@@ -124,3 +124,88 @@ def orientation_command_error_tanh(
     quat_distance = math_utils.quat_error_magnitude(object.data.root_quat_w, des_quat_w)
 
     return (1 - torch.tanh(quat_distance / std)) * contacts(env, 1.0).float()
+
+
+# ==================== Trajectory-based rewards ====================
+
+
+def lookahead_tracking(
+    env: ManagerBasedRLEnv,
+    std: float = 0.1,
+    decay: float = 0.5,
+    contact_threshold: float = 0.05,
+) -> torch.Tensor:
+    """
+    Reward tracking 8 future trajectory targets using point-to-point error.
+    
+    GATED BY CONTACT: Only gives reward when fingers are in contact with object.
+    Uses cached mean errors from observation term (precomputed).
+    Exponential decay weights: weight_i = decay^i (i=0 is current, i=7 is furthest)
+    
+    Args:
+        env: The environment.
+        std: Standard deviation for tanh kernel.
+        decay: Exponential decay factor (0-1). Lower = focus on current target.
+        contact_threshold: Force threshold for contact detection (N).
+    
+    Returns:
+        Reward tensor (num_envs,).
+    """
+    # Get cached mean errors from env: (N, W)
+    mean_errors = env._cached_mean_errors
+    
+    W = mean_errors.shape[1]
+    
+    # Exponential decay weights: decay^0, decay^1, ..., decay^(W-1)
+    weights = decay ** torch.arange(W, device=env.device, dtype=torch.float32)
+    weights = weights / weights.sum()  # Normalize
+    
+    # Weighted average error
+    weighted_error = (mean_errors * weights.unsqueeze(0)).sum(dim=-1)  # (N,)
+    
+    # Convert to reward using tanh kernel
+    reward = 1.0 - torch.tanh(weighted_error / std)
+    
+    # Gate by contact: only reward when grasping (thumb + at least one other finger)
+    has_contact = contacts(env, contact_threshold)  # (N,) bool
+    reward = torch.where(has_contact, reward, torch.zeros_like(reward))
+    
+    return reward
+
+
+
+def trajectory_success(
+    env: ManagerBasedRLEnv,
+    error_threshold: float = 0.02,
+) -> torch.Tensor:
+    """
+    Success reward: object at current target in release phase.
+    
+    Uses cached mean errors from observation term (precomputed).
+    Gives reward when conditions are met:
+    1. In release phase
+    2. Object close to current target (mean error < threshold)
+    
+    Args:
+        env: The environment.
+        error_threshold: Max mean point-to-point error for success (meters).
+    
+    Returns:
+        Reward tensor (num_envs,) - 1.0 if success, 0.0 otherwise.
+    """
+    trajectory_manager = env.trajectory_manager
+    
+    # Get cached mean errors from env: (N, W)
+    mean_errors = env._cached_mean_errors
+    
+    # Condition 1: In release phase
+    in_release = trajectory_manager.is_in_release_phase()  # (N,) bool
+    
+    # Condition 2: Object at current target (first in window, index 0)
+    current_error = mean_errors[:, 0]  # (N,)
+    at_goal = current_error < error_threshold
+    
+    # Success = both conditions
+    success = (in_release & at_goal).float()
+    
+    return success

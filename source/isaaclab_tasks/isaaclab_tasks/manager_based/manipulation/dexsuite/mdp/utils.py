@@ -8,10 +8,12 @@ import logging
 import numpy as np
 import torch
 import trimesh
+from scipy.spatial.transform import Rotation
+from trimesh.poses import compute_stable_poses
 from trimesh.sample import sample_surface
 
 import isaacsim.core.utils.prims as prim_utils
-from pxr import UsdGeom
+from pxr import Usd, UsdGeom
 
 from isaaclab.sim.utils import get_all_matching_child_prims
 
@@ -245,3 +247,271 @@ def farthest_point_sampling(
         distances = torch.minimum(distances, dist)
         farthest = torch.argmax(distances)
     return sampled_idx
+
+
+def sample_object_point_cloud_random(
+    env_ids: list[int],
+    num_points: int,
+    prim_path: str,
+    device: str = "cpu",
+) -> torch.Tensor:
+    """
+    Sample random points on object surfaces for specified environments.
+    
+    OPTIMIZED: Sample mesh ONCE from env 0, then apply per-env scales.
+    All envs share the same mesh geometry, only scales differ.
+
+    Args:
+        env_ids: List of environment indices to sample for.
+        num_points: Number of points to sample per environment.
+        prim_path: USD prim path pattern with ".*" placeholder for env index.
+        device: Device to place the output tensor on.
+
+    Returns:
+        torch.Tensor: Shape (len(env_ids), num_points, 3) on `device`.
+    """
+    n_envs = len(env_ids)
+    xform_cache = UsdGeom.XformCache()
+    
+    # === STEP 1: Sample points ONCE from env 0's mesh (unscaled) ===
+    obj_path_0 = prim_path.replace(".*", "0")
+    prims = get_all_matching_child_prims(
+        obj_path_0, predicate=lambda p: p.GetTypeName() in ("Mesh", "Cube", "Sphere", "Cylinder", "Capsule", "Cone")
+    )
+    if not prims:
+        raise KeyError(f"No valid prims under {obj_path_0}")
+
+    object_prim_0 = prim_utils.get_prim_at_path(obj_path_0)
+    world_root_0 = xform_cache.GetLocalToWorldTransform(object_prim_0)
+
+    # Sample from all prims in env 0
+    all_samples: list[torch.Tensor] = []
+    for prim in prims:
+        prim_type = prim.GetTypeName()
+
+        # Create trimesh
+        if prim_type == "Mesh":
+            mesh = UsdGeom.Mesh(prim)
+            verts = np.asarray(mesh.GetPointsAttr().Get(), dtype=np.float32)
+            faces = _triangulate_faces(prim)
+            mesh_tm = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+        else:
+            mesh_tm = create_primitive_mesh(prim)
+
+        # Random surface sampling (area-weighted)
+        face_weights = mesh_tm.area_faces
+        samples_np, _ = sample_surface(mesh_tm, num_points, face_weight=face_weights)
+        local_pts = torch.from_numpy(samples_np.astype(np.float32)).to(device)
+
+        # Transform from prim local frame to object root frame
+        rel = xform_cache.GetLocalToWorldTransform(prim) * world_root_0.GetInverse()
+        mat_np = np.array([[rel[r][c] for c in range(4)] for r in range(4)], dtype=np.float32)
+        mat_t = torch.from_numpy(mat_np).to(device)
+
+        ones = torch.ones((num_points, 1), device=device)
+        pts_h = torch.cat([local_pts, ones], dim=1)
+        root_h = pts_h @ mat_t
+        samples = root_h[:, :3]
+
+        # Cone height adjustment
+        if prim_type == "Cone":
+            samples[:, 2] -= UsdGeom.Cone(prim).GetHeightAttr().Get() / 2
+
+        all_samples.append(samples)
+
+    # Combine samples
+    if len(all_samples) == 1:
+        base_points = all_samples[0][:num_points]
+    else:
+        combined = torch.cat(all_samples, dim=0)
+        perm = torch.randperm(combined.shape[0], device=device)[:num_points]
+        base_points = combined[perm]
+
+    # === STEP 2: Get per-env scales (fast loop - just attribute reads) ===
+    scales = torch.ones((n_envs, 3), dtype=torch.float32, device=device)
+    for idx, env_id in enumerate(env_ids):
+        obj_path = prim_path.replace(".*", str(env_id))
+        object_prim = prim_utils.get_prim_at_path(obj_path)
+        attr = object_prim.GetAttribute("xformOp:scale")
+        scale_val = attr.Get() if attr else None
+        if scale_val is not None:
+            scales[idx] = torch.tensor(scale_val, dtype=torch.float32, device=device)
+
+    # === STEP 3: Apply scales to all envs (vectorized) ===
+    # base_points: (P, 3), scales: (N, 3) -> points: (N, P, 3)
+    points = base_points.unsqueeze(0) * scales.unsqueeze(1)  # Broadcasting
+
+    return points
+
+
+# ---- Stable Pose Computation ----
+
+# Cache for stable poses and aligned mesh per object geometry (to avoid recomputation)
+# Key: geometry hash -> (transforms, probabilities, aligned_mesh)
+_STABLE_POSE_CACHE: dict[str, tuple[np.ndarray, np.ndarray, trimesh.Trimesh]] = {}
+
+
+def clear_stable_pose_cache():
+    """Clear the stable pose cache."""
+    _STABLE_POSE_CACHE.clear()
+
+
+def get_stable_object_placement(
+    env_ids: list[int],
+    prim_path: str,
+    table_surface_z: float = 0.255,
+    randomize_pose: bool = True,
+    z_offset: float = 0.005,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute stable z-positions and orientations for placing objects on table.
+    
+    OPTIMIZED: Compute stable pose ONCE from env 0, then apply per-env scales.
+
+    Args:
+        env_ids: List of environment indices to compute placements for.
+        prim_path: USD prim path pattern with ".*" placeholder for env index.
+        table_surface_z: Z-coordinate of the table surface.
+        randomize_pose: If True, randomly sample from stable poses weighted by
+                       probability. If False, always use the most stable pose.
+        z_offset: Safety margin above table to prevent physics depenetration (meters).
+
+    Returns:
+        Tuple of:
+            - z_positions: (len(env_ids),) tensor of z-coordinates for object centers
+            - quaternions: (len(env_ids), 4) tensor of quaternions (w, x, y, z)
+    """
+    n_envs = len(env_ids)
+    z_positions = torch.zeros(n_envs, dtype=torch.float32)
+    quaternions = torch.zeros(n_envs, 4, dtype=torch.float32)
+    quaternions[:, 0] = 1.0  # Default to identity quaternion (w=1)
+
+    xform_cache = UsdGeom.XformCache()
+
+    # === STEP 1: Get stable pose and rotated mesh bounds from env 0 ===
+    obj_path_0 = prim_path.replace(".*", "0")
+    prims = get_all_matching_child_prims(
+        obj_path_0, predicate=lambda p: p.GetTypeName() in ("Mesh", "Cube", "Sphere", "Cylinder", "Capsule", "Cone")
+    )
+    if not prims:
+        logging.warning(f"No valid prims under {obj_path_0}, using default placement")
+        z_positions[:] = table_surface_z + 0.1
+        return z_positions, quaternions
+
+    prim = prims[0]
+    prim_type = prim.GetTypeName()
+    cache_key = _compute_geometry_hash(prim, prim_type)
+
+    # Check cache first
+    if cache_key in _STABLE_POSE_CACHE:
+        transforms, probabilities, mesh_tm = _STABLE_POSE_CACHE[cache_key]
+    else:
+        # Get bounding box
+        imageable = UsdGeom.Imageable(prim)
+        bbox = imageable.ComputeLocalBound(Usd.TimeCode.Default(), purpose1="default")
+        bbox_range = bbox.GetRange()
+        usd_min = np.array(bbox_range.GetMin())
+        usd_max = np.array(bbox_range.GetMax())
+        
+        # Create trimesh
+        mesh_tm = create_primitive_mesh(prim)
+        
+        # Align centers
+        tm_center = (mesh_tm.bounds[0] + mesh_tm.bounds[1]) / 2
+        usd_center = (usd_min + usd_max) / 2
+        offset = usd_center - tm_center
+        mesh_tm.apply_translation(offset)
+
+        # Compute stable poses
+        try:
+            transforms, probabilities = compute_stable_poses(mesh_tm)
+        except Exception as e:
+            logging.warning(f"Failed to compute stable poses: {e}")
+            z_positions[:] = table_surface_z + 0.1
+            return z_positions, quaternions
+
+        _STABLE_POSE_CACHE[cache_key] = (transforms, probabilities, mesh_tm)
+
+    if len(transforms) == 0:
+        logging.warning("No stable poses found")
+        z_positions[:] = table_surface_z + 0.1
+        return z_positions, quaternions
+
+    # Select stable pose (same for all envs if not randomizing)
+    if randomize_pose and len(transforms) > 1:
+        pose_idx = np.random.choice(len(transforms), p=probabilities / probabilities.sum())
+    else:
+        pose_idx = np.argmax(probabilities)
+
+    stable_transform = transforms[pose_idx]
+    rotation_matrix = stable_transform[:3, :3]
+    
+    # Convert to quaternion (same for all envs)
+    rot = Rotation.from_matrix(rotation_matrix)
+    quat_xyzw = rot.as_quat()
+    quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
+    quaternions[:] = torch.tensor(quat_wxyz, dtype=torch.float32)
+
+    # Create rotated mesh ONCE (unscaled)
+    mesh_rotated = mesh_tm.copy()
+    rotation_only_transform = np.eye(4)
+    rotation_only_transform[:3, :3] = rotation_matrix
+    mesh_rotated.apply_transform(rotation_only_transform)
+    
+    # Get unscaled min_z (the z-bound scales linearly with scale_z)
+    unscaled_min_z = mesh_rotated.bounds[0, 2]
+
+    # Get geometric scale from env 0 (same for all envs)
+    geom_scale_attr = prim.GetAttribute("xformOp:scale")
+    geom_scale_val = geom_scale_attr.Get() if geom_scale_attr else None
+    geom_scale_z = geom_scale_val[2] if geom_scale_val else 1.0
+
+    # === STEP 2: Get per-env root scales (fast attribute reads) ===
+    root_scales_z = np.ones(n_envs, dtype=np.float32)
+    for idx, env_id in enumerate(env_ids):
+        obj_path = prim_path.replace(".*", str(env_id))
+        object_prim = prim_utils.get_prim_at_path(obj_path)
+        root_scale_attr = object_prim.GetAttribute("xformOp:scale")
+        root_scale_val = root_scale_attr.Get() if root_scale_attr else None
+        if root_scale_val is not None:
+            root_scales_z[idx] = root_scale_val[2]
+
+    # === STEP 3: Compute z positions vectorized ===
+    # scaled_min_z = unscaled_min_z * geom_scale_z * root_scale_z
+    # z_position = table_surface_z - scaled_min_z + z_offset
+    combined_scales_z = geom_scale_z * root_scales_z
+    scaled_min_z = unscaled_min_z * combined_scales_z
+    z_positions = torch.tensor(table_surface_z - scaled_min_z + z_offset, dtype=torch.float32)
+
+    return z_positions, quaternions
+
+
+def _compute_geometry_hash(prim, prim_type: str) -> str:
+    """Compute a hash for a geometry prim to use as cache key."""
+    hasher = hashlib.sha256()
+    hasher.update(prim_type.encode())
+
+    if prim_type == "Mesh":
+        mesh = UsdGeom.Mesh(prim)
+        verts = np.asarray(mesh.GetPointsAttr().Get(), dtype=np.float32)
+        hasher.update(verts.tobytes())
+    elif prim_type == "Cube":
+        size = UsdGeom.Cube(prim).GetSizeAttr().Get()
+        hasher.update(np.float32(size).tobytes())
+    elif prim_type == "Sphere":
+        r = UsdGeom.Sphere(prim).GetRadiusAttr().Get()
+        hasher.update(np.float32(r).tobytes())
+    elif prim_type == "Cylinder":
+        c = UsdGeom.Cylinder(prim)
+        hasher.update(np.float32(c.GetRadiusAttr().Get()).tobytes())
+        hasher.update(np.float32(c.GetHeightAttr().Get()).tobytes())
+    elif prim_type == "Capsule":
+        c = UsdGeom.Capsule(prim)
+        hasher.update(np.float32(c.GetRadiusAttr().Get()).tobytes())
+        hasher.update(np.float32(c.GetHeightAttr().Get()).tobytes())
+    elif prim_type == "Cone":
+        c = UsdGeom.Cone(prim)
+        hasher.update(np.float32(c.GetRadiusAttr().Get()).tobytes())
+        hasher.update(np.float32(c.GetHeightAttr().Get()).tobytes())
+
+    return hasher.hexdigest()

@@ -24,3 +24,5 @@ Lift:
 }
 
 """
+
+from .trajectory_manager import TrajectoryManager

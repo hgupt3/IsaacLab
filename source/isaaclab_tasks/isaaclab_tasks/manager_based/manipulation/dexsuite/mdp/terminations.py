@@ -47,3 +47,27 @@ def abnormal_robot_state(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = Sce
     by very bad, or aggressive action"""
     robot: Articulation = env.scene[asset_cfg.name]
     return (robot.data.joint_vel.abs() > (robot.data.joint_vel_limits * 2)).any(dim=1)
+
+
+def trajectory_deviation(
+    env: ManagerBasedRLEnv,
+    threshold: float = 0.15,
+) -> torch.Tensor:
+    """Terminate if object deviates too far from current trajectory target.
+    
+    Uses cached mean errors from the observation term (point-to-point distance).
+    
+    Args:
+        env: The environment.
+        threshold: Max allowed mean point-to-point error (meters).
+    
+    Returns:
+        Boolean tensor (num_envs,) - True if should terminate.
+    """
+    # Get cached mean errors from env
+    mean_errors = env._cached_mean_errors  # (N, W)
+    
+    # Check error to current target (first in window)
+    current_error = mean_errors[:, 0]  # (N,)
+    
+    return current_error > threshold
