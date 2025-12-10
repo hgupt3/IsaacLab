@@ -10,14 +10,39 @@ from typing import TYPE_CHECKING
 
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import ManagerTermBase, SceneEntityCfg
-from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_inv, quat_mul, subtract_frame_transforms
+from isaaclab.utils.math import (
+    quat_apply,
+    quat_apply_inverse,
+    quat_error_magnitude,
+    quat_inv,
+    quat_mul,
+    subtract_frame_transforms,
+)
 
 from .utils import sample_object_point_cloud, sample_object_point_cloud_random
-from ..trajectory_manager import TrajectoryManager
-from ..trajectory_cfg import TrajectoryParamsCfg
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
+    from ..trajectory_manager import TrajectoryManager
+    from ..trajectory_cfg import TrajectoryParamsCfg
+
+
+def zeros_placeholder(
+    env: ManagerBasedRLEnv,
+    size: int = 7,
+) -> torch.Tensor:
+    """Placeholder observation that returns zeros.
+    
+    Useful for maintaining checkpoint compatibility when observations are removed.
+    
+    Args:
+        env: The environment.
+        size: Size of the zeros tensor. Defaults to 7 (pose size).
+    
+    Returns:
+        Tensor of shape (num_envs, size) filled with zeros.
+    """
+    return torch.zeros(env.num_envs, size, device=env.device)
 
 
 def object_pos_b(
@@ -58,6 +83,36 @@ def object_quat_b(
     robot: RigidObject = env.scene[robot_cfg.name]
     object: RigidObject = env.scene[object_cfg.name]
     return quat_mul(quat_inv(robot.data.root_quat_w), object.data.root_quat_w)
+
+
+def object_pose_b(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+) -> torch.Tensor:
+    """Object pose (position + quaternion) in the robot's root frame.
+
+    Combines object_pos_b and object_quat_b into a single 7-dim observation.
+    Used in pose mode instead of point cloud observations.
+
+    Args:
+        env: The environment.
+        robot_cfg: Scene entity for the robot (reference frame). Defaults to ``SceneEntityCfg("robot")``.
+        object_cfg: Scene entity for the object. Defaults to ``SceneEntityCfg("object")``.
+
+    Returns:
+        Tensor of shape ``(num_envs, 7)``: [x, y, z, qw, qx, qy, qz] in robot root frame.
+    """
+    robot: RigidObject = env.scene[robot_cfg.name]
+    object: RigidObject = env.scene[object_cfg.name]
+    
+    # Position in robot frame
+    pos_b = quat_apply_inverse(robot.data.root_quat_w, object.data.root_pos_w - robot.data.root_pos_w)
+    
+    # Orientation in robot frame
+    quat_b = quat_mul(quat_inv(robot.data.root_quat_w), object.data.root_quat_w)
+    
+    return torch.cat([pos_b, quat_b], dim=-1)
 
 
 def body_state_b(
@@ -129,6 +184,7 @@ class object_point_cloud_b(ManagerTermBase):
         
         # Visualizer
         self.visualizer = None
+        self.visualize_env_ids = cfg.params.get("visualize_env_ids", [0])  # Default: only env 0
         if cfg.params.get("visualize", True):
             from isaaclab.markers import VisualizationMarkers
             from isaaclab.markers.config import RAY_CASTER_MARKER_CFG
@@ -179,7 +235,12 @@ class object_point_cloud_b(ManagerTermBase):
         self.points_w = quat_apply(object_quat_w, self.points_local) + object_pos_w
         
         if visualize and self.visualizer is not None:
-            self.visualizer.visualize(translations=self.points_w.view(-1, 3))
+            if self.visualize_env_ids is not None:
+                # Only visualize points for specified env IDs
+                vis_points = self.points_w[self.visualize_env_ids].reshape(-1, 3)
+            else:
+                vis_points = self.points_w.view(-1, 3)
+            self.visualizer.visualize(translations=vis_points)
         
         # Transform to robot base frame
         object_point_cloud_pos_b, _ = subtract_frame_transforms(ref_pos_w, ref_quat_w, self.points_w, None)
@@ -209,23 +270,27 @@ def fingers_contact_force_b(
     return forces_b
 
 
-class target_sequence_point_clouds_b(ManagerTermBase):
-    """Point clouds for 8 trajectory targets expressed in robot's base frame.
+class target_sequence_obs_b(ManagerTermBase):
+    """Trajectory target observations expressed in robot's base frame.
     
-    Takes the object's local point cloud and transforms it to each of the 8 
-    target poses from the trajectory window. All points are expressed in the
-    robot's root frame. Optionally visualizes with Inferno colormap.
+    Supports two modes based on trajectory_cfg.use_point_cloud:
+    - Point cloud mode (default): Transforms object point cloud to each target pose.
+      Returns (num_envs, window_size * num_points * 3).
+    - Pose mode: Returns target poses directly.
+      Returns (num_envs, window_size * 7).
+    
+    Also caches errors for reward/termination functions:
+    - Point cloud mode: env._cached_mean_errors (N, W) - point-to-point mean error
+    - Pose mode: env._cached_pose_errors dict with 'pos' (N, W) and 'rot' (N, W)
     
     Args (from ``cfg.params``):
         object_cfg: Scene entity for the object. Defaults to ``SceneEntityCfg("object")``.
         ref_asset_cfg: Reference frame (robot). Defaults to ``SceneEntityCfg("robot")``.
-        num_points: Points per target point cloud. Defaults to 32.
-        trajectory_manager_attr: Attribute name on env for trajectory manager.
-        visualize: Whether to show markers. Defaults to False.
-        visualize_env_ids: Which envs to visualize. None = all, [0] = first only.
+        trajectory_cfg: TrajectoryParamsCfg with mode settings.
     
     Returns:
-        Tensor of shape ``(num_envs, 8 * num_points * 3)`` - flattened target point clouds.
+        Point cloud mode: Tensor of shape ``(num_envs, window_size * num_points * 3)``.
+        Pose mode: Tensor of shape ``(num_envs, window_size * 7)``.
     """
     
     # Inferno colormap (dark purple → bright yellow)
@@ -245,6 +310,10 @@ class target_sequence_point_clouds_b(ManagerTermBase):
     def __init__(self, cfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
         
+        # Import here to avoid circular import
+        from ..trajectory_manager import TrajectoryManager
+        from ..trajectory_cfg import TrajectoryParamsCfg
+        
         # Get trajectory config (all settings come from here)
         traj_cfg: TrajectoryParamsCfg = cfg.params.get("trajectory_cfg", TrajectoryParamsCfg())
         
@@ -253,12 +322,14 @@ class target_sequence_point_clouds_b(ManagerTermBase):
         
         # Use values from trajectory config
         self.traj_cfg = traj_cfg
+        self.use_point_cloud = traj_cfg.use_point_cloud
         self.num_points = traj_cfg.num_points
         self.window_size = traj_cfg.window_size
         self.visualize = traj_cfg.visualize_targets
         self.visualize_current = traj_cfg.visualize_current
         self.visualize_waypoint_region = traj_cfg.visualize_waypoint_region
         self.visualize_goal_region = traj_cfg.visualize_goal_region
+        self.visualize_pose_axes = traj_cfg.visualize_pose_axes
         self.visualize_env_ids = traj_cfg.visualize_env_ids  # None = all envs
         
         self.object: RigidObject = env.scene[self.object_cfg.name]
@@ -272,15 +343,18 @@ class target_sequence_point_clouds_b(ManagerTermBase):
             num_envs=env.num_envs,
             device=env.device,
             table_height=traj_cfg.table_surface_z,
+            object_prim_path=self.object.cfg.prim_path,
         )
         env.trajectory_manager = self.trajectory_manager
         
+        # Point cloud initialization (always needed for visualization)
+        self.points_local = None
         # Use cached points from object_point_cloud_b (must be initialized first)
         # This ensures SAME local points are used for both current object and targets
         if hasattr(env, '_object_points_local'):
             self.points_local = env._object_points_local
         else:
-            # Fallback if object_point_cloud_b not initialized yet (shouldn't happen)
+            # Fallback if object_point_cloud_b not initialized yet
             all_env_ids = list(range(env.num_envs))
             self.points_local = sample_object_point_cloud_random(
                 all_env_ids, self.num_points, self.object.cfg.prim_path, device=env.device
@@ -296,7 +370,7 @@ class target_sequence_point_clouds_b(ManagerTermBase):
         self._visualizer_initialized = False
         if self.visualize:
             self._init_visualizer()
-        if self.visualize_waypoint_region or self.visualize_goal_region:
+        if self.visualize_waypoint_region or self.visualize_goal_region or self.visualize_pose_axes:
             self._init_region_visualizer()
     
     def _init_visualizer(self):
@@ -365,8 +439,7 @@ class target_sequence_point_clouds_b(ManagerTermBase):
         origins = env_origins[env_ids]  # (E, 3)
         starts = start_pos[env_ids]     # (E, 3)
         
-        # Clear previous frame's lines
-        self._debug_draw.clear_lines()
+        # Note: clear_lines is done in _visualize_pose_axes which runs every frame
         
         # Waypoint region: 3D box (12 edges)
         if self.visualize_waypoint_region:
@@ -471,22 +544,106 @@ class target_sequence_point_clouds_b(ManagerTermBase):
         ends = torch.cat([verts[:, j] for i, j in edge_pairs], dim=0)
         return starts, ends
     
+    def _visualize_pose_axes(
+        self,
+        object_pos_w: torch.Tensor,
+        object_quat_w: torch.Tensor,
+        target_pos_w: torch.Tensor,
+        target_quat_w: torch.Tensor,
+        num_envs: int,
+    ):
+        """Visualize pose axes (XYZ arrows) for current object and targets.
+        
+        Args:
+            object_pos_w: (N, 3) current object position in world frame.
+            object_quat_w: (N, 4) current object quaternion in world frame.
+            target_pos_w: (N, W, 3) target positions in world frame.
+            target_quat_w: (N, W, 4) target quaternions in world frame.
+            num_envs: Number of environments.
+        """
+        if self._debug_draw is None:
+            return
+        
+        # Axis arrow length
+        AXIS_LENGTH = 0.08
+        
+        # Select envs to visualize
+        if self.visualize_env_ids is None:
+            env_ids = list(range(num_envs))
+        else:
+            env_ids = [i for i in self.visualize_env_ids if i < num_envs]
+        
+        if not env_ids:
+            return
+        
+        E = len(env_ids)
+        W = target_pos_w.shape[1]
+        device = object_pos_w.device
+        
+        # Local axis directions
+        x_axis = torch.tensor([1.0, 0.0, 0.0], device=device)
+        y_axis = torch.tensor([0.0, 1.0, 0.0], device=device)
+        z_axis = torch.tensor([0.0, 0.0, 1.0], device=device)
+        
+        all_starts = []
+        all_ends = []
+        all_colors = []
+        
+        # === Current object axes (bright colors) ===
+        obj_pos = object_pos_w[env_ids]  # (E, 3)
+        obj_quat = object_quat_w[env_ids]  # (E, 4)
+        
+        # Transform local axes to world
+        for axis, color in [(x_axis, (1.0, 0.0, 0.0, 1.0)),    # Red for X
+                            (y_axis, (0.0, 1.0, 0.0, 1.0)),    # Green for Y
+                            (z_axis, (0.0, 0.0, 1.0, 1.0))]:   # Blue for Z
+            axis_exp = axis.unsqueeze(0).expand(E, 3)
+            axis_world = quat_apply(obj_quat, axis_exp) * AXIS_LENGTH
+            
+            all_starts.append(obj_pos)
+            all_ends.append(obj_pos + axis_world)
+            all_colors.extend([color] * E)
+        
+        # === Target axes (dimmer colors, only first target for clarity) ===
+        # Using first target in window (current target)
+        tgt_pos = target_pos_w[env_ids, 0]  # (E, 3) - first target
+        tgt_quat = target_quat_w[env_ids, 0]  # (E, 4)
+        
+        for axis, color in [(x_axis, (0.5, 0.0, 0.0, 0.8)),    # Dark red for X
+                            (y_axis, (0.0, 0.5, 0.0, 0.8)),    # Dark green for Y
+                            (z_axis, (0.0, 0.0, 0.5, 0.8))]:   # Dark blue for Z
+            axis_exp = axis.unsqueeze(0).expand(E, 3)
+            axis_world = quat_apply(tgt_quat, axis_exp) * AXIS_LENGTH
+            
+            all_starts.append(tgt_pos)
+            all_ends.append(tgt_pos + axis_world)
+            all_colors.extend([color] * E)
+        
+        # Concatenate and draw
+        starts = torch.cat(all_starts, dim=0)  # (6*E, 3)
+        ends = torch.cat(all_ends, dim=0)      # (6*E, 3)
+        
+        starts_list = starts.cpu().tolist()
+        ends_list = ends.cpu().tolist()
+        n = len(starts_list)
+        self._debug_draw.draw_lines(starts_list, ends_list, all_colors, [3.0] * n)
+    
     def __call__(
         self,
         env: ManagerBasedRLEnv,
-        trajectory_cfg: TrajectoryParamsCfg | None = None,
+        trajectory_cfg: "TrajectoryParamsCfg | None" = None,
         object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
         ref_asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     ) -> torch.Tensor:
-        """Compute target sequence point clouds in robot base frame.
+        """Compute target sequence observations in robot base frame.
         
         Also manages trajectory manager: resets on env reset, steps each call.
         
         Returns:
-            Flattened tensor (num_envs, window_size * num_points * 3).
+            Point cloud mode: Flattened tensor (num_envs, window_size * num_points * 3).
+            Pose mode: Flattened tensor (num_envs, window_size * 7).
         """
         N = env.num_envs
-        P = self.num_points
         W = self.window_size
         
         # Handle resets: check which envs just reset (episode_length_buf == 0)
@@ -503,10 +660,6 @@ class target_sequence_point_clouds_b(ManagerTermBase):
             env_origins = env.scene.env_origins[reset_ids]
             
             self.trajectory_manager.reset(reset_ids, start_poses, env_origins)
-            
-            # Draw region visualization only on reset
-            if self.visualize_waypoint_region or self.visualize_goal_region:
-                self._visualize_regions(env.scene.env_origins, self.trajectory_manager.start_poses[:, :3])
         
         # Step trajectory (advance time)
         self.trajectory_manager.step(self.dt)
@@ -514,15 +667,45 @@ class target_sequence_point_clouds_b(ManagerTermBase):
         # Get window targets: (N, W, 7) - pos(3) + quat(4)
         window_targets = self.trajectory_manager.get_window_targets()
         
+        # Current object pose
+        object_pos_w = self.object.data.root_pos_w  # (N, 3)
+        object_quat_w = self.object.data.root_quat_w  # (N, 4)
+        
         # Reference frame
         ref_pos_w = self.ref_asset.data.root_pos_w   # (N, 3)
         ref_quat_w = self.ref_asset.data.root_quat_w  # (N, 4)
         
-        # Vectorized: transform local points to all W target poses at once
-        # points_local: (N, P, 3) -> (N, 1, P, 3) -> (N, W, P, 3)
-        # window_targets: (N, W, 7) -> pos (N, W, 1, 3), quat (N, W, 1, 4)
-        target_pos = window_targets[:, :, :3].unsqueeze(2)   # (N, W, 1, 3)
-        target_quat = window_targets[:, :, 3:7].unsqueeze(2)  # (N, W, 1, 4)
+        # Always compute point cloud observations and cache BOTH error types
+        # use_point_cloud flag only affects which errors are used in rewards/terminations
+        return self._compute_observations(
+            env, N, W, window_targets, object_pos_w, object_quat_w, ref_pos_w, ref_quat_w
+        )
+    
+    def _compute_observations(
+        self,
+        env: ManagerBasedRLEnv,
+        N: int,
+        W: int,
+        window_targets: torch.Tensor,
+        object_pos_w: torch.Tensor,
+        object_quat_w: torch.Tensor,
+        ref_pos_w: torch.Tensor,
+        ref_quat_w: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute point cloud observations and cache BOTH point cloud and pose errors.
+        
+        Always outputs point clouds. Caches both error types for rewards/terminations
+        to use based on use_point_cloud flag.
+        """
+        P = self.num_points
+        
+        # Target poses in world frame
+        target_pos_w = window_targets[:, :, :3]   # (N, W, 3)
+        target_quat_w = window_targets[:, :, 3:7]  # (N, W, 4)
+        
+        # === Point cloud computation ===
+        target_pos = target_pos_w.unsqueeze(2)   # (N, W, 1, 3)
+        target_quat = target_quat_w.unsqueeze(2)  # (N, W, 1, 4)
         
         local_exp = self.points_local.unsqueeze(1).expand(N, W, P, 3)  # (N, W, P, 3)
         quat_exp = target_quat.expand(N, W, P, 4)  # (N, W, P, 4)
@@ -542,25 +725,48 @@ class target_sequence_point_clouds_b(ManagerTermBase):
         all_points_b = all_points_b.reshape(N, W, P, 3)
         
         # Current object points (world space)
-        object_pos_w = self.object.data.root_pos_w
-        object_quat_w = self.object.data.root_quat_w
         object_quat_exp = object_quat_w.unsqueeze(1).expand(-1, P, -1)
         object_pos_exp = object_pos_w.unsqueeze(1).expand(-1, P, -1)
         current_points_w = quat_apply(object_quat_exp, self.points_local) + object_pos_exp
         
-        # Compute point-to-point errors for reward/curriculum functions (avoid recomputation)
-        # current_points_w: (N, P, 3) -> (N, 1, P, 3)
-        # all_points_w: (N, W, P, 3)
+        # === Cache point cloud errors ===
         current_exp = current_points_w.unsqueeze(1).expand(N, W, P, 3)
         point_errors = (current_exp - all_points_w).norm(dim=-1)  # (N, W, P)
-        self.cached_mean_errors = point_errors.mean(dim=-1)  # (N, W) - mean error per target
+        env._cached_mean_errors = point_errors.mean(dim=-1)  # (N, W)
         
-        # Also cache on env for curriculum access
-        env._cached_mean_errors = self.cached_mean_errors
+        # === Cache pose errors ===
+        # Position error: (N, W)
+        object_pos_exp_w = object_pos_w.unsqueeze(1).expand(N, W, 3)
+        pos_errors = (object_pos_exp_w - target_pos_w).norm(dim=-1)  # (N, W)
+        
+        # Rotation error using quat_error_magnitude: (N, W)
+        object_quat_exp_w = object_quat_w.unsqueeze(1).expand(N, W, 4)
+        rot_errors = quat_error_magnitude(
+            object_quat_exp_w.reshape(-1, 4),
+            target_quat_w.reshape(-1, 4)
+        ).reshape(N, W)  # (N, W)
+        
+        env._cached_pose_errors = {
+            'pos': pos_errors,  # (N, W) position error in meters
+            'rot': rot_errors,  # (N, W) rotation error in radians
+        }
         
         # Visualization (point clouds every frame)
         if self.visualize and self.markers is not None:
             self._visualize(all_points_w, current_points_w, N)
+        
+        # Debug draw visualizations (lines) - must redraw every frame after clear
+        if self._debug_draw is not None and (self.visualize_pose_axes or self.visualize_waypoint_region or self.visualize_goal_region):
+            # Clear previous frame's lines first
+            self._debug_draw.clear_lines()
+            
+            # Pose axes visualization (current + targets)
+            if self.visualize_pose_axes:
+                self._visualize_pose_axes(object_pos_w, object_quat_w, target_pos_w, target_quat_w, N)
+            
+            # Region boxes (waypoint/goal)
+            if self.visualize_waypoint_region or self.visualize_goal_region:
+                self._visualize_regions(self.env.scene.env_origins, self.trajectory_manager.start_poses[:, :3])
         
         # Flatten: (N, W * P * 3)
         return all_points_b.reshape(N, -1)
@@ -620,3 +826,57 @@ class target_sequence_point_clouds_b(ManagerTermBase):
             translations=all_positions,
             marker_indices=all_indices,
         )
+
+
+def target_sequence_poses_b(
+    env: ManagerBasedRLEnv,
+    ref_asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Target sequence poses in robot's base frame.
+    
+    Returns the window of target poses from the trajectory manager.
+    Must be called AFTER target_sequence_obs_b which initializes the trajectory manager.
+    
+    Args:
+        env: The environment (must have trajectory_manager attached).
+        ref_asset_cfg: Reference frame (robot). Defaults to ``SceneEntityCfg("robot")``.
+    
+    Returns:
+        Flattened tensor (num_envs, window_size * 7) - target poses in robot frame.
+    """
+    trajectory_manager = env.trajectory_manager
+    ref_asset: Articulation = env.scene[ref_asset_cfg.name]
+    
+    N = env.num_envs
+    W = trajectory_manager.cfg.window_size
+    
+    # Get window targets: (N, W, 7) - pos(3) + quat(4)
+    window_targets = trajectory_manager.get_window_targets()
+    target_pos_w = window_targets[:, :, :3]   # (N, W, 3)
+    target_quat_w = window_targets[:, :, 3:7]  # (N, W, 4)
+    
+    # Reference frame
+    ref_pos_w = ref_asset.data.root_pos_w   # (N, 3)
+    ref_quat_w = ref_asset.data.root_quat_w  # (N, 4)
+    
+    # Transform target poses to robot base frame
+    target_pos_rel = target_pos_w - ref_pos_w.unsqueeze(1)  # (N, W, 3)
+    ref_quat_inv = quat_inv(ref_quat_w)  # (N, 4)
+    
+    # Rotate each target position to robot frame
+    target_pos_b = quat_apply(
+        ref_quat_inv.unsqueeze(1).expand(N, W, 4).reshape(-1, 4),
+        target_pos_rel.reshape(-1, 3)
+    ).reshape(N, W, 3)
+    
+    # Orientation: multiply by inverse robot quat
+    target_quat_b = quat_mul(
+        ref_quat_inv.unsqueeze(1).expand(N, W, 4).reshape(-1, 4),
+        target_quat_w.reshape(-1, 4)
+    ).reshape(N, W, 4)
+    
+    # Combine to poses in robot frame: (N, W, 7)
+    target_poses_b = torch.cat([target_pos_b, target_quat_b], dim=-1)
+    
+    # Flatten: (N, W * 7)
+    return target_poses_b.reshape(N, -1)

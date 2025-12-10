@@ -14,12 +14,27 @@ from isaaclab.sensors import ContactSensorCfg
 from isaaclab.utils import configclass
 
 from ... import trajectory_env_cfg as trajectory
+from ...trajectory_cfg import TRAJECTORY_PARAMS
 from ... import mdp
 
 
 @configclass
 class KukaAllegroRelJointPosActionCfg:
+    """Standard relative joint position action (23D)."""
     action = mdp.RelativeJointPositionActionCfg(asset_name="robot", joint_names=[".*"], scale=0.1)
+
+
+@configclass
+class KukaAllegroEigenGraspActionCfg:
+    """Eigen grasp action with residual (28D input -> 23D output)."""
+    action = mdp.EigenGraspRelativeJointPositionActionCfg(
+        asset_name="robot",
+        joint_names=[".*"],
+        scale=0.1,
+        arm_joint_count=7,
+        hand_joint_count=16,
+        eigen_dim=5,
+    )
 
 
 @configclass
@@ -39,12 +54,16 @@ class KukaAllegroTrajectoryMixinCfg:
     """Mixin config for Kuka Allegro robot in trajectory task."""
 
     rewards: KukaAllegroTrajectoryRewardCfg = KukaAllegroTrajectoryRewardCfg()
+    # Default to standard action - overridden in __post_init__ if use_eigen_grasp is True
     actions: KukaAllegroRelJointPosActionCfg = KukaAllegroRelJointPosActionCfg()
 
     def __post_init__(self: trajectory.TrajectoryEnvCfg):
         super().__post_init__()
-        self.commands.object_pose.body_name = "palm_link"
         self.scene.robot = KUKA_ALLEGRO_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        
+        # Select action space based on trajectory config flag
+        if TRAJECTORY_PARAMS.use_eigen_grasp:
+            self.actions = KukaAllegroEigenGraspActionCfg()
 
         # Setup contact sensors for fingertips
         finger_tip_body_list = ["index_link_3", "middle_link_3", "ring_link_3", "thumb_link_3"]

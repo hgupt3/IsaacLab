@@ -5,8 +5,12 @@
 
 """Trajectory following task for dexterous manipulation.
 
-This task trains the robot to follow a sequence of point cloud targets along a smooth trajectory.
+This task trains the robot to follow a sequence of targets along a smooth trajectory.
 The trajectory includes pickup from table, variable-speed manipulation, and place-back phases.
+
+Supports two representation modes (controlled by trajectory_params.use_point_cloud):
+- Point cloud mode (default): Uses point-to-point distance for tracking
+- Pose mode: Uses position + rotation (quaternion) for tracking
 """
 
 from dataclasses import MISSING
@@ -80,8 +84,7 @@ class TrajectorySceneCfg(InteractiveSceneCfg):
             size=(0.8, 1.5, 0.04),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
             collision_props=sim_utils.CollisionPropertiesCfg(),
-            # trick: we let visualizer's color to show the table with success coloring
-            visible=False,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.4, 0.3, 0.2), roughness=0.5),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=(-0.55, 0.0, 0.235), rot=(1.0, 0.0, 0.0, 0.0)),
     )
@@ -106,23 +109,8 @@ class TrajectorySceneCfg(InteractiveSceneCfg):
 
 @configclass
 class CommandsCfg:
-    """Command terms for the MDP."""
-
-    object_pose = mdp.ObjectUniformPoseCommandCfg(
-        asset_name="robot",
-        object_name="object",
-        resampling_time_range=(3.0, 5.0),
-        debug_vis=False,
-        ranges=mdp.ObjectUniformPoseCommandCfg.Ranges(
-            pos_x=(-0.7, -0.3),
-            pos_y=(-0.25, 0.25),
-            pos_z=(0.55, 0.95),
-            roll=(-3.14, 3.14),
-            pitch=(-3.14, 3.14),
-            yaw=(0.0, 0.0),
-        ),
-        success_vis_asset_name="table",
-    )
+    """Command terms for the MDP (empty for trajectory task - uses TrajectoryManager instead)."""
+    pass
 
 
 @configclass
@@ -133,8 +121,6 @@ class ObservationsCfg:
     class PolicyCfg(ObsGroup):
         """Observations for policy group."""
 
-        object_quat_b = ObsTerm(func=mdp.object_quat_b, noise=Unoise(n_min=-0.0, n_max=0.0))
-        target_object_pose_b = ObsTerm(func=mdp.generated_commands, params={"command_name": "object_pose"})
         actions = ObsTerm(func=mdp.last_action)
 
         def __post_init__(self):
@@ -168,7 +154,7 @@ class ObservationsCfg:
 
     @configclass
     class PerceptionObsCfg(ObsGroup):
-        """Perception observations: current object point cloud with history."""
+        """Perception observations: current object point cloud and pose with history."""
 
         # Current object point cloud with history
         # Shape per frame: num_points × 3, with history_length frames
@@ -182,6 +168,14 @@ class ObservationsCfg:
                 "visualize": True,
             },
         )
+        
+        # Current object pose (position + quaternion) with history
+        # Shape per frame: 7 (pos_x, pos_y, pos_z, qw, qx, qy, qz)
+        object_pose = ObsTerm(
+            func=mdp.object_pose_b,
+            noise=Unoise(n_min=-0.0, n_max=0.0),
+            clip=(-2.0, 2.0),
+        )
 
         def __post_init__(self):
             self.enable_corruption = True
@@ -192,17 +186,25 @@ class ObservationsCfg:
     
     @configclass
     class TargetObsCfg(ObsGroup):
-        """Target observations: 8 target point clouds from trajectory."""
+        """Target observations: point clouds AND poses from trajectory."""
         
-        # 8 target point clouds (window_size × num_points × 3)
-        # Also manages trajectory generation internally
+        # Target point clouds (window_size × num_points × 3)
+        # Also manages trajectory generation and caches both error types
         target_point_clouds = ObsTerm(
-            func=mdp.target_sequence_point_clouds_b,
+            func=mdp.target_sequence_obs_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),
             clip=(-2.0, 2.0),
             params={
                 "trajectory_cfg": TRAJECTORY_PARAMS,
             },
+        )
+        
+        # Target poses (window_size × 7)
+        # Must come after target_point_clouds which initializes trajectory_manager
+        target_poses = ObsTerm(
+            func=mdp.target_sequence_poses_b,
+            noise=Unoise(n_min=-0.0, n_max=0.0),
+            clip=(-2.0, 2.0),
         )
 
         def __post_init__(self):
@@ -374,29 +376,47 @@ class RewardsCfg:
     fingers_to_object = RewTerm(func=mdp.object_ee_distance, params={"std": 0.4}, weight=1.0)
 
     # Trajectory tracking: lookahead with exponential decay, gated by contact
+    # Works for both point cloud and pose modes (auto-detects based on cached errors)
     lookahead_tracking = RewTerm(
         func=mdp.lookahead_tracking,
-        weight=2.0,
+        weight=5.0,
         params={
-            "std": 0.05,
+            "std": 0.03,  # Position std (point cloud mode: mean error std)
             "decay": TRAJECTORY_PARAMS.lookahead_decay,
-            "contact_threshold": 1.0,  # Must have contact to get tracking reward
+            "contact_threshold": 2.0,  # Must have contact to get tracking reward
+            "rot_std": TRAJECTORY_PARAMS.pose_rot_std,  # Rotation std (pose mode only)
         },
     )
 
-    # Success: at goal + in release phase (uses cached PCs)
+    # Success: at goal + in release phase
+    # Works for both point cloud and pose modes (auto-detects based on cached errors)
+    # Success: at goal + in release phase
+    # NOTE: Default to INITIAL (lenient) values - curriculum tightens these as difficulty increases
     trajectory_success = RewTerm(
         func=mdp.trajectory_success,
         weight=10.0,
         params={
-            "error_threshold": TRAJECTORY_PARAMS.success_threshold,
+            "error_threshold": TRAJECTORY_PARAMS.success_threshold_initial,  # Start lenient (6cm)
+            "rot_threshold": TRAJECTORY_PARAMS.pose_success_rot_threshold_initial,  # Start lenient (~46 deg)
         },
     )
 
     early_termination = RewTerm(
         func=mdp.is_terminated_term,
-        weight=-1,
+        weight=-5.0,
         params={"term_keys": ["abnormal_robot", "trajectory_deviation"]},
+    )
+
+    # Arm table avoidance: penalize links 3-7 + palm below safe heights
+    arm_table_penalty = RewTerm(
+        func=mdp.arm_table_binary_penalty,
+        weight=-1.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=["iiwa7_link_(3|4|5|6|7)|palm_link"]),
+            "table_z": 0.255,
+            "threshold_mid": 0.06,
+            "threshold_distal": 0.03,
+        },
     )
 
 
@@ -409,10 +429,13 @@ class TerminationsCfg:
     abnormal_robot = DoneTerm(func=mdp.abnormal_robot_state)
 
     # Terminate if object deviates too far from current target
+    # Works for both point cloud and pose modes (auto-detects based on cached errors)
+    # NOTE: Default to INITIAL (lenient) values - curriculum tightens these as difficulty increases
     trajectory_deviation = DoneTerm(
         func=mdp.trajectory_deviation,
         params={
-            "threshold": TRAJECTORY_PARAMS.termination_threshold,
+            "threshold": TRAJECTORY_PARAMS.termination_threshold_initial,  # Start lenient (30cm)
+            "rot_threshold": TRAJECTORY_PARAMS.pose_termination_rot_threshold_initial,  # Start lenient (~86 deg)
         },
     )
 
@@ -443,41 +466,18 @@ class TrajectoryEnvCfg(ManagerBasedEnvCfg):
 
     def __post_init__(self):
         """Post initialization."""
-        # general settings
+        # General settings
         self.decimation = 2  # 60 Hz control (120 Hz physics / 2)
 
         # Episode length matches trajectory duration
         self.episode_length_s = self.trajectory_params.trajectory_duration
         self.is_finite_horizon = True
 
-        # For now, keep the existing command setup (will be replaced with trajectory commands)
-        self.commands.object_pose.resampling_time_range = (self.episode_length_s, self.episode_length_s)
-        self.commands.object_pose.position_only = True  # Position only like lift task
-        self.commands.object_pose.success_visualizer_cfg.markers["failure"] = self.scene.table.spawn.replace(
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.25, 0.15, 0.15), roughness=0.25), visible=True
-        )
-        self.commands.object_pose.success_visualizer_cfg.markers["success"] = self.scene.table.spawn.replace(
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.15, 0.25, 0.15), roughness=0.25), visible=True
-        )
-
-        # simulation settings
+        # Simulation settings
         self.sim.dt = 1 / 120
         self.sim.render_interval = self.decimation
-        self.sim.physx.bounce_threshold_velocity = 0.2
         self.sim.physx.bounce_threshold_velocity = 0.01
         self.sim.physx.gpu_max_rigid_patch_count = 4 * 5 * 2**15
-
-        # TODO: Replace pose-based rewards with trajectory/Chamfer rewards
-        # For now, disable pose tracking rewards (will be replaced)
-        self.rewards.orientation_tracking = None
-        self.rewards.position_tracking = None
-        self.rewards.success = None
-
-        # TODO: Update curriculum to use Chamfer distance instead of pose tolerance
-        if self.curriculum is not None:
-            # Placeholder - will be replaced with Chamfer-based curriculum
-            self.curriculum.adr.params["pos_tol"] = 0.05
-            self.curriculum.adr.params["rot_tol"] = None
 
 
 class TrajectoryEnvCfg_PLAY(TrajectoryEnvCfg):
@@ -485,6 +485,8 @@ class TrajectoryEnvCfg_PLAY(TrajectoryEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        self.commands.object_pose.debug_vis = True
+        # Start at max difficulty for evaluation
         if self.curriculum is not None:
-            self.curriculum.adr.params["init_difficulty"] = self.curriculum.adr.params["max_difficulty"]
+            self.curriculum.adr.params["init_difficulty"] = self.curriculum.adr.params["min_difficulty"]
+        # Enable reward debug printing for play mode
+        TRAJECTORY_PARAMS.debug_print_rewards = True

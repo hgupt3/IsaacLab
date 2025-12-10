@@ -52,22 +52,32 @@ def abnormal_robot_state(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = Sce
 def trajectory_deviation(
     env: ManagerBasedRLEnv,
     threshold: float = 0.15,
+    rot_threshold: float = 1.0,
 ) -> torch.Tensor:
     """Terminate if object deviates too far from current trajectory target.
     
-    Uses cached mean errors from the observation term (point-to-point distance).
+    Uses use_point_cloud flag from trajectory config to decide which error metric:
+    - Point cloud mode: Uses _cached_mean_errors (point-to-point distance)
+    - Pose mode: Uses _cached_pose_errors (position + rotation errors)
     
     Args:
         env: The environment.
-        threshold: Max allowed mean point-to-point error (meters).
+        threshold: Max allowed position/mean error (meters).
+        rot_threshold: Max allowed rotation error (radians, pose mode only).
     
     Returns:
         Boolean tensor (num_envs,) - True if should terminate.
     """
-    # Get cached mean errors from env
+    use_point_cloud = env.trajectory_manager.cfg.use_point_cloud
+    
+    if not use_point_cloud:
+        # Pose mode: check both position AND rotation thresholds
+        pos_error = env._cached_pose_errors['pos'][:, 0]  # (N,)
+        rot_error = env._cached_pose_errors['rot'][:, 0]  # (N,)
+        # Terminate if EITHER threshold exceeded
+        return (pos_error > threshold) | (rot_error > rot_threshold)
+    
+    # Point cloud mode: use mean errors
     mean_errors = env._cached_mean_errors  # (N, W)
-    
-    # Check error to current target (first in window)
     current_error = mean_errors[:, 0]  # (N,)
-    
     return current_error > threshold

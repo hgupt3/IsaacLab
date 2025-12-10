@@ -57,12 +57,10 @@ class DifficultyScheduler(ManagerTermBase):
 
     Tracks per-environment difficulty levels and adjusts them based on task performance. 
 
-    For trajectory tasks: uses cached point-to-point error from observation term.
-    For pose tasks: uses command-based pose error (legacy).
+    For trajectory tasks: advances when object is at goal during release phase.
+    For pose tasks: advances when object is at commanded pose (legacy).
 
-    Difficulty increases when error falls below tolerance, decreases otherwise 
-    (unless `promotion_only` is set). The normalized average difficulty is exposed 
-    as `difficulty_frac` for curriculum interpolation.
+    The normalized average difficulty is exposed as `difficulty_frac` for curriculum interpolation.
     """
 
     def __init__(self, cfg, env):
@@ -81,27 +79,38 @@ class DifficultyScheduler(ManagerTermBase):
         self,
         env: ManagerBasedRLEnv,
         env_ids: Sequence[int],
-        error_tol: float = 0.05,
         init_difficulty: int = 0,
         min_difficulty: int = 0,
         max_difficulty: int = 50,
         promotion_only: bool = False,
-        use_trajectory: bool = True,
+        use_trajectory: bool = False,
+        pos_tol: float = 0.03,  # Position tolerance for goal check
+        rot_tol: float = 0.3,  # Rotation tolerance for goal check (pose mode)
+        pc_tol: float = 0.03,  # Point cloud mean error tolerance (point cloud mode)
         # Legacy params for pose-based tasks
         asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
         object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
-        pos_tol: float = 0.1,
-        rot_tol: float | None = None,
     ):
         if use_trajectory:
-            # Trajectory task: use cached mean errors from trajectory manager
-            # These are computed and cached by the target_point_clouds observation term
-            if not hasattr(env, '_cached_mean_errors') or env._cached_mean_errors is None:
-                # First reset - no errors computed yet, don't change difficulty
-                return self.difficulty_frac
-            mean_errors = env._cached_mean_errors  # (N, W)
-            current_error = mean_errors[env_ids, 0]  # Error to current target
-            move_up = current_error < error_tol
+            # Trajectory task: advance when object is at goal during release phase
+            trajectory_manager = env.trajectory_manager
+            use_point_cloud = trajectory_manager.cfg.use_point_cloud
+            
+            # Check if in release phase
+            in_release = trajectory_manager.is_in_release_phase()[env_ids]
+            
+            if use_point_cloud:
+                # Point cloud mode: use cached mean errors
+                mean_errors = env._cached_mean_errors[env_ids, 0]  # Current target error
+                at_goal = mean_errors < pc_tol
+            else:
+                # Pose mode: check both position AND rotation
+                pos_errors = env._cached_pose_errors['pos'][env_ids, 0]
+                rot_errors = env._cached_pose_errors['rot'][env_ids, 0]
+                at_goal = (pos_errors < pos_tol) & (rot_errors < rot_tol)
+            
+            # Promote if in release AND at goal
+            move_up = in_release & at_goal
         else:
             # Legacy pose-based task
             asset: Articulation = env.scene[asset_cfg.name]

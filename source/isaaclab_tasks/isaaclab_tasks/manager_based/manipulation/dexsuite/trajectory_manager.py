@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING
 
 from isaaclab.utils.math import quat_mul, quat_from_euler_xyz, quat_apply, sample_uniform
 
+from .mdp.utils import get_stable_object_placement
+
 if TYPE_CHECKING:
     from .trajectory_cfg import TrajectoryParamsCfg
 
@@ -37,6 +39,7 @@ class TrajectoryManager:
         num_envs: int,
         device: str,
         table_height: float = 0.255,
+        object_prim_path: str | None = None,
     ):
         """
         Initialize trajectory manager.
@@ -46,18 +49,19 @@ class TrajectoryManager:
             num_envs: Number of parallel environments.
             device: Torch device.
             table_height: Z-height of table surface for penetration check.
+            object_prim_path: USD prim path pattern for objects (for stable pose computation).
         """
         self.cfg = cfg
         self.num_envs = num_envs
         self.device = device
         self.table_height = table_height
+        self.object_prim_path = object_prim_path
         
         # Timing
         self.target_dt = 1.0 / cfg.target_hz
         self.total_duration = (
             cfg.pickup_duration
             + cfg.manipulate_duration
-            + cfg.place_duration
             + cfg.release_duration
         )
         
@@ -215,7 +219,8 @@ class TrajectoryManager:
     def _sample_goal(self, env_ids: torch.Tensor, env_origins: torch.Tensor, start_poses: torch.Tensor):
         """Sample goal pose (on table).
         
-        Uses start_poses Z to preserve stable object placement height.
+        Uses stable poses from trimesh for goal placement (z-position + orientation).
+        Different stable poses have different z-positions (e.g., cube on edge vs flat).
         """
         n = len(env_ids)
         cfg = self.cfg
@@ -231,23 +236,34 @@ class TrajectoryManager:
         goal_x = goal_x_local + env_origins[:, 0]
         goal_y = goal_y_local + env_origins[:, 1]
         
-        # Z: use same height as start (object is stable on table at start)
-        # This preserves the stable placement height regardless of object size
-        goal_z_val = start_poses[:, 2]
+        # Get stable placement (z-position + orientation) from trimesh
+        env_ids_list = env_ids.tolist()
+        goal_z_local, goal_quat = get_stable_object_placement(
+            env_ids=env_ids_list,
+            prim_path=self.object_prim_path,
+            table_surface_z=self.table_height,
+            randomize_pose=False,  # Use most stable pose
+            z_offset=0.0005,
+        )
+        goal_z_local = goal_z_local.to(self.device)
+        goal_quat = goal_quat.to(self.device)
         
-        # Random yaw rotation in WORLD frame (around world Z axis)
+        # Add env origin z offset
+        goal_z = goal_z_local + env_origins[:, 2]
+        
+        # Apply random yaw on top of stable pose (like start poses)
         yaw_delta = sample_uniform(-math.pi, math.pi, (n,), self.device)
         delta_quat = quat_from_euler_xyz(
             torch.zeros(n, device=self.device),
             torch.zeros(n, device=self.device),
             yaw_delta,
         )
-        # delta_quat * start_quat = apply yaw in world frame
-        goal_quat = quat_mul(delta_quat, start_poses[:, 3:7])
+        # Apply yaw in world frame on top of stable orientation
+        goal_quat = quat_mul(delta_quat, goal_quat)
         
         self.goal_poses[env_ids, 0] = goal_x
         self.goal_poses[env_ids, 1] = goal_y
-        self.goal_poses[env_ids, 2] = goal_z_val
+        self.goal_poses[env_ids, 2] = goal_z
         self.goal_poses[env_ids, 3:7] = goal_quat
 
     def _generate_full_trajectory(self, env_ids: torch.Tensor):
@@ -282,9 +298,10 @@ class TrajectoryManager:
         
         Phases:
         - pickup: stationary at start (progress = 0)
-        - manipulate: ease-in movement (0 -> ~0.7)
-        - place: ease-out to goal (~0.7 -> 1.0)
+        - manipulate: symmetric ease-in/out (0 -> 1) with S-curve
         - release: stationary at goal (progress = 1)
+        
+        Symmetric easing: ease-in for first half, ease-out for second half.
         """
         cfg = self.cfg
         n, T = times.shape
@@ -292,38 +309,39 @@ class TrajectoryManager:
         # Phase boundaries
         t1 = cfg.pickup_duration
         t2 = t1 + cfg.manipulate_duration
-        t3 = t2 + cfg.place_duration
-        # t4 = t3 + cfg.release_duration (end)
-        
-        # Movement duration (manipulate + place)
-        movement_duration = cfg.manipulate_duration + cfg.place_duration
+        # t3 = t2 + cfg.release_duration (end)
         
         progress = torch.zeros_like(times)
         
         # Pickup phase: progress = 0 (stationary)
         # Already zeros
         
-        # Manipulate phase: ease-in (slow start, speeds up)
-        mask1 = (times >= t1) & (times < t2)
-        if mask1.any():
-            local_t = (times[mask1] - t1) / cfg.manipulate_duration
-            # Ease-in: slow start, accelerate
-            eased = local_t ** cfg.ease_power
-            # Scale to fraction of total movement
-            progress[mask1] = eased * (cfg.manipulate_duration / movement_duration)
-        
-        # Place phase: ease-out (slows down to goal)
-        mask2 = (times >= t2) & (times < t3)
-        if mask2.any():
-            local_t = (times[mask2] - t2) / cfg.place_duration
-            # Ease-out: decelerate to stop
-            eased = 1.0 - (1.0 - local_t) ** cfg.ease_power
-            base = cfg.manipulate_duration / movement_duration
-            progress[mask2] = base + eased * (cfg.place_duration / movement_duration)
+        # Manipulate phase: symmetric ease-in/out
+        mask = (times >= t1) & (times < t2)
+        if mask.any():
+            local_t = (times[mask] - t1) / cfg.manipulate_duration  # 0 to 1
+            
+            # Split into first half (ease-in) and second half (ease-out)
+            first_half = local_t < 0.5
+            second_half = ~first_half
+            
+            eased = torch.zeros_like(local_t)
+            
+            # First half: ease-in (0 -> 0.5)
+            if first_half.any():
+                t_normalized = local_t[first_half] * 2.0  # Map [0, 0.5] -> [0, 1]
+                eased[first_half] = (t_normalized ** cfg.ease_power) * 0.5
+            
+            # Second half: ease-out (0.5 -> 1.0)
+            if second_half.any():
+                t_normalized = (local_t[second_half] - 0.5) * 2.0  # Map [0.5, 1] -> [0, 1]
+                eased[second_half] = 0.5 + (1.0 - (1.0 - t_normalized) ** cfg.ease_power) * 0.5
+            
+            progress[mask] = eased
         
         # Release phase: progress = 1 (stationary at goal)
-        mask3 = times >= t3
-        progress[mask3] = 1.0
+        mask_release = times >= t2
+        progress[mask_release] = 1.0
         
         return progress.clamp(0.0, 1.0)
 
@@ -518,24 +536,22 @@ class TrajectoryManager:
     # ---- Phase helpers ----
     
     def get_phase(self) -> torch.Tensor:
-        """Get current phase index for each environment (0=pickup, 1=manipulate, 2=place, 3=release)."""
+        """Get current phase index for each environment (0=pickup, 1=manipulate, 2=release)."""
         cfg = self.cfg
         t = self.phase_time
         
         phase = torch.zeros_like(t, dtype=torch.long)
         t1 = cfg.pickup_duration
         t2 = t1 + cfg.manipulate_duration
-        t3 = t2 + cfg.place_duration
         
         phase[t >= t1] = 1  # manipulate
-        phase[t >= t2] = 2  # place
-        phase[t >= t3] = 3  # release
+        phase[t >= t2] = 2  # release
         
         return phase
 
     def is_in_release_phase(self) -> torch.Tensor:
         """Check if environments are in release phase."""
-        return self.get_phase() == 3
+        return self.get_phase() == 2
     
     def is_in_pickup_phase(self) -> torch.Tensor:
         """Check if environments are in pickup phase."""
