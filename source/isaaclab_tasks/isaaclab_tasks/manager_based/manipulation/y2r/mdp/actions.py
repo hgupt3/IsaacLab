@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Custom action terms for dexsuite manipulation tasks."""
+"""Custom action terms for Y2R trajectory manipulation tasks."""
 
 from __future__ import annotations
 

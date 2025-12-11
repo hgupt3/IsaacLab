@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Custom event functions for dexsuite trajectory task."""
+"""Custom event functions for Y2R trajectory task."""
 
 from __future__ import annotations
 

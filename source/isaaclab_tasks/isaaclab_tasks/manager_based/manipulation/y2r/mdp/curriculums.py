@@ -9,10 +9,10 @@ import torch
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import mdp
-from isaaclab.managers import ManagerTermBase, SceneEntityCfg
-from isaaclab.utils.math import combine_frame_transforms, compute_pose_error
+from isaaclab.managers import ManagerTermBase
+
+from .rewards import contacts as y2r_contacts
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -53,17 +53,16 @@ def _recurse(iv_elem, fv_elem, data_elem, frac):
 
 
 class DifficultyScheduler(ManagerTermBase):
-    """Adaptive difficulty scheduler for curriculum learning.
+    """Adaptive difficulty scheduler for trajectory curriculum learning.
 
-    Tracks per-environment difficulty levels and adjusts them based on task performance. Difficulty increases when
-    position/orientation errors fall below given tolerances, and decreases otherwise (unless `promotion_only` is set).
-    The normalized average difficulty across environments is exposed as `difficulty_frac` for use in curriculum
-    interpolation.
+    Tracks per-environment difficulty levels and adjusts them based on task performance.
+    Advances when object is at goal during release phase.
 
-    Args:
-        cfg: Configuration object specifying scheduler parameters.
-        env: The manager-based RL environment.
-
+    The normalized average difficulty is exposed as `difficulty_frac` for curriculum interpolation.
+    
+    Tolerance parameters (pos_tol, rot_tol, pc_tol):
+    - If None: uses current success threshold (adaptive with curriculum)
+    - If float: uses fixed tolerance value
     """
 
     def __init__(self, cfg, env):
@@ -82,27 +81,45 @@ class DifficultyScheduler(ManagerTermBase):
         self,
         env: ManagerBasedRLEnv,
         env_ids: Sequence[int],
-        asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-        object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
-        pos_tol: float = 0.1,
-        rot_tol: float | None = None,
         init_difficulty: int = 0,
         min_difficulty: int = 0,
         max_difficulty: int = 50,
         promotion_only: bool = False,
+        use_trajectory: bool = True,  # Always True for trajectory tasks
+        pos_tol: float | None = None,  # None = use current success threshold
+        rot_tol: float | None = None,  # None = use current success threshold
+        pc_tol: float | None = None,   # None = use current success threshold
     ):
-        asset: Articulation = env.scene[asset_cfg.name]
-        object: RigidObject = env.scene[object_cfg.name]
-        command = env.command_manager.get_command("object_pose")
-        des_pos_w, des_quat_w = combine_frame_transforms(
-            asset.data.root_pos_w[env_ids], asset.data.root_quat_w[env_ids], command[env_ids, :3], command[env_ids, 3:7]
-        )
-        pos_err, rot_err = compute_pose_error(
-            des_pos_w, des_quat_w, object.data.root_pos_w[env_ids], object.data.root_quat_w[env_ids]
-        )
-        pos_dist = torch.norm(pos_err, dim=1)
-        rot_dist = torch.norm(rot_err, dim=1)
-        move_up = (pos_dist < pos_tol) & (rot_dist < rot_tol) if rot_tol else pos_dist < pos_tol
+        # Trajectory task: advance when object is at goal during release phase
+        trajectory_manager = env.trajectory_manager
+        use_point_cloud = trajectory_manager.cfg.mode.use_point_cloud
+        
+        # Get current success thresholds from reward manager (already curriculum-adjusted)
+        success_cfg = env.reward_manager.get_term_cfg("trajectory_success")
+        current_error_threshold = success_cfg.params.get("error_threshold", 0.02)
+        current_rot_threshold = success_cfg.params.get("rot_threshold", 0.2)
+        
+        # Use provided tolerances or fall back to current success thresholds
+        effective_pos_tol = pos_tol if pos_tol is not None else current_error_threshold
+        effective_rot_tol = rot_tol if rot_tol is not None else current_rot_threshold
+        effective_pc_tol = pc_tol if pc_tol is not None else current_error_threshold
+        
+        # Check if in release phase
+        in_release = trajectory_manager.is_in_release_phase()[env_ids]
+        
+        if use_point_cloud:
+            # Point cloud mode: use cached mean errors
+            mean_errors = env._cached_mean_errors[env_ids, 0]  # Current target error
+            at_goal = mean_errors < effective_pc_tol
+        else:
+            # Pose mode: check both position AND rotation
+            pos_errors = env._cached_pose_errors['pos'][env_ids, 0]
+            rot_errors = env._cached_pose_errors['rot'][env_ids, 0]
+            at_goal = (pos_errors < effective_pos_tol) & (rot_errors < effective_rot_tol)
+        
+        # Promote if in release AND at goal
+        move_up = in_release & at_goal 
+        
         demot = self.current_adr_difficulties[env_ids] if promotion_only else self.current_adr_difficulties[env_ids] - 1
         self.current_adr_difficulties[env_ids] = torch.where(
             move_up,

@@ -1,0 +1,58 @@
+# Push-T Mode Configuration
+# Inherits from base config and configures T-shape object with direct-to-goal trajectory
+_base_: y2r_config.yaml
+
+# ==============================================================================
+# Push-T Mode Settings
+# ==============================================================================
+push_t:
+  enabled: true
+  object_usd: "assets/t-shape/t-shape.usd"
+  outline_usd: "assets/t-shape_outline/t-shape_outline.usd"
+  object_scale: 1.0
+  outline_position: [-0.55, 0.0]  # Center of table = goal location
+  rolling_window: 2.0     # Trajectory planning horizon (seconds) - controls base speed
+  min_speed: 0.06         # Minimum speed (m/s) - prevents infinite slowdown when very close
+
+# ==============================================================================
+# Trajectory: Direct path to outline (no waypoints)
+# ==============================================================================
+trajectory:
+  duration: 30.0  # 30-second episodes
+  phases:
+    pickup: 0.0      # No pickup phase - always manipulating
+    manipulate: 30.0 # Always in manipulate phase
+    release: 0.0     # No release phase
+
+waypoints:
+  count: [0, 0]  # No intermediate waypoints
+
+# Goal at outline position (fixed, not random)
+goal:
+  x_range: [-0.55, -0.55]  # Exact x of outline
+  y_range: [0.0, 0.0]      # Exact y of outline
+
+# Override randomization: fixed scale for push-T (no random scaling)
+randomization:
+  object:
+    scale: [1.0, 1.0]  # Fixed scale matching push_t.object_scale
+
+# ==============================================================================
+# Evaluation Settings (like play config)
+# ==============================================================================
+curriculum:
+  difficulty:
+    initial: 10
+
+visualization:
+  targets: true                 # Show target point clouds
+  current_object: true          # Show current object point cloud
+  waypoint_region: false         # Show waypoint sampling box
+  goal_region: false             # Show goal sampling region on table
+  pose_axes: true               # Show axis arrows for poses
+  env_ids: null                 # Visualize all envs
+  debug_print_rewards: true     # Print reward breakdown
+
+simulation:
+  num_envs: 32
+

@@ -1,0 +1,694 @@
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Trajectory following task for dexterous manipulation.
+
+This task trains the robot to follow a sequence of targets along a smooth trajectory.
+The trajectory includes pickup from table, variable-speed manipulation, and place-back phases.
+
+Supports two representation modes (controlled by config mode.use_point_cloud):
+- Point cloud mode (default): Uses point-to-point distance for tracking
+- Pose mode: Uses position + rotation (quaternion) for tracking
+"""
+
+from dataclasses import MISSING
+from pathlib import Path
+
+import isaaclab.sim as sim_utils
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
+from isaaclab.envs import ManagerBasedEnvCfg, ViewerCfg
+from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import ObservationGroupCfg as ObsGroup
+from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
+from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sim import CapsuleCfg, ConeCfg, CuboidCfg, CylinderCfg, RigidBodyMaterialCfg, SphereCfg
+from isaaclab.utils import configclass
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
+
+from . import mdp
+from .adr_curriculum import build_curriculum_cfg
+from .config_loader import get_config, get_play_config, get_push_config, Y2RConfig
+from .procedural_shapes import get_procedural_shape_paths
+
+
+# ==============================================================================
+# SCENE CONFIG (static - no config dependencies)
+# ==============================================================================
+
+# Built-in primitive asset configs
+_PRIMITIVE_ASSETS = [
+    CuboidCfg(size=(0.05, 0.1, 0.1), physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
+    CuboidCfg(size=(0.05, 0.05, 0.1), physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
+    CuboidCfg(size=(0.025, 0.1, 0.1), physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
+    CuboidCfg(size=(0.025, 0.05, 0.1), physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
+    CuboidCfg(size=(0.025, 0.025, 0.1), physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
+    CuboidCfg(size=(0.01, 0.1, 0.1), physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
+    SphereCfg(radius=0.035, physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
+    SphereCfg(radius=0.065, physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
+    CapsuleCfg(radius=0.04, height=0.025, physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
+    CapsuleCfg(radius=0.04, height=0.1, physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
+    CapsuleCfg(radius=0.025, height=0.1, physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
+    CapsuleCfg(radius=0.025, height=0.2, physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
+    CapsuleCfg(radius=0.01, height=0.2, physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
+    CylinderCfg(radius=0.05, height=0.1, physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
+    CylinderCfg(radius=0.025, height=0.15, physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
+    CylinderCfg(radius=0.05, height=0.05, physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
+    CylinderCfg(radius=0.05, height=0.025, physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
+    CuboidCfg(size=(0.06, 0.06, 0.06), physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
+    CuboidCfg(size=(0.025, 0.025, 0.025), physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
+]
+
+
+def _build_object_cfg(cfg: Y2RConfig) -> RigidObjectCfg:
+    """Build object config with mix of primitives and procedural shapes.
+    
+    If procedural_objects.enabled is True, generates/loads procedural shapes
+    and mixes them with built-in primitives according to the percentage setting.
+    
+    If push_t.include_in_primitives is True, adds the T-shape USD to the primitives pool.
+    """
+    import math
+    
+    y2r_dir = Path(__file__).parent
+    proc_cfg = cfg.procedural_objects
+    
+    # Start with primitive assets
+    primitive_assets = list(_PRIMITIVE_ASSETS)
+    procedural_assets = []
+    
+    # Add T-shape to primitives if configured
+    if cfg.push_t.include_in_primitives and cfg.push_t.object_usd:
+        t_shape_path = y2r_dir / cfg.push_t.object_usd
+        if t_shape_path.exists():
+            t_shape_cfg = sim_utils.UsdFileCfg(
+                usd_path=str(t_shape_path),
+                scale=(cfg.push_t.object_scale,) * 3,
+                rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                    solver_position_iteration_count=16,
+                    solver_velocity_iteration_count=0,
+                    disable_gravity=False,
+                ),
+                collision_props=sim_utils.CollisionPropertiesCfg(),
+                mass_props=sim_utils.MassPropertiesCfg(mass=0.2),
+            )
+            primitive_assets.append(t_shape_cfg)
+    
+    # Add procedural shapes if enabled
+    if proc_cfg.enabled:
+        shape_paths = get_procedural_shape_paths(proc_cfg._raw, y2r_dir)
+        
+        if shape_paths:
+            # Create UsdFileCfg for each procedural shape
+            for path in shape_paths:
+                usd_cfg = sim_utils.UsdFileCfg(
+                    usd_path=str(path),
+                    scale=(1.0, 1.0, 1.0),  # Must specify scale for randomize_rigid_body_scale to work
+                    rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                        solver_position_iteration_count=16,
+                        solver_velocity_iteration_count=0,
+                        disable_gravity=False,
+                    ),
+                    collision_props=sim_utils.CollisionPropertiesCfg(),
+                    mass_props=sim_utils.MassPropertiesCfg(mass=0.2),
+                )
+                procedural_assets.append(usd_cfg)
+    
+    # Build final asset list based on percentage
+    # Since we can't weight, we repeat assets to achieve desired ratio
+    pct = proc_cfg.percentage if proc_cfg.enabled and procedural_assets else 0.0
+    
+    if pct >= 1.0:
+        # All procedural
+        all_assets = procedural_assets
+    elif pct <= 0.0 or not procedural_assets:
+        # All primitives
+        all_assets = primitive_assets
+    else:
+        # Mix: repeat assets to approximate the desired ratio
+        # Target: procedural_count / total_count ≈ pct
+        n_prim = len(primitive_assets)
+        n_proc = len(procedural_assets)
+        
+        # Find repeat counts to achieve ratio
+        # We want: (n_proc * r_proc) / (n_prim * r_prim + n_proc * r_proc) = pct
+        # Simplify by setting r_prim = 1 and solving for r_proc:
+        # r_proc = pct * n_prim / ((1 - pct) * n_proc)
+        if pct < 1.0:
+            r_proc = pct * n_prim / ((1 - pct) * n_proc)
+            r_proc = max(1, round(r_proc))  # At least 1 repeat
+        else:
+            r_proc = 1
+        
+        all_assets = primitive_assets + procedural_assets * r_proc
+    
+    return RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Object",
+        spawn=sim_utils.MultiAssetSpawnerCfg(
+            assets_cfg=all_assets,
+            random_choice=True,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                solver_position_iteration_count=16,
+                solver_velocity_iteration_count=0,
+                disable_gravity=False,
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.2),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(-0.55, 0.0, 0.45)),
+    )
+
+
+@configclass
+class TrajectorySceneCfg(InteractiveSceneCfg):
+    """Scene for trajectory following task with object starting on table."""
+
+    # robot
+    robot: ArticulationCfg = MISSING
+
+    # object - default config, overridden in TrajectoryEnvCfg.__post_init__
+    object: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Object",
+        spawn=sim_utils.MultiAssetSpawnerCfg(
+            assets_cfg=_PRIMITIVE_ASSETS,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                solver_position_iteration_count=16,
+                solver_velocity_iteration_count=0,
+                disable_gravity=False,
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.2),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(-0.55, 0.0, 0.45)),
+    )
+
+    # table
+    table: RigidObjectCfg = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/table",
+        spawn=sim_utils.CuboidCfg(
+            size=(0.8, 1.5, 0.04),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.4, 0.3, 0.2), roughness=0.5),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(-0.55, 0.0, 0.235), rot=(1.0, 0.0, 0.0, 0.0)),
+    )
+
+    # plane
+    plane = AssetBaseCfg(
+        prim_path="/World/GroundPlane",
+        init_state=AssetBaseCfg.InitialStateCfg(),
+        spawn=sim_utils.GroundPlaneCfg(),
+        collision_group=-1,
+    )
+
+    # lights
+    sky_light = AssetBaseCfg(
+        prim_path="/World/skyLight",
+        spawn=sim_utils.DomeLightCfg(
+            intensity=750.0,
+            texture_file=f"{ISAAC_NUCLEUS_DIR}/Materials/Textures/Skies/PolyHaven/kloofendal_43d_clear_puresky_4k.hdr",
+        ),
+    )
+
+    # Visual outline for push-T mode (set dynamically in TrajectoryEnvCfg_PUSH)
+    outline: AssetBaseCfg | None = None
+
+
+@configclass
+class CommandsCfg:
+    """Command terms for the MDP (empty for trajectory task - uses TrajectoryManager instead)."""
+    pass
+
+
+@configclass
+class ActionsCfg:
+    pass
+
+
+# ==============================================================================
+# CONFIG BUILDERS - Create manager configs dynamically from Y2RConfig
+# ==============================================================================
+
+def _build_observations_cfg(cfg: Y2RConfig):
+    """Build ObservationsCfg from config."""
+    
+    @configclass
+    class PolicyCfg(ObsGroup):
+        """Observations for policy group."""
+        actions = ObsTerm(func=mdp.last_action)
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+            self.history_length = cfg.observations.history.policy
+
+    @configclass
+    class ProprioObsCfg(ObsGroup):
+        """Observations for proprioception group."""
+        joint_pos = ObsTerm(func=mdp.joint_pos, noise=Unoise(n_min=-0.0, n_max=0.0))
+        joint_vel = ObsTerm(func=mdp.joint_vel, noise=Unoise(n_min=-0.0, n_max=0.0))
+        hand_tips_state_b = ObsTerm(
+            func=mdp.body_state_b,
+            noise=Unoise(n_min=-0.0, n_max=0.0),
+            clip=cfg.observations.clip_range,
+            params={
+                "body_asset_cfg": SceneEntityCfg("robot"),
+                "base_asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+        contact: ObsTerm = MISSING
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+            self.history_length = cfg.observations.history.proprio
+
+    @configclass
+    class PerceptionObsCfg(ObsGroup):
+        """Perception observations: current object point cloud and pose with history."""
+        object_point_cloud = ObsTerm(
+            func=mdp.object_point_cloud_b,
+            noise=Unoise(n_min=-0.0, n_max=0.0),
+            clip=cfg.observations.clip_range,
+            params={
+                "num_points": cfg.observations.num_points,
+                "flatten": True,
+                "visualize": cfg.visualization.current_object,
+                "visualize_env_ids": cfg.visualization.env_ids,
+            },
+        )
+        object_pose = ObsTerm(
+            func=mdp.object_pose_b,
+            noise=Unoise(n_min=-0.0, n_max=0.0),
+            clip=cfg.observations.clip_range,
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_dim = 0
+            self.concatenate_terms = True
+            self.flatten_history_dim = True
+            self.history_length = cfg.observations.history.perception
+    
+    @configclass
+    class TargetObsCfg(ObsGroup):
+        """Target observations: point clouds AND poses from trajectory."""
+        target_point_clouds = ObsTerm(
+            func=mdp.target_sequence_obs_b,
+            noise=Unoise(n_min=-0.0, n_max=0.0),
+            clip=cfg.observations.clip_range,
+            params={},
+        )
+        target_poses = ObsTerm(
+            func=mdp.target_sequence_poses_b,
+            noise=Unoise(n_min=-0.0, n_max=0.0),
+            clip=cfg.observations.clip_range,
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_dim = 0
+            self.concatenate_terms = True
+            self.flatten_history_dim = True
+            self.history_length = cfg.observations.history.targets
+
+    @configclass
+    class ObservationsCfg:
+        """Observation specifications for the MDP."""
+        policy: PolicyCfg = PolicyCfg()
+        proprio: ProprioObsCfg = ProprioObsCfg()
+        perception: PerceptionObsCfg = PerceptionObsCfg()
+        targets: TargetObsCfg = TargetObsCfg()
+
+    return ObservationsCfg()
+
+
+def _build_events_cfg(cfg: Y2RConfig):
+    """Build EventCfg from config."""
+    
+    @configclass
+    class EventCfg:
+        """Configuration for randomization."""
+
+        randomize_object_scale = EventTerm(
+            func=mdp.randomize_rigid_body_scale,
+            mode="prestartup",
+            params={
+                "scale_range": list(cfg.randomization.object.scale),
+                "asset_cfg": SceneEntityCfg("object"),
+            },
+        )
+
+        robot_physics_material = EventTerm(
+            func=mdp.randomize_rigid_body_material,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+                "static_friction_range": list(cfg.randomization.robot.static_friction),
+                "dynamic_friction_range": list(cfg.randomization.robot.dynamic_friction),
+                "restitution_range": list(cfg.randomization.robot.restitution),
+                "num_buckets": 250,
+            },
+        )
+
+        object_physics_material = EventTerm(
+            func=mdp.randomize_rigid_body_material,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("object", body_names=".*"),
+                "static_friction_range": list(cfg.randomization.object.static_friction),
+                "dynamic_friction_range": list(cfg.randomization.object.dynamic_friction),
+                "restitution_range": list(cfg.randomization.object.restitution),
+                "num_buckets": 250,
+            },
+        )
+
+        joint_stiffness_and_damping = EventTerm(
+            func=mdp.randomize_actuator_gains,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+                "stiffness_distribution_params": list(cfg.randomization.robot.stiffness_scale),
+                "damping_distribution_params": list(cfg.randomization.robot.damping_scale),
+                "operation": "scale",
+            },
+        )
+
+        joint_friction = EventTerm(
+            func=mdp.randomize_joint_parameters,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+                "friction_distribution_params": list(cfg.randomization.robot.joint_friction_scale),
+                "operation": "scale",
+            },
+        )
+
+        object_scale_mass = EventTerm(
+            func=mdp.randomize_rigid_body_mass,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("object"),
+                "mass_distribution_params": list(cfg.randomization.object.mass_scale),
+                "operation": "scale",
+            },
+        )
+
+        reset_table = EventTerm(
+            func=mdp.reset_root_state_uniform,
+            mode="reset",
+            params={
+                "pose_range": {
+                    "x": list(cfg.randomization.reset.table_xy),
+                    "y": list(cfg.randomization.reset.table_xy),
+                    "z": [0.0, 0.0],
+                },
+                "velocity_range": {"x": [-0.0, 0.0], "y": [-0.0, 0.0], "z": [-0.0, 0.0]},
+                "asset_cfg": SceneEntityCfg("table"),
+            },
+        )
+
+        reset_object = EventTerm(
+            func=mdp.reset_object_on_table_stable,
+            mode="reset",
+            params={
+                "xy_position_range": {
+                    "x": list(cfg.randomization.reset.object_x),
+                    "y": list(cfg.randomization.reset.object_y),
+                    "yaw": list(cfg.randomization.reset.object_yaw),
+                },
+                "table_surface_z": cfg.workspace.table_surface_z,
+                "randomize_stable_pose": False,
+                "asset_cfg": SceneEntityCfg("object"),
+                "z_offset": cfg.randomization.reset.z_offset,
+            },
+        )
+
+        reset_root = EventTerm(
+            func=mdp.reset_root_state_uniform,
+            mode="reset",
+            params={
+                "pose_range": {"x": [-0.0, 0.0], "y": [-0.0, 0.0], "yaw": [-0.0, 0.0]},
+                "velocity_range": {"x": [-0.0, 0.0], "y": [-0.0, 0.0], "z": [-0.0, 0.0]},
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+
+        reset_robot_joints = EventTerm(
+            func=mdp.reset_joints_by_offset,
+            mode="reset",
+            params={
+                "position_range": list(cfg.randomization.reset.robot_joints),
+                "velocity_range": [0.0, 0.0],
+            },
+        )
+
+        reset_robot_wrist_joint = EventTerm(
+            func=mdp.reset_joints_by_offset,
+            mode="reset",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", joint_names="iiwa7_joint_7"),
+                "position_range": list(cfg.randomization.reset.robot_wrist),
+                "velocity_range": [0.0, 0.0],
+            },
+        )
+
+        variable_gravity = EventTerm(
+            func=mdp.randomize_physics_scene_gravity,
+            mode="reset",
+            params={
+                "gravity_distribution_params": (
+                    tuple(cfg.curriculum.gravity.initial),
+                    tuple(cfg.curriculum.gravity.initial),
+                ),
+                "operation": "abs",
+            },
+        )
+
+    return EventCfg()
+
+
+def _build_rewards_cfg(cfg: Y2RConfig):
+    """Build RewardsCfg from config."""
+    
+    @configclass
+    class RewardsCfg:
+        """Reward terms for the MDP."""
+
+        action_l2 = RewTerm(func=mdp.action_l2_clamped, weight=cfg.rewards.action_l2.weight)
+
+        action_rate_l2 = RewTerm(func=mdp.action_rate_l2_clamped, weight=cfg.rewards.action_rate_l2.weight)
+
+        fingers_to_object = RewTerm(
+            func=mdp.object_ee_distance,
+            params={"std": cfg.rewards.fingers_to_object.params.get("std", 0.4)},
+            weight=cfg.rewards.fingers_to_object.weight,
+        )
+
+        lookahead_tracking = RewTerm(
+            func=mdp.lookahead_tracking,
+            weight=cfg.rewards.lookahead_tracking.weight,
+            params={
+                "std": cfg.rewards.lookahead_tracking.params.get("std", 0.03),
+                "decay": cfg.rewards.lookahead_tracking.params.get("decay", 0.2),
+                "contact_threshold": cfg.rewards.lookahead_tracking.params.get("contact_threshold", 2.0),
+                "rot_std": cfg.rewards.lookahead_tracking.params.get("rot_std", 0.3),
+            },
+        )
+
+        trajectory_success = RewTerm(
+            func=mdp.trajectory_success,
+            weight=cfg.rewards.trajectory_success.weight,
+            params={
+                "error_threshold": cfg.rewards.trajectory_success.params["point_cloud_threshold"][0],
+                "rot_threshold": cfg.rewards.trajectory_success.params["rotation_threshold"][0],
+            },
+        )
+
+        early_termination = RewTerm(
+            func=mdp.is_terminated_term,
+            weight=cfg.rewards.early_termination.weight,
+            params={"term_keys": cfg.rewards.early_termination.params.get(
+                "term_keys", ["abnormal_robot", "trajectory_deviation"]
+            )},
+        )
+
+        arm_table_penalty = RewTerm(
+            func=mdp.arm_table_binary_penalty,
+            weight=cfg.rewards.arm_table_penalty.weight,
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names=["iiwa7_link_(3|4|5|6|7)|palm_link"]),
+                "table_z": cfg.rewards.arm_table_penalty.params.get("table_z", 0.255),
+                "threshold_mid": cfg.rewards.arm_table_penalty.params.get("threshold_mid", 0.06),
+                "threshold_distal": cfg.rewards.arm_table_penalty.params.get("threshold_distal", 0.03),
+            },
+        )
+
+    return RewardsCfg()
+
+
+def _build_terminations_cfg(cfg: Y2RConfig):
+    """Build TerminationsCfg from config."""
+    
+    @configclass
+    class TerminationsCfg:
+        """Termination terms for the MDP."""
+
+        time_out = DoneTerm(func=mdp.time_out, time_out=True)
+
+        abnormal_robot = DoneTerm(func=mdp.abnormal_robot_state)
+
+        trajectory_deviation = DoneTerm(
+            func=mdp.trajectory_deviation,
+            params={
+                "threshold": cfg.terminations.trajectory_deviation.point_cloud_threshold[0],
+                "rot_threshold": cfg.terminations.trajectory_deviation.rotation_threshold[0],
+            },
+        )
+
+    return TerminationsCfg()
+
+
+# ==============================================================================
+# MAIN ENV CONFIG
+# ==============================================================================
+
+@configclass
+class TrajectoryEnvCfg(ManagerBasedEnvCfg):
+    """Trajectory following task definition.
+
+    The robot must follow a sequence of point cloud targets along a smooth Bezier trajectory.
+    Includes pickup from table, variable-speed manipulation, and place-back phases.
+    
+    All config values are loaded dynamically in __post_init__ from the appropriate YAML file.
+    Subclasses override _get_config() to use different YAML files.
+    """
+
+    # Static settings (no config dependencies)
+    viewer: ViewerCfg = ViewerCfg(eye=(-2.25, 0.0, 0.75), lookat=(0.0, 0.0, 0.45), origin_type="env")
+    
+    # Scene - will be configured in __post_init__
+    scene: TrajectorySceneCfg = TrajectorySceneCfg(num_envs=1, env_spacing=3.0)  # Placeholder values
+    
+    # These will be built dynamically in __post_init__
+    observations = None
+    actions: ActionsCfg = ActionsCfg()
+    commands: CommandsCfg = CommandsCfg()
+    rewards = None
+    terminations = None
+    events = None
+    curriculum = None
+    
+    # Config reference (set in __post_init__)
+    y2r_cfg: Y2RConfig = None
+
+    def _get_config(self) -> Y2RConfig:
+        """Return config to use. Override in subclasses for different configs."""
+        return get_config()
+
+    def __post_init__(self):
+        """Build all config-dependent managers from the correct config."""
+        # Load the right config for this env type
+        cfg = self._get_config()
+        self.y2r_cfg = cfg
+        
+        # Build scene with config values
+        self.scene = TrajectorySceneCfg(
+            num_envs=cfg.simulation.num_envs,
+            env_spacing=cfg.simulation.env_spacing,
+            replicate_physics=cfg.simulation.replicate_physics,
+        )
+        
+        # Override object config with dynamic mix of primitives + procedural shapes
+        self.scene.object = _build_object_cfg(cfg)
+        
+        # Build managers from config
+        self.observations = _build_observations_cfg(cfg)
+        self.events = _build_events_cfg(cfg)
+        self.rewards = _build_rewards_cfg(cfg)
+        self.terminations = _build_terminations_cfg(cfg)
+        self.curriculum = build_curriculum_cfg(cfg)
+        
+        # Set simulation parameters
+        self.decimation = cfg.simulation.decimation
+        self.episode_length_s = cfg.trajectory.duration
+        self.is_finite_horizon = True
+        
+        self.sim.dt = cfg.simulation.physics_dt
+        self.sim.render_interval = self.decimation
+        self.sim.physx.bounce_threshold_velocity = 0.01
+        self.sim.physx.gpu_max_rigid_patch_count = 4 * 5 * 2**15
+
+
+class TrajectoryEnvCfg_PLAY(TrajectoryEnvCfg):
+    """Trajectory task evaluation environment definition."""
+
+    def _get_config(self) -> Y2RConfig:
+        """Use play config for evaluation."""
+        return get_play_config()
+
+    def __post_init__(self):
+        super().__post_init__()
+        
+        # Start at configured difficulty for evaluation
+        if self.curriculum is not None:
+            self.curriculum.adr.params["init_difficulty"] = self.y2r_cfg.curriculum.difficulty.initial
+
+
+class TrajectoryEnvCfg_PUSH(TrajectoryEnvCfg):
+    """Push-T task evaluation environment definition.
+    
+    Uses T-shaped object with direct trajectory to goal (outline position).
+    """
+
+    def _get_config(self) -> Y2RConfig:
+        """Use push config for push-T task."""
+        return get_push_config()
+
+    def __post_init__(self):
+        super().__post_init__()
+        
+        cfg = self.y2r_cfg
+        config_dir = Path(__file__).parent
+        
+        # Override object to T-shape USD
+        object_usd_path = str(config_dir / cfg.push_t.object_usd)
+        self.scene.object = RigidObjectCfg(
+            prim_path="{ENV_REGEX_NS}/Object",
+            spawn=sim_utils.UsdFileCfg(
+                usd_path=object_usd_path,
+                scale=(cfg.push_t.object_scale,) * 3,
+                rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                    solver_position_iteration_count=16,
+                    solver_velocity_iteration_count=0,
+                    disable_gravity=False,
+                ),
+                collision_props=sim_utils.CollisionPropertiesCfg(),
+                mass_props=sim_utils.MassPropertiesCfg(mass=0.2),
+            ),
+            init_state=RigidObjectCfg.InitialStateCfg(pos=(-0.55, 0.0, 0.45)),
+        )
+        
+        # Add visual outline (visual-only, no physics) at goal position
+        outline_usd_path = str(config_dir / cfg.push_t.outline_usd)
+        self.scene.outline = AssetBaseCfg(
+            prim_path="{ENV_REGEX_NS}/Outline",
+            spawn=sim_utils.UsdFileCfg(
+                usd_path=outline_usd_path,
+                scale=(cfg.push_t.object_scale,) * 3,
+            ),
+            init_state=AssetBaseCfg.InitialStateCfg(
+                pos=(*cfg.push_t.outline_position, cfg.workspace.table_surface_z + 0.001),
+                rot=(0.5, 0.5, -0.5, -0.5),  # 90° X then -90° Z to lay flat and rotate
+            ),
+        )
+        
+        # Set difficulty from push config
+        if self.curriculum is not None:
+            self.curriculum.adr.params["init_difficulty"] = cfg.curriculum.difficulty.initial

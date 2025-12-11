@@ -1,0 +1,4 @@
+# This directory holds procedurally generated shapes.
+# Shapes are generated automatically on first run if enabled in y2r_config.yaml.
+# Set procedural_objects.regenerate: true to force regeneration.
+

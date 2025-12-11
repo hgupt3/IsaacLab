@@ -89,6 +89,9 @@ from isaaclab_rl.rl_games import MultiObserver, PbtAlgoObserver, RlGamesGpuEnv, 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
+# Register custom networks for y2r tasks (must be before Runner.load)
+import isaaclab_tasks.manager_based.manipulation.y2r.networks  # noqa: F401
+
 # import logger
 logger = logging.getLogger(__name__)
 

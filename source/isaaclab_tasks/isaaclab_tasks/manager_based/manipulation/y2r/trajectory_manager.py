@@ -20,7 +20,7 @@ from isaaclab.utils.math import quat_mul, quat_from_euler_xyz, quat_apply, sampl
 from .mdp.utils import get_stable_object_placement
 
 if TYPE_CHECKING:
-    from .trajectory_cfg import TrajectoryParamsCfg
+    from .config_loader import Y2RConfig
 
 
 class TrajectoryManager:
@@ -35,7 +35,7 @@ class TrajectoryManager:
 
     def __init__(
         self,
-        cfg: "TrajectoryParamsCfg",
+        cfg: "Y2RConfig",
         num_envs: int,
         device: str,
         table_height: float = 0.255,
@@ -45,7 +45,7 @@ class TrajectoryManager:
         Initialize trajectory manager.
         
         Args:
-            cfg: TrajectoryParamsCfg with timing and trajectory parameters.
+            cfg: Y2RConfig with timing and trajectory parameters.
             num_envs: Number of parallel environments.
             device: Torch device.
             table_height: Z-height of table surface for penetration check.
@@ -57,15 +57,22 @@ class TrajectoryManager:
         self.table_height = table_height
         self.object_prim_path = object_prim_path
         
-        # Timing
-        self.target_dt = 1.0 / cfg.target_hz
-        self.total_duration = (
-            cfg.pickup_duration
-            + cfg.manipulate_duration
-            + cfg.release_duration
-        )
+        # Extract trajectory settings from config
+        traj = cfg.trajectory
         
-        # Total number of targets for entire episode
+        # Timing
+        self.target_dt = 1.0 / traj.target_hz
+        # For push-T, the trajectory horizon is the rolling window (e.g., 7s), not the full episode
+        if cfg.push_t.enabled:
+            self.total_duration = cfg.push_t.rolling_window
+        else:
+            self.total_duration = (
+                traj.phases.pickup
+                + traj.phases.manipulate
+                + traj.phases.release
+            )
+        
+        # Total number of targets for the trajectory buffer
         self.total_targets = int(self.total_duration / self.target_dt) + 1
         
         # Full trajectory buffer: (num_envs, total_targets, 7) for pos(3) + quat(4)
@@ -85,11 +92,16 @@ class TrajectoryManager:
         self.env_origins = torch.zeros(num_envs, 3, device=device)
         
         # Waypoints: (num_envs, max_waypoints, 7)
-        self.waypoints = torch.zeros(num_envs, cfg.num_waypoints_max, 7, device=device)
+        wp_cfg = cfg.waypoints
+        self.waypoints = torch.zeros(num_envs, wp_cfg.count[1], 7, device=device)
         self.num_waypoints = torch.zeros(num_envs, dtype=torch.long, device=device)
         
         # Local point cloud for penetration checking (set by observation term)
         self.points_local: torch.Tensor | None = None
+        
+        # For push-T replanning: track when to regenerate trajectory
+        self.last_replan_idx = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self.current_object_poses = torch.zeros(num_envs, 7, device=device)
 
     def reset(
         self,
@@ -127,20 +139,55 @@ class TrajectoryManager:
         self._sample_goal(env_ids, env_origins, start_poses)
         
         # Generate entire trajectory
-        self._generate_full_trajectory(env_ids)
+        # For push-T mode, use adaptive speed from the start
+        if self.cfg.push_t.enabled:
+            # Initialize current_object_poses with start poses for initial trajectory
+            self.current_object_poses[env_ids] = start_poses
+            self._replan_from_current(env_ids)
+            # Reset replan tracking so first replan happens at correct time
+            self.last_replan_idx[env_ids] = 0
+        else:
+            self._generate_full_trajectory(env_ids)
 
-    def step(self, dt: float):
+    def step(self, dt: float, object_poses: torch.Tensor | None = None):
         """
         Advance trajectory by one timestep.
         
+        For push-T mode: replans trajectory from current object position every window_size timesteps.
+        
         Args:
             dt: Simulation timestep.
+            object_poses: Current object poses (num_envs, 7) for replanning. Only used in push-T mode.
         """
         self.phase_time += dt
         
         # Compute current target index from time
         new_idx = (self.phase_time / self.target_dt).long()
-        self.current_idx = torch.clamp(new_idx, max=self.total_targets - self.cfg.window_size)
+        
+        # For push-T: don't clamp idx (need continuous replanning)
+        # For normal: clamp to trajectory length
+        if self.cfg.push_t.enabled:
+            self.current_idx = new_idx
+        else:
+            self.current_idx = torch.clamp(new_idx, max=self.total_targets - self.cfg.trajectory.window_size)
+        
+        # Push-T replanning: regenerate trajectory from current position every window_size timesteps
+        if self.cfg.push_t.enabled and object_poses is not None:
+            self.current_object_poses = object_poses
+            replan_interval = self.cfg.trajectory.window_size
+            
+            # Check which envs need replanning (every window_size steps, but not at idx 0)
+            steps_since_replan = self.current_idx - self.last_replan_idx
+            needs_replan = (steps_since_replan >= replan_interval) & (self.current_idx > 0)
+            
+            if needs_replan.any():
+                env_ids = torch.where(needs_replan)[0]
+                self._replan_from_current(env_ids)
+                # Reset to start of trajectory buffer after replanning
+                # This ensures current_idx stays within buffer bounds
+                self.current_idx[env_ids] = 0
+                self.last_replan_idx[env_ids] = 0
+                self.phase_time[env_ids] = 0.0
 
     def get_window_targets(self) -> torch.Tensor:
         """
@@ -149,7 +196,7 @@ class TrajectoryManager:
         Returns:
             (num_envs, window_size, 7) tensor of pos(3) + quat(4).
         """
-        window_size = self.cfg.window_size
+        window_size = self.cfg.trajectory.window_size
         
         # Build indices: (num_envs, window_size)
         batch_idx = torch.arange(self.num_envs, device=self.device).unsqueeze(1)
@@ -170,34 +217,37 @@ class TrajectoryManager:
         """Sample 0-2 intermediate waypoints."""
         n = len(env_ids)
         cfg = self.cfg
+        wp_cfg = cfg.waypoints
+        ws_cfg = cfg.workspace
         
         # Random number of waypoints
         self.num_waypoints[env_ids] = torch.randint(
-            cfg.num_waypoints_min, cfg.num_waypoints_max + 1, (n,), device=self.device
+            wp_cfg.count[0], wp_cfg.count[1] + 1, (n,), device=self.device
         )
         
         # Convert start to local frame for clamping
         start_local = start_poses[:, :3] - env_origins
         
-        for wp_idx in range(cfg.num_waypoints_max):
+        max_wp = wp_cfg.count[1]
+        for wp_idx in range(max_wp):
             # Position: sample in local frame (None = use workspace, else offset from start)
-            if cfg.waypoint_position_range_x is None:
-                x_local = sample_uniform(cfg.workspace_x[0], cfg.workspace_x[1], (n,), self.device)
+            if wp_cfg.position_range.x is None:
+                x_local = sample_uniform(ws_cfg.x[0], ws_cfg.x[1], (n,), self.device)
             else:
-                x_local = start_local[:, 0] + sample_uniform(cfg.waypoint_position_range_x[0], cfg.waypoint_position_range_x[1], (n,), self.device)
-                x_local = x_local.clamp(cfg.workspace_x[0], cfg.workspace_x[1])
+                x_local = start_local[:, 0] + sample_uniform(wp_cfg.position_range.x[0], wp_cfg.position_range.x[1], (n,), self.device)
+                x_local = x_local.clamp(ws_cfg.x[0], ws_cfg.x[1])
             
-            if cfg.waypoint_position_range_y is None:
-                y_local = sample_uniform(cfg.workspace_y[0], cfg.workspace_y[1], (n,), self.device)
+            if wp_cfg.position_range.y is None:
+                y_local = sample_uniform(ws_cfg.y[0], ws_cfg.y[1], (n,), self.device)
             else:
-                y_local = start_local[:, 1] + sample_uniform(cfg.waypoint_position_range_y[0], cfg.waypoint_position_range_y[1], (n,), self.device)
-                y_local = y_local.clamp(cfg.workspace_y[0], cfg.workspace_y[1])
+                y_local = start_local[:, 1] + sample_uniform(wp_cfg.position_range.y[0], wp_cfg.position_range.y[1], (n,), self.device)
+                y_local = y_local.clamp(ws_cfg.y[0], ws_cfg.y[1])
             
-            if cfg.waypoint_position_range_z is None:
-                z_local = sample_uniform(cfg.workspace_z_min, cfg.workspace_z_max, (n,), self.device)
+            if wp_cfg.position_range.z is None:
+                z_local = sample_uniform(ws_cfg.z[0], ws_cfg.z[1], (n,), self.device)
             else:
-                z_local = sample_uniform(cfg.waypoint_position_range_z[0], cfg.waypoint_position_range_z[1], (n,), self.device)
-                z_local = z_local.clamp(cfg.workspace_z_min, cfg.workspace_z_max)
+                z_local = sample_uniform(wp_cfg.position_range.z[0], wp_cfg.position_range.z[1], (n,), self.device)
+                z_local = z_local.clamp(ws_cfg.z[0], ws_cfg.z[1])
             
             pos_local = torch.stack([x_local, y_local, z_local], dim=-1)
             
@@ -205,8 +255,8 @@ class TrajectoryManager:
             pos_world = pos_local + env_origins
             
             # Orientation: random rotation in WORLD frame if enabled
-            if cfg.vary_waypoint_orientation:
-                euler = sample_uniform(-cfg.waypoint_max_rotation, cfg.waypoint_max_rotation, (n, 3), self.device)
+            if wp_cfg.vary_orientation:
+                euler = sample_uniform(-wp_cfg.max_rotation, wp_cfg.max_rotation, (n, 3), self.device)
                 delta_quat = quat_from_euler_xyz(euler[:, 0], euler[:, 1], euler[:, 2])
                 # delta_quat * start_quat = apply delta in world frame
                 quat = quat_mul(delta_quat, start_poses[:, 3:7])
@@ -224,10 +274,12 @@ class TrajectoryManager:
         """
         n = len(env_ids)
         cfg = self.cfg
+        goal_cfg = cfg.goal
+        ws_cfg = cfg.workspace
         
         # Random XY (None = use workspace bounds)
-        x_range = cfg.goal_x_range if cfg.goal_x_range is not None else cfg.workspace_x
-        y_range = cfg.goal_y_range if cfg.goal_y_range is not None else cfg.workspace_y
+        x_range = goal_cfg.x_range if goal_cfg.x_range is not None else ws_cfg.x
+        y_range = goal_cfg.y_range if goal_cfg.y_range is not None else ws_cfg.y
         
         goal_x_local = sample_uniform(x_range[0], x_range[1], (n,), self.device)
         goal_y_local = sample_uniform(y_range[0], y_range[1], (n,), self.device)
@@ -237,16 +289,22 @@ class TrajectoryManager:
         goal_y = goal_y_local + env_origins[:, 1]
         
         # Get stable placement (z-position + orientation) from trimesh
-        env_ids_list = env_ids.tolist()
-        goal_z_local, goal_quat = get_stable_object_placement(
-            env_ids=env_ids_list,
-            prim_path=self.object_prim_path,
-            table_surface_z=self.table_height,
-            randomize_pose=False,  # Use most stable pose
-            z_offset=0.0005,
-        )
-        goal_z_local = goal_z_local.to(self.device)
-        goal_quat = goal_quat.to(self.device)
+        # Skip for push-T mode (use fixed flat orientation on table)
+        if cfg.push_t.enabled:
+            # Fixed flat orientation on table surface (90° X then -90° Z rotation)
+            goal_z_local = torch.full((n,), self.table_height + cfg.randomization.reset.z_offset, device=self.device)
+            goal_quat = torch.tensor([[0.5, 0.5, -0.5, -0.5]], device=self.device).repeat(n, 1)  # 90° X + -90° Z
+        else:
+            env_ids_list = env_ids.tolist()
+            goal_z_local, goal_quat = get_stable_object_placement(
+                env_ids=env_ids_list,
+                prim_path=self.object_prim_path,
+                table_surface_z=self.table_height,
+                randomize_pose=False,  # Use most stable pose
+                z_offset=cfg.randomization.reset.z_offset,
+            )
+            goal_z_local = goal_z_local.to(self.device)
+            goal_quat = goal_quat.to(self.device)
         
         # Add env origin z offset
         goal_z = goal_z_local + env_origins[:, 2]
@@ -292,24 +350,128 @@ class TrajectoryManager:
         self.trajectory[env_ids, :, :3] = positions
         self.trajectory[env_ids, :, 3:7] = orientations
 
+    def _replan_from_current(self, env_ids: torch.Tensor):
+        """Regenerate trajectory from current object pose to goal (push-T mode).
+        
+        Generates a fixed-horizon trajectory (rolling_window seconds) from the
+        current object position to the goal. This keeps a consistent 7s (configurable)
+        horizon and then we consume it in sliding windows of size `window_size`
+        (e.g., 5 targets) before replanning again.
+        """
+        # Update start poses to current actual object positions
+        self.start_poses[env_ids] = self.current_object_poses[env_ids]
+        
+        # Fixed horizon duration (e.g., 7s)
+        duration = self.cfg.push_t.rolling_window
+        num_tgt = min(int(duration / self.target_dt) + 1, self.total_targets)
+        
+        # Time array for this horizon
+        times = torch.arange(num_tgt, device=self.device).float() * self.target_dt  # (num_tgt,)
+        progress = (times / duration).clamp(0.0, 1.0)  # Linear progress over horizon
+        
+        # Symmetric easing
+        traj_cfg = self.cfg.trajectory
+        first_half = progress < 0.5
+        second_half = ~first_half
+        eased = torch.zeros_like(progress)
+        if first_half.any():
+            t_norm = progress[first_half] * 2.0
+            eased[first_half] = (t_norm ** traj_cfg.easing_power) * 0.5
+        if second_half.any():
+            t_norm = (progress[second_half] - 0.5) * 2.0
+            eased[second_half] = 0.5 + (1.0 - (1.0 - t_norm) ** traj_cfg.easing_power) * 0.5
+        progress_eased = eased  # (num_tgt,)
+        
+        # Build trajectories per env
+        for env_id in env_ids:
+            env_id = env_id.item()
+            
+            # Interpolate positions (lerp)
+            start_pos = self.start_poses[env_id:env_id+1, :3]  # (1, 3)
+            goal_pos = self.goal_poses[env_id:env_id+1, :3]    # (1, 3)
+            positions = start_pos + progress_eased.unsqueeze(-1) * (goal_pos - start_pos)
+            
+            # Interpolate orientations (slerp)
+            start_quat = self.start_poses[env_id:env_id+1, 3:7][0]  # (4,)
+            goal_quat = self.goal_poses[env_id:env_id+1, 3:7][0]    # (4,)
+            orientations = torch.zeros(num_tgt, 4, device=self.device)
+            for t, t_val in enumerate(progress_eased):
+                orientations[t] = self._slerp(start_quat, goal_quat, t_val.item())
+            
+            # Store in trajectory buffer (pad remaining with final pose)
+            self.trajectory[env_id, :num_tgt, :3] = positions
+            self.trajectory[env_id, :num_tgt, 3:7] = orientations
+            if num_tgt < self.total_targets:
+                self.trajectory[env_id, num_tgt:, :3] = positions[-1]
+                self.trajectory[env_id, num_tgt:, 3:7] = orientations[-1]
+    
+    def _slerp(self, q1: torch.Tensor, q2: torch.Tensor, t: float) -> torch.Tensor:
+        """Spherical linear interpolation between two quaternions."""
+        dot = (q1 * q2).sum()
+        
+        # If negative dot, negate one quat to take shorter path
+        if dot < 0:
+            q2 = -q2
+            dot = -dot
+        
+        dot = torch.clamp(dot, -1.0, 1.0)
+        
+        # If very close, use linear interpolation
+        if dot > 0.9995:
+            result = q1 + t * (q2 - q1)
+            return result / torch.norm(result)
+        
+        theta = torch.acos(dot)
+        sin_theta = torch.sin(theta)
+        
+        w1 = torch.sin((1.0 - t) * theta) / sin_theta
+        w2 = torch.sin(t * theta) / sin_theta
+        
+        return w1 * q1 + w2 * q2
+
     def _compute_progress(self, times: torch.Tensor) -> torch.Tensor:
         """
         Compute progress (0 to 1) with phase-based easing.
         
-        Phases:
+        For push-T mode: Always in manipulate phase (no pickup/release).
+        For normal mode:
         - pickup: stationary at start (progress = 0)
         - manipulate: symmetric ease-in/out (0 -> 1) with S-curve
         - release: stationary at goal (progress = 1)
         
         Symmetric easing: ease-in for first half, ease-out for second half.
         """
-        cfg = self.cfg
+        cfg = self.cfg.trajectory
         n, T = times.shape
         
+        # Push-T mode: always manipulate phase, no pickup/release
+        if self.cfg.push_t.enabled:
+            # Map time directly to progress with symmetric easing
+            local_t = (times / cfg.phases.manipulate).clamp(0.0, 1.0)  # 0 to 1
+            
+            # Split into first half (ease-in) and second half (ease-out)
+            first_half = local_t < 0.5
+            second_half = ~first_half
+            
+            progress = torch.zeros_like(local_t)
+            
+            # First half: ease-in (0 -> 0.5)
+            if first_half.any():
+                t_normalized = local_t[first_half] * 2.0  # Map [0, 0.5] -> [0, 1]
+                progress[first_half] = (t_normalized ** cfg.easing_power) * 0.5
+            
+            # Second half: ease-out (0.5 -> 1.0)
+            if second_half.any():
+                t_normalized = (local_t[second_half] - 0.5) * 2.0  # Map [0.5, 1] -> [0, 1]
+                progress[second_half] = 0.5 + (1.0 - (1.0 - t_normalized) ** cfg.easing_power) * 0.5
+            
+            return progress.clamp(0.0, 1.0)
+        
+        # Normal mode: phases
         # Phase boundaries
-        t1 = cfg.pickup_duration
-        t2 = t1 + cfg.manipulate_duration
-        # t3 = t2 + cfg.release_duration (end)
+        t1 = cfg.phases.pickup
+        t2 = t1 + cfg.phases.manipulate
+        # t3 = t2 + cfg.phases.release (end)
         
         progress = torch.zeros_like(times)
         
@@ -319,7 +481,7 @@ class TrajectoryManager:
         # Manipulate phase: symmetric ease-in/out
         mask = (times >= t1) & (times < t2)
         if mask.any():
-            local_t = (times[mask] - t1) / cfg.manipulate_duration  # 0 to 1
+            local_t = (times[mask] - t1) / cfg.phases.manipulate  # 0 to 1
             
             # Split into first half (ease-in) and second half (ease-out)
             first_half = local_t < 0.5
@@ -330,12 +492,12 @@ class TrajectoryManager:
             # First half: ease-in (0 -> 0.5)
             if first_half.any():
                 t_normalized = local_t[first_half] * 2.0  # Map [0, 0.5] -> [0, 1]
-                eased[first_half] = (t_normalized ** cfg.ease_power) * 0.5
+                eased[first_half] = (t_normalized ** cfg.easing_power) * 0.5
             
             # Second half: ease-out (0.5 -> 1.0)
             if second_half.any():
                 t_normalized = (local_t[second_half] - 0.5) * 2.0  # Map [0.5, 1] -> [0, 1]
-                eased[second_half] = 0.5 + (1.0 - (1.0 - t_normalized) ** cfg.ease_power) * 0.5
+                eased[second_half] = 0.5 + (1.0 - (1.0 - t_normalized) ** cfg.easing_power) * 0.5
             
             progress[mask] = eased
         
@@ -354,7 +516,7 @@ class TrajectoryManager:
         """
         n, T = progress.shape
         cfg = self.cfg
-        max_wp = cfg.num_waypoints_max
+        max_wp = cfg.waypoints.count[1]
         
         start = self.start_poses[env_ids, :3]  # (n, 3)
         goal = self.goal_poses[env_ids, :3]    # (n, 3)
@@ -411,7 +573,7 @@ class TrajectoryManager:
         """Interpolate orientations using piecewise SLERP through waypoints."""
         n, T = progress.shape
         cfg = self.cfg
-        max_wp = cfg.num_waypoints_max
+        max_wp = cfg.waypoints.count[1]
         
         # Build orientation control points: start -> waypoints -> goal
         quats = torch.zeros(n, max_wp + 2, 4, device=self.device)
@@ -537,12 +699,12 @@ class TrajectoryManager:
     
     def get_phase(self) -> torch.Tensor:
         """Get current phase index for each environment (0=pickup, 1=manipulate, 2=release)."""
-        cfg = self.cfg
+        cfg = self.cfg.trajectory
         t = self.phase_time
         
         phase = torch.zeros_like(t, dtype=torch.long)
-        t1 = cfg.pickup_duration
-        t2 = t1 + cfg.manipulate_duration
+        t1 = cfg.phases.pickup
+        t2 = t1 + cfg.phases.manipulate
         
         phase[t >= t1] = 1  # manipulate
         phase[t >= t2] = 2  # release
