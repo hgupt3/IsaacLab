@@ -253,6 +253,17 @@ def _build_observations_cfg(cfg: Y2RConfig):
         """Observations for proprioception group."""
         joint_pos = ObsTerm(func=mdp.joint_pos, noise=Unoise(n_min=-0.0, n_max=0.0))
         joint_vel = ObsTerm(func=mdp.joint_vel, noise=Unoise(n_min=-0.0, n_max=0.0))
+        hand_eigen = ObsTerm(
+            func=mdp.allegro_hand_eigen_b,
+            noise=Unoise(n_min=-0.0, n_max=0.0),
+            clip=cfg.observations.clip_range,
+            params={
+                "arm_joint_count": cfg.robot.arm_joint_count,
+                "hand_joint_count": cfg.robot.hand_joint_count,
+                "eigen_dim": cfg.robot.eigen_dim,
+                "use_default_delta": True,
+            },
+        )
         hand_tips_state_b = ObsTerm(
             func=mdp.body_state_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),
@@ -481,13 +492,34 @@ def _build_rewards_cfg(cfg: Y2RConfig):
     class RewardsCfg:
         """Reward terms for the MDP."""
 
-        action_l2 = RewTerm(func=mdp.action_l2_clamped, weight=cfg.rewards.action_l2.weight)
+        action_l2 = RewTerm(
+            func=mdp.action_l2_clamped,
+            weight=cfg.rewards.action_l2.weight,
+            params={
+                "arm_joint_count": cfg.robot.arm_joint_count,
+                "finger_scale": cfg.rewards.action_l2.params.get("finger_scale", 0.1),
+            },
+        )
 
-        action_rate_l2 = RewTerm(func=mdp.action_rate_l2_clamped, weight=cfg.rewards.action_rate_l2.weight)
+        action_rate_l2 = RewTerm(
+            func=mdp.action_rate_l2_clamped,
+            weight=cfg.rewards.action_rate_l2.weight,
+            params={
+                "arm_joint_count": cfg.robot.arm_joint_count,
+                "finger_scale": cfg.rewards.action_rate_l2.params.get("finger_scale", 0.1),
+            },
+        )
 
         fingers_to_object = RewTerm(
             func=mdp.object_ee_distance,
-            params={"std": cfg.rewards.fingers_to_object.params.get("std", 0.4)},
+            params={
+                "std": cfg.rewards.fingers_to_object.params.get("std", 0.4),
+                # Error gating to avoid squeeze-and-freeze when tracking is bad
+                "error_gate_pos_threshold": cfg.rewards.fingers_to_object.params.get("error_gate_pos_threshold", None),
+                "error_gate_pos_slope": cfg.rewards.fingers_to_object.params.get("error_gate_pos_slope", 0.02),
+                "error_gate_rot_threshold": cfg.rewards.fingers_to_object.params.get("error_gate_rot_threshold", None),
+                "error_gate_rot_slope": cfg.rewards.fingers_to_object.params.get("error_gate_rot_slope", 0.5),
+            },
             weight=cfg.rewards.fingers_to_object.weight,
         )
 
@@ -498,7 +530,14 @@ def _build_rewards_cfg(cfg: Y2RConfig):
                 "std": cfg.rewards.lookahead_tracking.params.get("std", 0.03),
                 "decay": cfg.rewards.lookahead_tracking.params.get("decay", 0.2),
                 "contact_threshold": cfg.rewards.lookahead_tracking.params.get("contact_threshold", 2.0),
+                "contact_ramp": cfg.rewards.lookahead_tracking.params.get("contact_ramp", 1.0),
+                "contact_min_factor": cfg.rewards.lookahead_tracking.params.get("contact_min_factor", 0.05),
                 "rot_std": cfg.rewards.lookahead_tracking.params.get("rot_std", 0.3),
+                "neg_threshold": cfg.rewards.lookahead_tracking.params.get("neg_threshold", 0.08),
+                "neg_std": cfg.rewards.lookahead_tracking.params.get("neg_std", 0.1),
+                "neg_scale": cfg.rewards.lookahead_tracking.params.get("neg_scale", 0.5),
+                "rot_neg_threshold": cfg.rewards.lookahead_tracking.params.get("rot_neg_threshold", 0.6),
+                "rot_neg_std": cfg.rewards.lookahead_tracking.params.get("rot_neg_std", 0.4),
             },
         )
 
@@ -527,6 +566,59 @@ def _build_rewards_cfg(cfg: Y2RConfig):
                 "table_z": cfg.rewards.arm_table_penalty.params.get("table_z", 0.255),
                 "threshold_mid": cfg.rewards.arm_table_penalty.params.get("threshold_mid", 0.06),
                 "threshold_distal": cfg.rewards.arm_table_penalty.params.get("threshold_distal", 0.03),
+            },
+        )
+
+        finger_manipulation = RewTerm(
+            func=mdp.finger_manipulation,
+            weight=cfg.rewards.finger_manipulation.weight,
+            params={
+                "pos_std": cfg.rewards.finger_manipulation.params.get("pos_std", 0.01),
+                "rot_std": cfg.rewards.finger_manipulation.params.get("rot_std", 0.1),
+                "robot_cfg": SceneEntityCfg("robot"),
+                "object_cfg": SceneEntityCfg("object"),
+            },
+        )
+
+        palm_velocity_penalty = RewTerm(
+            func=mdp.palm_velocity_penalty,
+            weight=cfg.rewards.palm_velocity_penalty.weight,
+            params={
+                "angular_std": cfg.rewards.palm_velocity_penalty.params.get("angular_std", 0.5),
+                "linear_std": cfg.rewards.palm_velocity_penalty.params.get("linear_std", 0.3),
+                "linear_scale": cfg.rewards.palm_velocity_penalty.params.get("linear_scale", 0.2),
+                "robot_cfg": SceneEntityCfg("robot"),
+            },
+        )
+
+        palm_orientation_penalty = RewTerm(
+            func=mdp.palm_orientation_penalty,
+            weight=cfg.rewards.palm_orientation_penalty.weight,
+            params={
+                "std": cfg.rewards.palm_orientation_penalty.params.get("std", 0.5),
+                "robot_cfg": SceneEntityCfg("robot"),
+            },
+        )
+
+        joint_limits_margin = RewTerm(
+            func=mdp.joint_pos_limits_margin,
+            weight=cfg.rewards.joint_limits_margin.weight,
+            params={
+                "threshold": cfg.rewards.joint_limits_margin.params.get("threshold", 0.95),
+                "power": cfg.rewards.joint_limits_margin.params.get("power", 2.0),
+                "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+            },
+        )
+
+        # Optional: off by default (weight=0). Turn on only if you still see "freeze+press".
+        tracking_progress = RewTerm(
+            func=mdp.tracking_progress,
+            weight=cfg.rewards.tracking_progress.weight,
+            params={
+                "pos_weight": cfg.rewards.tracking_progress.params.get("pos_weight", 1.0),
+                "rot_weight": cfg.rewards.tracking_progress.params.get("rot_weight", 0.5),
+                "positive_only": cfg.rewards.tracking_progress.params.get("positive_only", False),
+                "clip": cfg.rewards.tracking_progress.params.get("clip", 1.0),
             },
         )
 

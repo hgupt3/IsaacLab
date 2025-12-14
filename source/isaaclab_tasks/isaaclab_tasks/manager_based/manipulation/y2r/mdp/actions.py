@@ -38,8 +38,8 @@ ALLEGRO_PCA_MATRIX = torch.tensor([
 class EigenGraspRelativeJointPositionAction(ActionTerm):
     """Eigen grasp action term with relative joint position control.
     
-    Takes 28D input [arm_7, eigen_5, hand_raw_16] and outputs 23D joint targets.
-    The hand joints are computed as: hand_delta = (eigen_5 @ PCA) + hand_raw_16
+    Takes (7 + eigen_dim + 16)D input [arm_7, eigen_k, hand_raw_16] and outputs 23D joint targets.
+    The hand joints are computed as: hand_delta = (eigen_k @ PCA_kx16) + hand_raw_16
     """
     
     cfg: "EigenGraspRelativeJointPositionActionCfg"
@@ -72,13 +72,21 @@ class EigenGraspRelativeJointPositionAction(ActionTerm):
         self._hand_dim = cfg.hand_joint_count
         self._input_dim = self._arm_dim + self._eigen_dim + self._hand_dim  # 28
         self._output_dim = self._arm_dim + self._hand_dim  # 23
+
+        # Validate eigen dimension against the PCA matrix.
+        # We support taking the first K principal components (K <= 5).
+        if not (1 <= self._eigen_dim <= ALLEGRO_PCA_MATRIX.shape[0]):
+            raise ValueError(
+                f"Invalid eigen_dim={self._eigen_dim}. Must be in [1, {ALLEGRO_PCA_MATRIX.shape[0]}] "
+                f"to match ALLEGRO_PCA_MATRIX shape={tuple(ALLEGRO_PCA_MATRIX.shape)}."
+            )
         
         # Create tensors for raw and processed actions
         self._raw_actions = torch.zeros(self.num_envs, self._input_dim, device=self.device)
         self._processed_actions = torch.zeros(self.num_envs, self._output_dim, device=self.device)
         
-        # Register PCA matrix as buffer
-        self._pca_matrix = ALLEGRO_PCA_MATRIX.to(self.device)  # (5, 16)
+        # Register PCA matrix as buffer (use only the first eigen_dim components)
+        self._pca_matrix = ALLEGRO_PCA_MATRIX[: self._eigen_dim].to(self.device)  # (eigen_dim, 16)
         
         # Parse scale
         if isinstance(cfg.scale, (float, int)):
@@ -92,7 +100,7 @@ class EigenGraspRelativeJointPositionAction(ActionTerm):
     
     @property
     def action_dim(self) -> int:
-        """The dimension of the action space (28D input)."""
+        """The dimension of the action space (7 + eigen_dim + 16)."""
         return self._input_dim
     
     @property
@@ -104,21 +112,21 @@ class EigenGraspRelativeJointPositionAction(ActionTerm):
         return self._processed_actions
     
     def process_actions(self, actions: torch.Tensor):
-        """Process 28D input to 23D joint deltas.
+        """Process (7 + eigen_dim + 16)D input to 23D joint deltas.
         
         Args:
-            actions: Input actions of shape (num_envs, 28)
-                     [arm_7, eigen_5, hand_raw_16]
+            actions: Input actions of shape (num_envs, 7 + eigen_dim + 16)
+                     [arm_7, eigen_k, hand_raw_16]
         """
         # Store raw actions
         self._raw_actions[:] = actions
         
         # Split input
         arm_actions = actions[:, :self._arm_dim]  # (N, 7)
-        eigen_actions = actions[:, self._arm_dim:self._arm_dim + self._eigen_dim]  # (N, 5)
+        eigen_actions = actions[:, self._arm_dim : self._arm_dim + self._eigen_dim]  # (N, eigen_dim)
         hand_raw_actions = actions[:, self._arm_dim + self._eigen_dim:]  # (N, 16)
         
-        # Transform eigen to hand joints: (N, 5) @ (5, 16) = (N, 16)
+        # Transform eigen to hand joints: (N, eigen_dim) @ (eigen_dim, 16) = (N, 16)
         hand_pca = torch.matmul(eigen_actions, self._pca_matrix)
         
         # Add residual

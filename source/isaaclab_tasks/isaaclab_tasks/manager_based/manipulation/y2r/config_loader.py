@@ -194,9 +194,27 @@ class RewardsConfig:
     """All rewards configuration."""
     action_l2: RewardConfig = field(default_factory=lambda: RewardConfig(weight=-0.005))
     action_rate_l2: RewardConfig = field(default_factory=lambda: RewardConfig(weight=-0.005))
-    fingers_to_object: RewardConfig = field(default_factory=lambda: RewardConfig(weight=1.0, params={"std": 0.4}))
+    fingers_to_object: RewardConfig = field(default_factory=lambda: RewardConfig(
+        weight=1.0,
+        params={
+            "std": 0.4,
+            # When tracking error is large, reduce this reward to avoid squeeze-and-freeze.
+            # Defaults: disabled (thresholds None).
+            "error_gate_pos_threshold": None,
+            "error_gate_pos_slope": 0.02,
+            "error_gate_rot_threshold": None,
+            "error_gate_rot_slope": 0.5,
+        },
+    ))
     lookahead_tracking: RewardConfig = field(default_factory=lambda: RewardConfig(
-        weight=5.0, params={"std": 0.03, "decay": 0.2, "contact_threshold": 2.0, "rot_std": 0.3}
+        weight=5.0, params={
+            "std": 0.03,
+            "decay": 0.2,
+            "contact_threshold": 2.0,
+            "contact_ramp": 1.0,
+            "contact_min_factor": 0.05,
+            "rot_std": 0.3,
+        }
     ))
     trajectory_success: RewardConfig = field(default_factory=lambda: RewardConfig(
         weight=10.0, params={
@@ -213,6 +231,32 @@ class RewardsConfig:
     ))
     good_finger_contact: RewardConfig = field(default_factory=lambda: RewardConfig(
         weight=0.5, params={"threshold": 1.0}
+    ))
+    finger_manipulation: RewardConfig = field(default_factory=lambda: RewardConfig(
+        weight=0.5, params={"pos_std": 0.01, "rot_std": 0.1}
+    ))
+    palm_velocity_penalty: RewardConfig = field(default_factory=lambda: RewardConfig(
+        weight=-0.3, params={"angular_std": 0.5, "linear_std": 0.3, "linear_scale": 0.2}
+    ))
+    palm_orientation_penalty: RewardConfig = field(default_factory=lambda: RewardConfig(
+        weight=-0.1, params={"std": 0.5}
+    ))
+    distal_joint3_penalty: RewardConfig = field(default_factory=lambda: RewardConfig(
+        weight=-0.3,
+        params={"std": 1.0, "joint_name_regex": ".*_joint_3", "only_when_contact": True, "contact_threshold": 1.0, "only_in_manipulation": True,
+        },
+    ))
+    joint_limits_margin: RewardConfig = field(default_factory=lambda: RewardConfig(
+        weight=-0.05, params={"threshold": 0.95, "power": 2.0}
+    ))
+    tracking_progress: RewardConfig = field(default_factory=lambda: RewardConfig(
+        weight=0.0,
+        params={
+            "pos_weight": 1.0,
+            "rot_weight": 0.5,
+            "positive_only": False,
+            "clip": 1.0,
+        },
     ))
 
 
@@ -550,9 +594,22 @@ def _parse_rewards(data: dict) -> RewardsConfig:
     return RewardsConfig(
         action_l2=parse_reward("action_l2", {"weight": -0.005}),
         action_rate_l2=parse_reward("action_rate_l2", {"weight": -0.005}),
-        fingers_to_object=parse_reward("fingers_to_object", {"weight": 1.0, "std": 0.4}),
+        fingers_to_object=parse_reward("fingers_to_object", {
+            "weight": 1.0,
+            "std": 0.4,
+            "error_gate_pos_threshold": None,
+            "error_gate_pos_slope": 0.02,
+            "error_gate_rot_threshold": None,
+            "error_gate_rot_slope": 0.5,
+        }),
         lookahead_tracking=parse_reward("lookahead_tracking", {
-            "weight": 5.0, "std": 0.03, "decay": 0.2, "contact_threshold": 2.0, "rot_std": 0.3
+            "weight": 5.0,
+            "std": 0.03,
+            "decay": 0.2,
+            "contact_threshold": 2.0,
+            "contact_ramp": 1.0,
+            "contact_min_factor": 0.05,
+            "rot_std": 0.3,
         }),
         trajectory_success=parse_reward("trajectory_success", {
             "weight": 10.0,
@@ -567,6 +624,30 @@ def _parse_rewards(data: dict) -> RewardsConfig:
             "weight": -1.0, "table_z": 0.255, "threshold_mid": 0.06, "threshold_distal": 0.03
         }),
         good_finger_contact=parse_reward("good_finger_contact", {"weight": 0.5, "threshold": 1.0}),
+        finger_manipulation=parse_reward("finger_manipulation", {"weight": 0.5, "pos_std": 0.01, "rot_std": 0.1}),
+        palm_velocity_penalty=parse_reward("palm_velocity_penalty", {
+            "weight": -0.3, "angular_std": 0.5, "linear_std": 0.3, "linear_scale": 0.2
+        }),
+        palm_orientation_penalty=parse_reward("palm_orientation_penalty", {"weight": -0.1, "std": 0.5}),
+        distal_joint3_penalty=parse_reward("distal_joint3_penalty", {
+            "weight": -0.3,
+            "std": 1.0,
+            "joint_name_regex": ".*_joint_3",
+            "only_when_contact": True,
+            "contact_threshold": 1.0,
+            "only_in_manipulation": True,
+        }),
+        joint_limits_margin=parse_reward("joint_limits_margin", {"weight": -0.05, "threshold": 0.95, "power": 2.0}),
+        tracking_progress=parse_reward(
+            "tracking_progress",
+            {
+                "weight": 0.0,
+                "pos_weight": 1.0,
+                "rot_weight": 0.5,
+                "positive_only": False,
+                "clip": 1.0,
+            },
+        ),
     )
 
 

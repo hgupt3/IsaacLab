@@ -63,6 +63,18 @@ def _build_kuka_allegro_rewards_cfg(cfg: Y2RConfig, base_rewards):
         weight=cfg.rewards.good_finger_contact.weight,
         params={"threshold": cfg.rewards.good_finger_contact.params.get("threshold", 1.0)},
     )
+    # Penalize over-curling distal joints (joint_3) to discourage nail-side grasps
+    base_rewards.distal_joint3_penalty = RewTerm(
+        func=mdp.distal_joint3_penalty,
+        weight=cfg.rewards.distal_joint3_penalty.weight,
+        params={
+            "std": cfg.rewards.distal_joint3_penalty.params.get("std", 1.0),
+            "joint_name_regex": cfg.rewards.distal_joint3_penalty.params.get("joint_name_regex", ".*_joint_3"),
+            "only_when_contact": cfg.rewards.distal_joint3_penalty.params.get("only_when_contact", True),
+            "contact_threshold": cfg.rewards.distal_joint3_penalty.params.get("contact_threshold", 1.0),
+            "only_in_manipulation": cfg.rewards.distal_joint3_penalty.params.get("only_in_manipulation", True),
+        },
+    )
     return base_rewards
 
 

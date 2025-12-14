@@ -291,9 +291,9 @@ class TrajectoryManager:
         # Get stable placement (z-position + orientation) from trimesh
         # Skip for push-T mode (use fixed flat orientation on table)
         if cfg.push_t.enabled:
-            # Fixed flat orientation on table surface (90° X then -90° Z rotation)
+            # Fixed flat orientation on table surface (90° X then -180 Z rotation)
             goal_z_local = torch.full((n,), self.table_height + cfg.randomization.reset.z_offset, device=self.device)
-            goal_quat = torch.tensor([[0.5, 0.5, -0.5, -0.5]], device=self.device).repeat(n, 1)  # 90° X + -90° Z
+            goal_quat = torch.tensor([[0.0, 0.0, 0.7071, 0.7071]], device=self.device).repeat(n, 1)  # 90° X + 180° Z
         else:
             env_ids_list = env_ids.tolist()
             goal_z_local, goal_quat = get_stable_object_placement(
@@ -368,19 +368,7 @@ class TrajectoryManager:
         # Time array for this horizon
         times = torch.arange(num_tgt, device=self.device).float() * self.target_dt  # (num_tgt,)
         progress = (times / duration).clamp(0.0, 1.0)  # Linear progress over horizon
-        
-        # Symmetric easing
-        traj_cfg = self.cfg.trajectory
-        first_half = progress < 0.5
-        second_half = ~first_half
-        eased = torch.zeros_like(progress)
-        if first_half.any():
-            t_norm = progress[first_half] * 2.0
-            eased[first_half] = (t_norm ** traj_cfg.easing_power) * 0.5
-        if second_half.any():
-            t_norm = (progress[second_half] - 0.5) * 2.0
-            eased[second_half] = 0.5 + (1.0 - (1.0 - t_norm) ** traj_cfg.easing_power) * 0.5
-        progress_eased = eased  # (num_tgt,)
+        progress_eased = progress  # No easing - use linear progress directly
         
         # Build trajectories per env
         for env_id in env_ids:

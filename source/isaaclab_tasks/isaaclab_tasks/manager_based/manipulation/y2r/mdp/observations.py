@@ -20,6 +20,7 @@ from isaaclab.utils.math import (
 )
 
 from .utils import sample_object_point_cloud_random
+from .actions import ALLEGRO_PCA_MATRIX
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -273,6 +274,60 @@ def fingers_contact_force_b(
     robot: Articulation = env.scene[asset_cfg.name]
     forces_b = quat_apply_inverse(robot.data.root_link_quat_w.unsqueeze(1).repeat(1, force_w.shape[1], 1), force_w)
     return forces_b
+
+
+def allegro_hand_eigen_b(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    arm_joint_count: int = 7,
+    hand_joint_count: int = 16,
+    eigen_dim: int = 5,
+    use_default_delta: bool = True,
+) -> torch.Tensor:
+    """Project current Allegro hand joints into eigen-grasp coefficients.
+
+    We compute eigen coefficients from the current hand joint *delta* (relative to default pose),
+    by least-squares projection onto the first ``eigen_dim`` PCA components:
+
+        hand_delta ≈ eigen @ PCA
+
+    where ``PCA`` is ``ALLEGRO_PCA_MATRIX[:eigen_dim]`` with shape (eigen_dim, 16).
+
+    Args:
+        env: The environment.
+        asset_cfg: Scene entity for the robot articulation. Defaults to ``SceneEntityCfg("robot")``.
+        arm_joint_count: Number of arm joints at the front of the joint array. Defaults to 7.
+        hand_joint_count: Number of Allegro hand joints after the arm joints. Defaults to 16.
+        eigen_dim: Number of eigen dimensions to use (1..5). Defaults to 5.
+        use_default_delta: If True, subtract default joint positions before projection. Defaults to True.
+
+    Returns:
+        Tensor of shape (num_envs, eigen_dim) with eigen coefficients.
+    """
+    if not (1 <= eigen_dim <= int(ALLEGRO_PCA_MATRIX.shape[0])):
+        raise ValueError(f"Invalid eigen_dim={eigen_dim}. Must be in [1, {int(ALLEGRO_PCA_MATRIX.shape[0])}].")
+    if hand_joint_count != int(ALLEGRO_PCA_MATRIX.shape[1]):
+        raise ValueError(
+            f"hand_joint_count={hand_joint_count} does not match PCA width={int(ALLEGRO_PCA_MATRIX.shape[1])}."
+        )
+
+    robot: Articulation = env.scene[asset_cfg.name]
+    start = arm_joint_count
+    end = arm_joint_count + hand_joint_count
+    hand = robot.data.joint_pos[:, start:end]
+    if use_default_delta:
+        hand = hand - robot.data.default_joint_pos[:, start:end]
+
+    # Cache the right-inverse per eigen_dim on the env instance.
+    cache_attr = f"_allegro_pca_right_pinv_{eigen_dim}"
+    right_pinv = getattr(env, cache_attr, None)
+    if right_pinv is None or right_pinv.device != env.device:
+        A = ALLEGRO_PCA_MATRIX[:eigen_dim].to(env.device)  # (eigen_dim, 16)
+        # right_pinv = A.T @ (A @ A.T)^-1  -> (16, eigen_dim)
+        right_pinv = A.T @ torch.linalg.inv(A @ A.T)
+        setattr(env, cache_attr, right_pinv)
+
+    return hand @ right_pinv
 
 
 class target_sequence_obs_b(ManagerTermBase):

@@ -12,7 +12,7 @@
 simulation:
   physics_dt: 0.01              # 1/100 seconds (100 Hz physics)
   decimation: 2                 # Control at 60 Hz (physics_dt * decimation)
-  num_envs: 20480
+  num_envs: 16384
   env_spacing: 3.0
   replicate_physics: false
 
@@ -27,7 +27,7 @@ mode:
 # OBSERVATIONS
 # ==============================================================================
 observations:
-  num_points: 32                # Points sampled per object surface
+  num_points: 64                # Points sampled per object surface
   clip_range: [-2.0, 2.0]       # Clip observation values
   
   # History lengths for observation groups
@@ -41,17 +41,17 @@ observations:
 # TRAJECTORY TIMING
 # ==============================================================================
 trajectory:
-  duration: 10.0                # Total episode length (seconds)
+  duration: 9.0                # Total episode length (seconds)
   target_hz: 6.667              # Target update rate (20/3 Hz = 150ms between targets)
   window_size: 5                # Number of lookahead targets in observation
   
   # Phase durations (seconds) - must sum to duration
   phases:
     pickup: 0.5                 # Stationary at start for grasping
-    manipulate: 7.5             # Main movement phase with easing
-    release: 2.0                # Stationary at goal for release
+    manipulate: 8.0             # Main movement phase with easing
+    release: 0.5                # Stationary at goal for release
   
-  easing_power: 2.0             # Quadratic ease curves (higher = sharper transitions)
+  easing_power: 1.0             # Quadratic ease curves (higher = sharper transitions)
 
 # ==============================================================================
 # WORKSPACE BOUNDS
@@ -59,8 +59,8 @@ trajectory:
 # Relative to robot base frame (meters)
 workspace:
   x: [-0.75, -0.35]
-  y: [-0.3, 0.3]
-  z: [0.28, 0.7]               # [min, max] - above table surface
+  y: [-0.25, 0.25]
+  z: [0.28, 0.65]               # [min, max] - above table surface
   table_surface_z: 0.255        # Height of table surface
 
 # ==============================================================================
@@ -78,7 +78,7 @@ waypoints:
   
   # Orientation randomization
   vary_orientation: true
-  max_rotation: 2.0            # Max rotation in radians (~114 degrees)
+  max_rotation: 1.4            # Max rotation in radians (~114 degrees)
 
 # ==============================================================================
 # GOAL SAMPLING
@@ -96,43 +96,98 @@ goal:
 # Thresholds use [initial, final] format - curriculum interpolates between
 rewards:
   action_l2:
-    weight: -0.003
+    weight: -0.005
+    finger_scale: 0.1         # 10x less penalty on hand actions
     
   action_rate_l2:
-    weight: -0.003
+    weight: -0.005
+    finger_scale: 0.1         # 10x less penalty on hand actions
     
   fingers_to_object:
-    weight: 0.5
+    weight: 2.0
     std: 0.4
+    # When tracking error is high, reduce this reward so the policy doesn't
+    # prefer "press + squeeze" instead of recovering trajectory tracking.
+    # Set to null to disable gating.
+    error_gate_pos_threshold: 0.10   # meters (pose mode) / mean error (pc mode)
+    error_gate_pos_slope: 0.02       # meters; smaller = sharper gate
+    error_gate_rot_threshold: 1.0    # radians (pose mode only); set null to ignore rotation
+    error_gate_rot_slope: 0.5        # radians
     
   lookahead_tracking:
-    weight: 6.0
-    std: 0.06                   # Position/point cloud error std
-    decay: 0.2                  # Exponential decay for lookahead weights
-    contact_threshold: 1.0      # Must have contact (Newtons) to get reward
-    rot_std: 0.6                # Rotation error std (pose mode only) 
+    weight: 5.0
+    std: 0.03                   # Position/point cloud error std for positive reward
+    rot_std: 0.3                # Rotation error std (pose mode only) 
+    decay: 0.3                  # Exponential decay for lookahead weights
+    contact_threshold: 1.0      # Currently unused
+    # Soft contact gating: scales tracking reward but never hard-zeros it.
+    contact_ramp: 1.0           # Newtons; contact_factor ramps from 0→1 over this range
+    contact_min_factor: 0.05    # lower bound so reward doesn't fully collapse
+    # Negative penalty zones (activates when error > threshold):
+    neg_scale: 0.2              # Max penalty magnitude (0.5 = can go to -0.5)
+    neg_threshold: 0.04         # Position error > 8cm triggers penalty
+    neg_std: 0.1                # How fast position penalty grows
+    rot_neg_threshold: 0.4      # Rotation error > 0.6 rad (~34°) triggers penalty
+    rot_neg_std: 1.0            # How fast rotation penalty grows
     
   trajectory_success:
     weight: 10.0
     # Success thresholds [initial (lenient), final (strict)]
-    point_cloud_threshold: [0.06, 0.02]     # meters
-    position_threshold: [0.06, 0.02]        # meters (pose mode)
-    rotation_threshold: [0.6, 0.2]          # radians (pose mode) ~34° → ~11°
+    point_cloud_threshold: [0.05, 0.05]     # meters
+    position_threshold: [0.05, 0.05]        # meters (pose mode)
+    rotation_threshold: [0.5, 0.5]          # radians (pose mode) ~34° → ~11°
     
   early_termination:
-    weight: -1.0
+    weight: -4.0
     term_keys: ["abnormal_robot", "trajectory_deviation"]
     
   arm_table_penalty:
-    weight: -1.0
+    weight: -0.5
     table_z: 0.255
-    threshold_mid: 0.06         # Safe height above table for links 3,4,5
-    threshold_distal: 0.03      # Safe height above table for links 6,7,palm
+    threshold_mid: 0.07         # Safe height above table for links 3,4,5
+    threshold_distal: 0.04      # Safe height above table for links 6,7,palm
     
   # Robot-specific (Kuka Allegro)
   good_finger_contact:
     weight: 0.5
     threshold: 1.0              # Contact force threshold (Newtons)
+    
+  finger_manipulation:
+    weight: 4.0                 # Shaping reward - encourages in-hand adjustment
+    pos_std: 0.02               # Position change threshold (meters)
+    rot_std: 0.2                # Rotation change threshold (radians)
+    
+  distal_joint3_penalty:
+    weight: -0.3                # Weak regularizer to discourage over-curling distal joints
+    std: 1.6                    # (rad) larger = more lenient
+    joint_name_regex: ".*_joint_3"
+    only_when_contact: false
+    contact_threshold: 1.0
+    only_in_manipulation: false
+    
+  palm_velocity_penalty:
+    weight: -0.3                # Negative = penalty during manipulation phase
+    angular_std: 0.7            # Angular velocity threshold (rad/s) - stricter
+    linear_std: 1.0             # Linear velocity threshold (m/s)
+    linear_scale: 0.1           # 5x more lenient on linear than angular
+    
+  palm_orientation_penalty:
+    weight: -0.5                # Weak penalty to avoid awkward wrist configs
+    std: 1.0                    # Angular deviation std (rad) - lenient
+
+  # Penalize being too close to joint soft limits (encourages "comfort zone" postures)
+  joint_limits_margin:
+    weight: -0.05
+    threshold: 0.95             # in (0,1): 0.95 means penalize last 5% near either limit
+    power: 2.0                  # >=1: higher = sharper penalty near limits
+
+  # Rewards *reducing* current target error (helps recovery if policy freezes).
+  tracking_progress:
+    weight: 2.0
+    pos_weight: 1.0
+    rot_weight: 1.0
+    positive_only: true
+    clip: 1.0
 
 # ==============================================================================
 # TERMINATIONS
@@ -142,8 +197,8 @@ terminations:
   trajectory_deviation:
     # Max allowed deviation before episode terminates
     point_cloud_threshold: [0.18, 0.06]     # meters
-    position_threshold: [0.7, 0.4] #[0.25, 0.05]        # meters (pose mode)
-    rotation_threshold: [3.5, 2.0] #[2.5, 0.5]          # radians (pose mode) ~143° → ~29°
+    position_threshold: [0.4, 0.1] #[0.25, 0.05]        # meters (pose mode)
+    rotation_threshold: [2.5, 1.0] #[2.5, 0.5]          # radians (pose mode) ~143° → ~29°
 
 # ==============================================================================
 # CURRICULUM (Adaptive Domain Randomization)
@@ -173,7 +228,7 @@ curriculum:
     
   # Gravity scheduling (m/s²)
   gravity:
-    initial: [0.0, 0.0, 0.0]
+    initial: [0.0, 0.0, -0.0]
     final: [0.0, 0.0, -9.81]
 
 # ==============================================================================
@@ -225,7 +280,7 @@ robot:
   action_scale: 0.1
   arm_joint_count: 7
   hand_joint_count: 16
-  eigen_dim: 5                  # PCA dimensions for eigen grasp
+  eigen_dim: 1                  # PCA dimensions for eigen grasp (1..5 supported)
 
 # ==============================================================================
 # PUSH-T MODE (disabled by default)
@@ -259,8 +314,8 @@ procedural_objects:
     base_size: [0.035, 0.075]       # [min, max] base primitive size (meters)
     size_decay: 0.7               # Each child primitive is this fraction of parent
     primitive_types:              # Weighted selection of primitive types
-      ellipsoid: 0.2
-      box: 0.3
-      capsule: 0.2
+      ellipsoid: 0.1
+      box: 0.5
+      capsule: 0.1
       cylinder: 0.3
     seed: null                    # Random seed (null = different each generation)
