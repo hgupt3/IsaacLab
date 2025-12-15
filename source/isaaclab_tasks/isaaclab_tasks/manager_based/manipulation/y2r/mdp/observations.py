@@ -164,12 +164,11 @@ class object_point_cloud_b(ManagerTermBase):
         object_cfg: Scene entity for the object to sample. Defaults to ``SceneEntityCfg("object")``.
         ref_asset_cfg: Scene entity providing the reference frame. Defaults to ``SceneEntityCfg("robot")``.
         num_points: Number of points to sample on the object surface. Defaults to ``10``.
-        visualize: Whether to draw markers for the points. Defaults to ``True``.
 
     Returns (from ``__call__``):
         If ``flatten=False``: tensor of shape ``(num_envs, num_points, 3)``.
         If ``flatten=True``: tensor of shape ``(num_envs, 3 * num_points)``.
-    
+
     Note:
         Caches points_local on env._object_points_local for use by target_sequence_point_clouds_b.
     """
@@ -182,27 +181,14 @@ class object_point_cloud_b(ManagerTermBase):
         self.num_points: int = cfg.params.get("num_points", 10)
         self.object: RigidObject = env.scene[self.object_cfg.name]
         self.ref_asset: Articulation = env.scene[self.ref_asset_cfg.name]
-        
-        # Visualizer
-        # env_ids: None = all envs, [] = no envs, [0,1,2] = specific envs
-        self.visualizer = None
-        self.visualize_env_ids = cfg.params.get("visualize_env_ids", None)  # Default: all envs
-        visualize = cfg.params.get("visualize", True)
-        # Only create visualizer if visualization is enabled AND env_ids is not empty list
-        if visualize and self.visualize_env_ids != []:
-            from isaaclab.markers import VisualizationMarkers
-            from isaaclab.markers.config import RAY_CASTER_MARKER_CFG
-            ray_cfg = RAY_CASTER_MARKER_CFG.replace(prim_path="/Visuals/ObservationPointCloud")
-            ray_cfg.markers["hit"].radius = 0.0025
-            self.visualizer = VisualizationMarkers(ray_cfg)
-        
+
         # Sample points using RANDOM sampling (not FPS) for consistency with targets
         all_env_ids = list(range(env.num_envs))
         self.points_local = sample_object_point_cloud_random(
             all_env_ids, self.num_points, self.object.cfg.prim_path, device=env.device
         )
         self.points_w = torch.zeros_like(self.points_local)
-        
+
         # Cache on env for target_sequence_point_clouds_b to use the SAME points
         env._object_points_local = self.points_local
 
@@ -213,8 +199,6 @@ class object_point_cloud_b(ManagerTermBase):
         object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
         num_points: int = 10,
         flatten: bool = False,
-        visualize: bool = True,
-        visualize_env_ids: list[int] | None = None,
     ):
         """Compute the object point cloud in the reference asset's root frame.
 
@@ -224,8 +208,6 @@ class object_point_cloud_b(ManagerTermBase):
             object_cfg: Object to sample. Defaults to ``SceneEntityCfg("object")``.
             num_points: Number of points (set at init from cfg.params).
             flatten: If ``True``, return a flattened tensor ``(num_envs, 3 * num_points)``.
-            visualize: If ``True``, draw markers for the points.
-            visualize_env_ids: Which envs to visualize (set at init from cfg.params).
 
         Returns:
             Tensor of shape ``(num_envs, num_points, 3)`` or flattened if requested.
@@ -236,18 +218,10 @@ class object_point_cloud_b(ManagerTermBase):
 
         object_pos_w = self.object.data.root_pos_w.unsqueeze(1).expand(-1, P, -1)
         object_quat_w = self.object.data.root_quat_w.unsqueeze(1).expand(-1, P, -1)
-        
+
         # Transform local points to world
         self.points_w = quat_apply(object_quat_w, self.points_local) + object_pos_w
-        
-        if visualize and self.visualizer is not None:
-            # env_ids: None = all envs, [] = no envs (but visualizer not created), [0,1,2] = specific
-            if self.visualize_env_ids is None:
-                vis_points = self.points_w.view(-1, 3)
-            else:
-                vis_points = self.points_w[self.visualize_env_ids].reshape(-1, 3)
-            self.visualizer.visualize(translations=vis_points)
-        
+
         # Transform to robot base frame
         object_point_cloud_pos_b, _ = subtract_frame_transforms(ref_pos_w, ref_quat_w, self.points_w, None)
 

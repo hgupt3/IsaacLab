@@ -22,6 +22,7 @@ simulation:
 mode:
   use_point_cloud: false        # true = point cloud tracking, false = pose tracking
   use_eigen_grasp: true         # true = 28D eigen grasp, false = 23D full joints
+  use_student_mode: false       # true = adds student_perception and student_targets obs groups (point cloud only)
 
 # ==============================================================================
 # OBSERVATIONS

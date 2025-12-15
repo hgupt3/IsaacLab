@@ -290,8 +290,6 @@ def _build_observations_cfg(cfg: Y2RConfig):
             params={
                 "num_points": cfg.observations.num_points,
                 "flatten": True,
-                "visualize": cfg.visualization.current_object,
-                "visualize_env_ids": cfg.visualization.env_ids,
             },
         )
         object_pose = ObsTerm(
@@ -330,14 +328,58 @@ def _build_observations_cfg(cfg: Y2RConfig):
             self.history_length = cfg.observations.history.targets
 
     @configclass
+    class StudentPerceptionObsCfg(ObsGroup):
+        """Student perception: only object point cloud (no pose)."""
+        object_point_cloud = ObsTerm(
+            func=mdp.object_point_cloud_b,
+            noise=Unoise(n_min=-0.0, n_max=0.0),
+            clip=cfg.observations.clip_range,
+            params={
+                "num_points": cfg.observations.num_points,
+                "flatten": True,
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_dim = 0
+            self.concatenate_terms = True
+            self.flatten_history_dim = True
+            self.history_length = cfg.observations.history.perception
+
+    @configclass
+    class StudentTargetObsCfg(ObsGroup):
+        """Student targets: only point clouds (no poses)."""
+        target_point_clouds = ObsTerm(
+            func=mdp.target_sequence_obs_b,
+            noise=Unoise(n_min=-0.0, n_max=0.0),
+            clip=cfg.observations.clip_range,
+            params={},
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_dim = 0
+            self.concatenate_terms = True
+            self.flatten_history_dim = True
+            self.history_length = cfg.observations.history.targets
+
+    @configclass
     class ObservationsCfg:
         """Observation specifications for the MDP."""
         policy: PolicyCfg = PolicyCfg()
         proprio: ProprioObsCfg = ProprioObsCfg()
         perception: PerceptionObsCfg = PerceptionObsCfg()
         targets: TargetObsCfg = TargetObsCfg()
+        # Student groups (only when mode.use_student_mode is True)
+        student_perception: StudentPerceptionObsCfg | None = None
+        student_targets: StudentTargetObsCfg | None = None
 
-    return ObservationsCfg()
+    obs_cfg = ObservationsCfg()
+    if cfg.mode.use_student_mode:
+        obs_cfg.student_perception = StudentPerceptionObsCfg()
+        obs_cfg.student_targets = StudentTargetObsCfg()
+    return obs_cfg
 
 
 def _build_events_cfg(cfg: Y2RConfig):

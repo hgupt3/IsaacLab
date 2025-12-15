@@ -110,6 +110,7 @@ class ModeConfig:
     """Mode selection configuration."""
     use_point_cloud: bool = False
     use_eigen_grasp: bool = True
+    use_student_mode: bool = False
 
 
 @dataclass
@@ -513,6 +514,7 @@ def _parse_mode(data: dict) -> ModeConfig:
     return ModeConfig(
         use_point_cloud=data.get("use_point_cloud", False),
         use_eigen_grasp=data.get("use_eigen_grasp", True),
+        use_student_mode=data.get("use_student_mode", False),
     )
 
 
