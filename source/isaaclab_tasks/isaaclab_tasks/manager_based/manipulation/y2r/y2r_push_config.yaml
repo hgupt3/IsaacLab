@@ -42,12 +42,14 @@ randomization:
 # ==============================================================================
 curriculum:
   difficulty:
-    initial: 0
+    initial: 10
 
 visualization:
   targets: true                 # Show target point clouds
   current_object: true          # Show current object point cloud
   waypoint_region: false         # Show waypoint sampling box
+  student_visible: false         # Show student visible point cloud (blue markers)
+  student_target: false          # Show student visible point trajectory (inferno colors)
   goal_region: false             # Show goal sampling region on table
   pose_axes: true               # Show axis arrows for poses
   env_ids: null                 # Visualize all envs

@@ -291,9 +291,9 @@ class TrajectoryManager:
         # Get stable placement (z-position + orientation) from trimesh
         # Skip for push-T mode (use fixed flat orientation on table)
         if cfg.push_t.enabled:
-            # Fixed flat orientation on table surface (90° X then -180 Z rotation)
+            # Fixed flat orientation on table surface (90° X then -90 Z rotation)
             goal_z_local = torch.full((n,), self.table_height + cfg.randomization.reset.z_offset, device=self.device)
-            goal_quat = torch.tensor([[0.0, 0.0, 0.7071, 0.7071]], device=self.device).repeat(n, 1)  # 90° X + 180° Z
+            goal_quat = torch.tensor([[0.5, 0.5, -0.5, -0.5]], device=self.device).repeat(n, 1)  # 90° X + -90 Z
         else:
             env_ids_list = env_ids.tolist()
             goal_z_local, goal_quat = get_stable_object_placement(
@@ -310,14 +310,16 @@ class TrajectoryManager:
         goal_z = goal_z_local + env_origins[:, 2]
         
         # Apply random yaw on top of stable pose (like start poses)
-        yaw_delta = sample_uniform(-math.pi, math.pi, (n,), self.device)
-        delta_quat = quat_from_euler_xyz(
-            torch.zeros(n, device=self.device),
-            torch.zeros(n, device=self.device),
-            yaw_delta,
-        )
-        # Apply yaw in world frame on top of stable orientation
-        goal_quat = quat_mul(delta_quat, goal_quat)
+        # Skip random yaw for push-T mode - keep deterministic orientation
+        if not cfg.push_t.enabled:
+            yaw_delta = sample_uniform(-math.pi, math.pi, (n,), self.device)
+            delta_quat = quat_from_euler_xyz(
+                torch.zeros(n, device=self.device),
+                torch.zeros(n, device=self.device),
+                yaw_delta,
+            )
+            # Apply yaw in world frame on top of stable orientation
+            goal_quat = quat_mul(delta_quat, goal_quat)
         
         self.goal_poses[env_ids, 0] = goal_x
         self.goal_poses[env_ids, 1] = goal_y
@@ -353,45 +355,62 @@ class TrajectoryManager:
     def _replan_from_current(self, env_ids: torch.Tensor):
         """Regenerate trajectory from current object pose to goal (push-T mode).
         
-        Generates a fixed-horizon trajectory (rolling_window seconds) from the
-        current object position to the goal. This keeps a consistent 7s (configurable)
-        horizon and then we consume it in sliding windows of size `window_size`
-        (e.g., 5 targets) before replanning again.
+        Generates a trajectory from current object position to goal with minimum speed
+        enforcement. Uses rolling_window as the base planning horizon, but adjusts it
+        if the distance is small to maintain at least min_speed.
+        
+        This prevents infinite slowdown when very close to goal while ensuring the
+        object stays at goal once reached.
         """
         # Update start poses to current actual object positions
         self.start_poses[env_ids] = self.current_object_poses[env_ids]
         
-        # Fixed horizon duration (e.g., 7s)
-        duration = self.cfg.push_t.rolling_window
-        num_tgt = min(int(duration / self.target_dt) + 1, self.total_targets)
-        
-        # Time array for this horizon
-        times = torch.arange(num_tgt, device=self.device).float() * self.target_dt  # (num_tgt,)
-        progress = (times / duration).clamp(0.0, 1.0)  # Linear progress over horizon
-        progress_eased = progress  # No easing - use linear progress directly
-        
-        # Build trajectories per env
+        # Build trajectories per env (need per-env durations for min_speed enforcement)
         for env_id in env_ids:
             env_id = env_id.item()
             
-            # Interpolate positions (lerp)
+            # Calculate distance to goal
             start_pos = self.start_poses[env_id:env_id+1, :3]  # (1, 3)
             goal_pos = self.goal_poses[env_id:env_id+1, :3]    # (1, 3)
-            positions = start_pos + progress_eased.unsqueeze(-1) * (goal_pos - start_pos)
+            distance_to_goal = torch.norm(goal_pos - start_pos).item()
+            
+            # Enforce minimum speed: adjust duration if natural speed would be too slow
+            rolling_window = self.cfg.push_t.rolling_window
+            min_speed = self.cfg.push_t.min_speed
+            natural_speed = distance_to_goal / rolling_window if rolling_window > 0 else float('inf')
+            
+            if natural_speed < min_speed and distance_to_goal > 1e-4:
+                # Too slow - use min_speed to determine duration
+                duration = max(distance_to_goal / min_speed, self.target_dt)
+            else:
+                # Normal speed or already at goal - use full rolling window
+                duration = rolling_window
+            
+            # Generate targets for this duration
+            # Start from target_dt ahead (skip the "current position" target)
+            num_tgt = min(int(duration / self.target_dt) + 1, self.total_targets)
+            
+            # Time array starting from target_dt (not 0)
+            times = (torch.arange(num_tgt, device=self.device).float() + 1) * self.target_dt
+            progress = (times / duration).clamp(0.0, 1.0) if duration > 0 else torch.ones(num_tgt, device=self.device)
+            
+            # Interpolate positions (lerp)
+            positions = start_pos + progress.unsqueeze(-1) * (goal_pos - start_pos)
             
             # Interpolate orientations (slerp)
             start_quat = self.start_poses[env_id:env_id+1, 3:7][0]  # (4,)
             goal_quat = self.goal_poses[env_id:env_id+1, 3:7][0]    # (4,)
             orientations = torch.zeros(num_tgt, 4, device=self.device)
-            for t, t_val in enumerate(progress_eased):
+            for t, t_val in enumerate(progress):
                 orientations[t] = self._slerp(start_quat, goal_quat, t_val.item())
             
-            # Store in trajectory buffer (pad remaining with final pose)
+            # Store in trajectory buffer (pad remaining with goal pose)
             self.trajectory[env_id, :num_tgt, :3] = positions
             self.trajectory[env_id, :num_tgt, 3:7] = orientations
             if num_tgt < self.total_targets:
-                self.trajectory[env_id, num_tgt:, :3] = positions[-1]
-                self.trajectory[env_id, num_tgt:, 3:7] = orientations[-1]
+                # Fill rest of trajectory with goal pose (stay at goal)
+                self.trajectory[env_id, num_tgt:, :3] = goal_pos
+                self.trajectory[env_id, num_tgt:, 3:7] = goal_quat
     
     def _slerp(self, q1: torch.Tensor, q2: torch.Tensor, t: float) -> torch.Tensor:
         """Spherical linear interpolation between two quaternions."""

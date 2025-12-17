@@ -14,12 +14,14 @@ _base_: y2r_config.yaml
 # Start at maximum difficulty (fully trained conditions)
 curriculum:
   difficulty:
-    initial: 0                 # Start at max difficulty for evaluation
+    initial: 5                 # Start at max difficulty for evaluation
 
 # Enable debug visualization for analysis
 visualization:
-  targets: true                 # Show target point clouds
-  current_object: true          # Show current object point cloud
+  targets: false                 # Show target point clouds
+  current_object: false          # Show current object point cloud
+  student_visible: true         # Show student visible point cloud (blue markers)
+  student_target: true          # Show student visible point trajectory (inferno colors)
   waypoint_region: true         # Show waypoint sampling box
   goal_region: true             # Show goal sampling region on table
   pose_axes: true               # Show axis arrows for poses
@@ -28,5 +30,5 @@ visualization:
 
 # Fewer envs for visualization performance
 simulation:
-  num_envs: 32
+  num_envs: 4
 

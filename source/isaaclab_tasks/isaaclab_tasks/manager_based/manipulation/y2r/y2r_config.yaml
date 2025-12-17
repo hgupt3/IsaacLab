@@ -28,7 +28,9 @@ mode:
 # OBSERVATIONS
 # ==============================================================================
 observations:
-  num_points: 64                # Points sampled per object surface
+  num_points: 64                # Points sampled per object surface (privileged)
+  student_num_points: 32        # Points for student observations (visible point cloud)
+  point_pool_size: 256          # Pool size for surface sampling (must be > num_points)
   clip_range: [-2.0, 2.0]       # Clip observation values
   
   # History lengths for observation groups
@@ -181,6 +183,7 @@ rewards:
     weight: -0.05
     threshold: 0.95             # in (0,1): 0.95 means penalize last 5% near either limit
     power: 2.0                  # >=1: higher = sharper penalty near limits
+    max_penalty_per_joint: 2.0  # cap per-joint penalty to prevent spikes when exceeding soft limits
 
   # Rewards *reducing* current target error (helps recovery if policy freezes).
   tracking_progress:
@@ -268,6 +271,8 @@ randomization:
 visualization:
   targets: false                 # Show target point clouds
   current_object: false          # Show current object point cloud
+  student_visible: false         # Show student visible point cloud (blue markers)
+  student_target: false          # Show student visible point trajectory (inferno colors)
   waypoint_region: false         # Show waypoint sampling box
   goal_region: false             # Show goal sampling region on table
   pose_axes: false               # Show axis arrows for poses
@@ -296,6 +301,34 @@ push_t:
   rolling_window: 3.0           # Trajectory planning horizon (seconds)
   min_speed: 0.02               # Minimum speed (m/s) to prevent infinite slowdown
   include_in_primitives: true   # Include T-shape in random object selection pool
+
+# ==============================================================================
+# PSEUDO CAMERA (for visible point cloud filtering)
+# ==============================================================================
+# Virtual camera for computing point cloud visibility (self-occlusion)
+pseudo_camera:
+  position: [-1.0, 0.0, 0.3]     # [x, y, z] relative to env origin (meters)
+
+# ==============================================================================
+# WRIST CAMERA
+# ==============================================================================
+# Wrist-mounted depth camera for student observations
+wrist_camera:
+  enabled: false              # Set true when using student_camera
+  resolution: 64              # Output resolution (80x80)
+  focal_length: 1.78          # D455 focal length (mm)
+  horizontal_aperture: 6.17  # D455 sensor size (mm)
+  clipping_range: [0.0001, 0.5] # Near/far clipping (meters)
+  
+  # Transform relative to palm_link (from Isaac Sim GUI)
+  offset:
+    pos: [-0.1, 0.0, 0.05]    # [x, y, z] in meters
+    rot: [-90.0, -90.0, 0.0]  # [rx, ry, rz] in degrees
+  
+  # Web viewer for remote visualization over SSH
+  web_viewer: false           # Enable to view at localhost:viewer_port
+  viewer_port: 8000           # Port for web viewer
+  viewer_update_hz: 10        # Viewer update rate (Hz)
 
 # ==============================================================================
 # PROCEDURAL OBJECTS

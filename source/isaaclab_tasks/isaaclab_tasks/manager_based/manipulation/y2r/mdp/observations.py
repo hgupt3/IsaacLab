@@ -19,7 +19,7 @@ from isaaclab.utils.math import (
     subtract_frame_transforms,
 )
 
-from .utils import sample_object_point_cloud_random
+from .utils import sample_object_point_cloud_random, get_point_cloud_cache
 from .actions import ALLEGRO_PCA_MATRIX
 
 if TYPE_CHECKING:
@@ -226,6 +226,478 @@ class object_point_cloud_b(ManagerTermBase):
         object_point_cloud_pos_b, _ = subtract_frame_transforms(ref_pos_w, ref_quat_w, self.points_w, None)
 
         return object_point_cloud_pos_b.view(env.num_envs, -1) if flatten else object_point_cloud_pos_b
+
+
+class visible_object_point_cloud_b(ManagerTermBase):
+    """Visible object point cloud from a pseudo-camera viewpoint.
+    
+    Samples points on object surface and filters to only include points
+    visible from the pseudo-camera position (using self-occlusion / back-face culling).
+    Points whose surface normals face away from the camera are hidden.
+    
+    Args (from ``cfg.params``):
+        object_cfg: Scene entity for the object. Defaults to ``SceneEntityCfg("object")``.
+        ref_asset_cfg: Scene entity for reference frame. Defaults to ``SceneEntityCfg("robot")``.
+        num_points: Number of visible points to return. Defaults to config value.
+        
+    Returns (from ``__call__``):
+        Flattened tensor of shape ``(num_envs, num_points * 3)``.
+    """
+    
+    # Blue color for visible point cloud visualization
+    VISIBLE_POINT_COLOR = (0.0, 0.0, 1.0)  # Bright blue
+    POINT_RADIUS = 0.003
+    
+    def __init__(self, cfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        
+        self.object_cfg: SceneEntityCfg = cfg.params.get("object_cfg", SceneEntityCfg("object"))
+        self.ref_asset_cfg: SceneEntityCfg = cfg.params.get("ref_asset_cfg", SceneEntityCfg("robot"))
+        
+        # Get config - use student_num_points for student observations
+        y2r_cfg = env.cfg.y2r_cfg
+        self.num_points: int = cfg.params.get("num_points", y2r_cfg.observations.student_num_points)
+        self.pool_size: int = y2r_cfg.observations.point_pool_size
+        self.pseudo_camera_pos: tuple = y2r_cfg.pseudo_camera.position
+        self.visualize: bool = y2r_cfg.visualization.student_visible
+        self.visualize_env_ids: list | None = y2r_cfg.visualization.env_ids
+        
+        self.object: RigidObject = env.scene[self.object_cfg.name]
+        self.ref_asset: Articulation = env.scene[self.ref_asset_cfg.name]
+        self.env = env
+        
+        # Compute resample interval: resample every window_size target updates
+        # This means visibility is resampled when the entire target window advances
+        target_hz = y2r_cfg.trajectory.target_hz
+        window_size = y2r_cfg.trajectory.window_size
+        policy_dt = env.step_dt  # Time per policy step
+        steps_per_target = 1.0 / (target_hz * policy_dt)  # Steps between target updates
+        self.resample_interval: int = max(1, int(window_size * steps_per_target))
+        
+        # Get the point cloud cache with normals and move to GPU
+        all_env_ids = list(range(env.num_envs))
+        cache = get_point_cloud_cache(all_env_ids, self.object.cfg.prim_path, self.pool_size)
+        
+        # Move cache tensors to GPU once (avoid CPU-GPU transfer every frame)
+        self.geo_indices = cache.geo_indices.to(env.device)
+        self.scales = cache.scales.to(env.device)
+        self.all_base_points = cache.all_base_points.to(env.device)
+        self.all_base_normals = cache.all_base_normals.to(env.device)
+        
+        # Pre-compute camera position tensor (relative to env origins)
+        camera_offset = torch.tensor(self.pseudo_camera_pos, device=env.device, dtype=torch.float32)
+        self.camera_offset = camera_offset.unsqueeze(0)  # (1, 3) for broadcasting
+        
+        # Pre-allocate output buffer
+        self.output = torch.zeros(env.num_envs, self.num_points, 3, device=env.device)
+        
+        # For visualization - store world-space points
+        self.selected_points_w = None
+        
+        # Cached visibility sampling (resample at target_hz rate)
+        self.cached_indices = None  # (N, num_points) selected point indices
+        self.cached_points_local = None  # (N, num_points, 3) selected points in local frame
+        
+        # Initialize visualization if enabled
+        self.markers = None
+        if self.visualize:
+            self._init_visualizer()
+        
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        ref_asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+        object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+        num_points: int = 64,
+        flatten: bool = True,
+    ) -> torch.Tensor:
+        """Compute visible point cloud from pseudo-camera viewpoint.
+        
+        Visibility sampling happens at target_hz rate (not every step) for efficiency.
+        Between resamples, cached indices are used with updated object poses.
+        
+        Args:
+            env: The environment.
+            ref_asset_cfg: Reference frame (robot).
+            object_cfg: Object to sample.
+            num_points: Number of points (from init).
+            flatten: If True, return flattened tensor.
+            
+        Returns:
+            Tensor of shape (num_envs, num_points * 3) if flattened.
+        """
+        N = env.num_envs
+        P = self.pool_size
+        num_pts = self.num_points
+        device = env.device
+        
+        # Get per-env geometry data (already on GPU)
+        geo_indices = self.geo_indices[:N]  # (N,)
+        scales = self.scales[:N]  # (N, 3)
+        
+        # Index into cached points/normals (all on GPU)
+        pool_points_local = self.all_base_points[geo_indices]   # (N, P, 3)
+        pool_normals_local = self.all_base_normals[geo_indices]  # (N, P, 3)
+        
+        # Apply per-env scale to points (normals don't scale)
+        pool_points_local = pool_points_local * scales.unsqueeze(1)  # (N, P, 3)
+        
+        # Determine which envs need resampling:
+        # 1. First call (no cache)
+        # 2. Environment just reset (episode_length_buf == 0)
+        # 3. Resample interval reached (every resample_interval steps)
+        needs_resample = self.cached_indices is None
+        
+        if not needs_resample:
+            # Check for resets
+            just_reset = env.episode_length_buf == 0
+            # Check for interval (resample when step % interval == 0)
+            at_interval = (env.episode_length_buf % self.resample_interval) == 0
+            needs_resample_mask = just_reset | at_interval
+            needs_resample = needs_resample_mask.any().item()
+        
+        if needs_resample:
+            # Full visibility resampling
+            object_pos_w = self.object.data.root_pos_w  # (N, 3)
+            object_quat_w = self.object.data.root_quat_w  # (N, 4)
+            
+            # Expand for broadcasting with pool
+            obj_pos_exp = object_pos_w.unsqueeze(1).expand(-1, P, -1)  # (N, P, 3)
+            obj_quat_exp = object_quat_w.unsqueeze(1).expand(-1, P, -1)  # (N, P, 4)
+            
+            # Transform to world
+            pool_points_w = quat_apply(obj_quat_exp, pool_points_local) + obj_pos_exp  # (N, P, 3)
+            pool_normals_w = quat_apply(obj_quat_exp, pool_normals_local)  # (N, P, 3)
+            pool_normals_w = pool_normals_w / (pool_normals_w.norm(dim=-1, keepdim=True) + 1e-8)
+            
+            # Camera position in world
+            env_origins = env.scene.env_origins  # (N, 3)
+            camera_pos_w = env_origins + self.camera_offset  # (N, 3)
+            
+            # Compute visibility
+            view_dirs = camera_pos_w.unsqueeze(1) - pool_points_w  # (N, P, 3)
+            view_dirs = view_dirs / (view_dirs.norm(dim=-1, keepdim=True) + 1e-8)
+            visibility = (pool_normals_w * view_dirs).sum(dim=-1)  # (N, P)
+            
+            # Sample visible points
+            selected_indices = self._sample_visible_batched(visibility, num_pts)  # (N, num_pts)
+            
+            # Cache indices and local points
+            self.cached_indices = selected_indices
+            batch_idx = torch.arange(N, device=device).unsqueeze(1).expand(-1, num_pts)
+            self.cached_points_local = pool_points_local[batch_idx, selected_indices]  # (N, num_pts, 3)
+        
+        # Use cached local points and transform to current world frame
+        object_pos_w = self.object.data.root_pos_w  # (N, 3)
+        object_quat_w = self.object.data.root_quat_w  # (N, 4)
+        
+        obj_pos_exp = object_pos_w.unsqueeze(1).expand(-1, num_pts, -1)  # (N, num_pts, 3)
+        obj_quat_exp = object_quat_w.unsqueeze(1).expand(-1, num_pts, -1)  # (N, num_pts, 4)
+        
+        selected_points_w = quat_apply(obj_quat_exp, self.cached_points_local) + obj_pos_exp
+        
+        # Store visible points in object-local frame for visible_target_sequence_obs_b
+        env._visible_points_local = self.cached_points_local  # (N, num_points, 3)
+        
+        # Transform to robot base frame
+        ref_pos_w = self.ref_asset.data.root_pos_w.unsqueeze(1).expand(-1, num_pts, -1)
+        ref_quat_w = self.ref_asset.data.root_quat_w.unsqueeze(1).expand(-1, num_pts, -1)
+        points_b, _ = subtract_frame_transforms(ref_pos_w, ref_quat_w, selected_points_w, None)
+        
+        # Store for visualization and visualize if enabled
+        self.selected_points_w = selected_points_w
+        if self.visualize and self.markers is not None:
+            self._visualize(selected_points_w, N)
+        
+        return points_b.view(N, -1) if flatten else points_b
+    
+    def _init_visualizer(self):
+        """Initialize blue sphere markers for visible point cloud."""
+        import isaaclab.sim as sim_utils
+        from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+        
+        markers_dict = {
+            "visible": sim_utils.SphereCfg(
+                radius=self.POINT_RADIUS,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=self.VISIBLE_POINT_COLOR),
+            ),
+        }
+        
+        self.markers = VisualizationMarkers(
+            VisualizationMarkersCfg(
+                prim_path="/Visuals/StudentVisiblePointCloud",
+                markers=markers_dict,
+            )
+        )
+    
+    def _visualize(self, points_w: torch.Tensor, num_envs: int):
+        """Visualize visible point cloud with blue markers.
+        
+        Args:
+            points_w: (N, num_points, 3) selected visible points in world space.
+            num_envs: Number of environments.
+        """
+        # Determine which envs to visualize
+        if self.visualize_env_ids is None:
+            env_ids = list(range(num_envs))
+        elif len(self.visualize_env_ids) == 0:
+            return  # Empty list means no visualization
+        else:
+            env_ids = [i for i in self.visualize_env_ids if i < num_envs]
+        
+        if not env_ids:
+            return
+        
+        P = points_w.shape[1]
+        E = len(env_ids)
+        device = points_w.device
+        
+        # Gather points for selected envs
+        selected_pts = points_w[env_ids]  # (E, P, 3)
+        
+        # Flatten: (E, P, 3) -> (E*P, 3)
+        positions = selected_pts.reshape(-1, 3)
+        
+        # All points use the same marker (index 0 = "visible")
+        marker_indices = torch.zeros(E * P, dtype=torch.long, device=device)
+        
+        self.markers.visualize(
+            translations=positions,
+            marker_indices=marker_indices,
+        )
+    
+    def _sample_visible_batched(self, visibility: torch.Tensor, num_points: int) -> torch.Tensor:
+        """Randomly sample N points from visible set, fully batched.
+        
+        Args:
+            visibility: (N, pool) - dot product scores, >0 means visible.
+            num_points: Number of points to select.
+            
+        Returns:
+            indices: (N, num_points) - selected point indices per env.
+        """
+        N, P = visibility.shape
+        device = visibility.device
+        
+        visible_mask = visibility > 0  # (N, P)
+        
+        # Assign random priority to visible, -inf to hidden
+        random_scores = torch.where(
+            visible_mask,
+            torch.rand(N, P, device=device),
+            torch.full((N, P), float('-inf'), device=device)
+        )
+        
+        # Sort descending - visible points (random order) come first
+        _, sorted_idx = random_scores.sort(dim=-1, descending=True)
+        selected = sorted_idx[:, :num_points]  # (N, num_points)
+        
+        # Handle edge case: if < num_points visible, repeat from visible ones
+        num_visible = visible_mask.sum(dim=-1, keepdim=True)  # (N, 1)
+        needs_repeat = num_visible < num_points
+        
+        if needs_repeat.any():
+            # For envs needing repeats: use modulo to wrap indices
+            repeat_idx = torch.arange(num_points, device=device).unsqueeze(0)  # (1, num_points)
+            wrapped_idx = repeat_idx % num_visible.clamp(min=1)  # (N, num_points)
+            
+            # Gather from sorted visible indices using wrapped index
+            max_visible = num_visible.max().item()
+            first_visible = sorted_idx[:, :max(1, max_visible)]  # (N, max_visible)
+            
+            # Clamp wrapped_idx to valid range for gather
+            wrapped_idx_clamped = wrapped_idx.clamp(max=first_visible.shape[1] - 1)
+            repeated = first_visible.gather(1, wrapped_idx_clamped.long())
+            
+            # Use repeated only for envs that need it
+            selected = torch.where(
+                needs_repeat.expand(-1, num_points),
+                repeated,
+                selected
+            )
+        
+        return selected
+
+
+class visible_target_sequence_obs_b(ManagerTermBase):
+    """Student target observation: transforms visible points through target trajectory.
+    
+    Takes the visible points selected by visible_object_point_cloud_b and transforms
+    them through the target poses from the trajectory manager. This provides the
+    student with a filtered view of where visible surface points will be at each
+    future target pose.
+    
+    Prerequisites:
+        - visible_object_point_cloud_b must be initialized first (stores env._visible_points_local)
+        - target_sequence_obs_b must be initialized first (creates env.trajectory_manager)
+    
+    Args (from ``cfg.params``):
+        ref_asset_cfg: Scene entity for reference frame. Defaults to ``SceneEntityCfg("robot")``.
+        
+    Returns (from ``__call__``):
+        Flattened tensor of shape ``(num_envs, window_size * num_points * 3)``.
+    """
+    
+    # Same inferno colormap as target_sequence_obs_b
+    INFERNO_COLORS = [
+        (0.07, 0.04, 0.11),  # 0: nearly black
+        (0.32, 0.06, 0.38),  # 1: dark purple
+        (0.55, 0.09, 0.38),  # 2: magenta
+        (0.75, 0.19, 0.27),  # 3: red-purple
+        (0.89, 0.35, 0.13),  # 4: orange-red
+        (0.96, 0.55, 0.04),  # 5: orange
+        (0.99, 0.77, 0.17),  # 6: yellow-orange
+        (0.99, 0.99, 0.64),  # 7: bright yellow
+    ]
+    POINT_RADIUS = 0.0025
+    
+    def __init__(self, cfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        
+        self.ref_asset_cfg: SceneEntityCfg = cfg.params.get("ref_asset_cfg", SceneEntityCfg("robot"))
+        
+        # Get config - use student_num_points for student observations
+        y2r_cfg = env.cfg.y2r_cfg
+        self.num_points: int = y2r_cfg.observations.student_num_points
+        self.window_size: int = y2r_cfg.trajectory.window_size
+        self.visualize: bool = y2r_cfg.visualization.student_target
+        self.visualize_env_ids: list | None = y2r_cfg.visualization.env_ids
+        
+        self.ref_asset: Articulation = env.scene[self.ref_asset_cfg.name]
+        self.env = env
+        
+        # Verify prerequisites
+        if not hasattr(env, 'trajectory_manager'):
+            raise RuntimeError(
+                "visible_target_sequence_obs_b requires target_sequence_obs_b to be initialized first. "
+                "Ensure 'targets' observation group is defined before 'student_targets'."
+            )
+        
+        # Initialize visualization if enabled
+        self.markers = None
+        if self.visualize:
+            self._init_visualizer()
+    
+    def _init_visualizer(self):
+        """Initialize visualization markers with inferno colormap."""
+        import isaaclab.sim as sim_utils
+        from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+        
+        markers_dict = {
+            f"visible_target_{i}": sim_utils.SphereCfg(
+                radius=self.POINT_RADIUS,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=self.INFERNO_COLORS[i]),
+            )
+            for i in range(self.window_size)
+        }
+        
+        self.markers = VisualizationMarkers(
+            VisualizationMarkersCfg(
+                prim_path="/Visuals/StudentVisibleTargetSequence",
+                markers=markers_dict,
+            )
+        )
+    
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        ref_asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    ) -> torch.Tensor:
+        """Compute visible target sequence observations.
+        
+        Returns:
+            Flattened tensor (num_envs, window_size * num_points * 3).
+        """
+        N = env.num_envs
+        W = self.window_size
+        P = self.num_points
+        device = env.device
+        
+        # Get visible points in object-local frame (set by visible_object_point_cloud_b)
+        if not hasattr(env, '_visible_points_local'):
+            # Fallback: return zeros if visible points not available yet
+            return torch.zeros(N, W * P * 3, device=device)
+        
+        visible_points_local = env._visible_points_local  # (N, P, 3)
+        
+        # Get target poses from trajectory manager
+        window_targets = env.trajectory_manager.get_window_targets()  # (N, W, 7)
+        target_pos_w = window_targets[:, :, :3]   # (N, W, 3)
+        target_quat_w = window_targets[:, :, 3:7]  # (N, W, 4)
+        
+        # Transform visible points to each target pose
+        # Expand local points for all windows: (N, P, 3) -> (N, W, P, 3)
+        local_exp = visible_points_local.unsqueeze(1).expand(N, W, P, 3)
+        
+        # Expand target poses for all points
+        target_pos = target_pos_w.unsqueeze(2)   # (N, W, 1, 3)
+        target_quat = target_quat_w.unsqueeze(2)  # (N, W, 1, 4)
+        quat_exp = target_quat.expand(N, W, P, 4)  # (N, W, P, 4)
+        pos_exp = target_pos.expand(N, W, P, 3)    # (N, W, P, 3)
+        
+        # Apply rotation + translation: (N, W, P, 3)
+        all_points_w = quat_apply(
+            quat_exp.reshape(-1, 4), 
+            local_exp.reshape(-1, 3)
+        ).reshape(N, W, P, 3) + pos_exp
+        
+        # Transform to robot base frame
+        ref_pos_w = self.ref_asset.data.root_pos_w   # (N, 3)
+        ref_quat_w = self.ref_asset.data.root_quat_w  # (N, 4)
+        
+        ref_pos_exp = ref_pos_w.view(N, 1, 1, 3).expand(N, W, P, 3)
+        ref_quat_exp = ref_quat_w.view(N, 1, 1, 4).expand(N, W, P, 4)
+        
+        all_points_b, _ = subtract_frame_transforms(
+            ref_pos_exp.reshape(-1, 3), ref_quat_exp.reshape(-1, 4),
+            all_points_w.reshape(-1, 3), None
+        )
+        all_points_b = all_points_b.reshape(N, W, P, 3)
+        
+        # Visualize if enabled
+        if self.visualize and self.markers is not None:
+            self._visualize(all_points_w, N)
+        
+        # Flatten: (N, W * P * 3)
+        return all_points_b.reshape(N, -1)
+    
+    def _visualize(self, target_points_w: torch.Tensor, num_envs: int):
+        """Visualize visible target point clouds with inferno colormap.
+        
+        Args:
+            target_points_w: (N, W, P, 3) visible points at each target pose in world space.
+            num_envs: Number of environments.
+        """
+        # Determine which envs to visualize
+        if self.visualize_env_ids is None:
+            env_ids = list(range(num_envs))
+        elif len(self.visualize_env_ids) == 0:
+            return  # Empty list means no visualization
+        else:
+            env_ids = [i for i in self.visualize_env_ids if i < num_envs]
+        
+        if not env_ids:
+            return
+        
+        W = target_points_w.shape[1]
+        P = target_points_w.shape[2]
+        E = len(env_ids)
+        device = target_points_w.device
+        
+        # Gather points for selected envs
+        target_pts = target_points_w[env_ids]  # (E, W, P, 3)
+        
+        # Flatten: (E, W, P, 3) -> (E*W*P, 3)
+        positions = target_pts.reshape(-1, 3)
+        
+        # Marker indices: [0,0,...,1,1,...,W-1,W-1,...] repeated E times
+        single_env_indices = torch.arange(W, device=device).repeat_interleave(P)  # (W*P,)
+        marker_indices = single_env_indices.repeat(E)  # (E*W*P,)
+        
+        self.markers.visualize(
+            translations=positions,
+            marker_indices=marker_indices,
+        )
 
 
 def fingers_contact_force_b(
@@ -923,3 +1395,176 @@ def target_sequence_poses_b(
     
     # Flatten: (N, W * 7)
     return target_poses_b.reshape(N, -1)
+
+
+# ==============================================================================
+# Wrist Camera Observations
+# ==============================================================================
+
+# Global web viewer state
+_web_viewer_app = None
+_web_viewer_thread = None
+_web_viewer_latest_image = None
+
+
+def wrist_depth_image(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("wrist_camera"),
+) -> torch.Tensor:
+    """Wrist-mounted depth camera observation using TiledCamera.
+    
+    Returns 32x32 depth image normalized to [0, 1] based on clipping range.
+    Optionally serves images via web viewer for remote visualization.
+    
+    Args:
+        env: Environment instance
+        sensor_cfg: Camera sensor configuration
+    
+    Returns:
+        Flattened depth tensor (num_envs, resolution * resolution)
+    """
+    cfg = env.cfg.y2r_cfg.wrist_camera
+    camera = env.scene.sensors[sensor_cfg.name]
+    
+    # Get depth: TiledCamera returns (num_envs, H, W, 1)
+    depth = camera.data.output["distance_to_image_plane"]
+    
+    # Remove channel dimension and normalize
+    depth = depth.squeeze(-1)  # (num_envs, H, W)
+    near, far = cfg.clipping_range
+    depth_normalized = (depth.clamp(near, far) - near) / (far - near)
+    
+    # Web viewer update
+    if cfg.web_viewer:
+        _update_web_viewer(env, depth_normalized, cfg)
+    
+    # Flatten: (N, resolution * resolution)
+    return depth_normalized.reshape(env.num_envs, -1)
+
+
+def _update_web_viewer(env, depth: torch.Tensor, cfg):
+    """Update web viewer with latest depth image."""
+    global _web_viewer_app, _web_viewer_thread, _web_viewer_latest_image
+    
+    # Start web viewer on first call
+    if _web_viewer_app is None and cfg.web_viewer:
+        _start_web_viewer(cfg.viewer_port)
+    
+    # Update at specified rate
+    update_interval = int((1.0 / cfg.viewer_update_hz) / env.step_dt)
+    if env.common_step_counter % max(1, update_interval) == 0:
+        # Convert first env's depth to numpy
+        depth_np = depth[0].cpu().numpy()
+        
+        # Convert to RGB for display using colormap
+        import matplotlib.cm as cm
+        colored = cm.viridis(depth_np)[:, :, :3]  # Drop alpha
+        colored = (colored * 255).astype('uint8')
+        
+        # Update global image buffer
+        _web_viewer_latest_image = {
+            'image': colored,
+            'step': env.common_step_counter,
+            'min_depth': depth[0].min().item() * (cfg.clipping_range[1] - cfg.clipping_range[0]) + cfg.clipping_range[0],
+            'max_depth': depth[0].max().item() * (cfg.clipping_range[1] - cfg.clipping_range[0]) + cfg.clipping_range[0],
+        }
+
+
+def _start_web_viewer(port: int):
+    """Start Flask web server in background thread."""
+    global _web_viewer_app, _web_viewer_thread
+    
+    from flask import Flask, Response
+    import threading
+    import io
+    from PIL import Image
+    
+    app = Flask(__name__)
+    
+    @app.route('/')
+    def index():
+        return '''
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Wrist Camera Viewer</title>
+            <style>
+                body { 
+                    background: #1e1e1e; 
+                    color: #ffffff; 
+                    font-family: monospace; 
+                    text-align: center;
+                    padding: 20px;
+                }
+                img { 
+                    image-rendering: pixelated; 
+                    width: 512px; 
+                    height: 512px; 
+                    border: 2px solid #444;
+                }
+                .info {
+                    margin-top: 10px;
+                    font-size: 14px;
+                }
+            </style>
+        </head>
+        <body>
+            <h1>Wrist Camera - Depth View</h1>
+            <img src="/stream" id="stream">
+            <div class="info" id="info">Waiting for data...</div>
+            <script>
+                // Auto-refresh image (add timestamp to bust cache)
+                setInterval(() => {
+                    document.getElementById('stream').src = '/stream?' + Date.now();
+                }, 100);
+                // Auto-refresh info
+                setInterval(() => {
+                    fetch('/info')
+                        .then(r => r.json())
+                        .then(data => {
+                            document.getElementById('info').innerHTML = 
+                                `Step: ${data.step} | Depth: ${data.min_depth.toFixed(3)}m - ${data.max_depth.toFixed(3)}m`;
+                        });
+                }, 100);
+            </script>
+        </body>
+        </html>
+        '''
+    
+    @app.route('/stream')
+    def stream():
+        if _web_viewer_latest_image is None:
+            # Return black image if no data yet
+            img = Image.new('RGB', (32, 32), color='black')
+        else:
+            img = Image.fromarray(_web_viewer_latest_image['image'])
+        
+        buf = io.BytesIO()
+        img.save(buf, format='PNG')
+        buf.seek(0)
+        
+        return Response(buf.getvalue(), mimetype='image/png')
+    
+    @app.route('/info')
+    def info():
+        if _web_viewer_latest_image is None:
+            return {'step': 0, 'min_depth': 0.0, 'max_depth': 0.0}
+        # Only return JSON-serializable fields (not the image array)
+        return {
+            'step': int(_web_viewer_latest_image['step']),
+            'min_depth': float(_web_viewer_latest_image['min_depth']),
+            'max_depth': float(_web_viewer_latest_image['max_depth']),
+        }
+    
+    def run_server():
+        app.run(host='0.0.0.0', port=port, threaded=True, use_reloader=False, debug=False)
+    
+    _web_viewer_app = app
+    _web_viewer_thread = threading.Thread(target=run_server, daemon=True)
+    _web_viewer_thread.start()
+    
+    print(f"\n{'='*60}")
+    print(f"Wrist Camera Web Viewer started!")
+    print(f"View at: http://localhost:{port}")
+    print(f"Or forward port via SSH: ssh -L {port}:localhost:{port} user@remote")
+    print(f"{'='*60}\n")

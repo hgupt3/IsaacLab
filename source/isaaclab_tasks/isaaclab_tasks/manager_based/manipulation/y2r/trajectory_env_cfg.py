@@ -33,7 +33,7 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from . import mdp
 from .adr_curriculum import build_curriculum_cfg
-from .config_loader import get_config, get_play_config, get_push_config, Y2RConfig
+from .config_loader import get_config, get_play_config, get_push_config, get_student_config, get_student_play_config, Y2RConfig
 from .procedural_shapes import get_procedural_shape_paths
 
 
@@ -329,13 +329,13 @@ def _build_observations_cfg(cfg: Y2RConfig):
 
     @configclass
     class StudentPerceptionObsCfg(ObsGroup):
-        """Student perception: only object point cloud (no pose)."""
-        object_point_cloud = ObsTerm(
-            func=mdp.object_point_cloud_b,
+        """Student perception: visible-only object point cloud from pseudo-camera viewpoint."""
+        visible_point_cloud = ObsTerm(
+            func=mdp.visible_object_point_cloud_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),
             clip=cfg.observations.clip_range,
             params={
-                "num_points": cfg.observations.num_points,
+                "num_points": cfg.observations.student_num_points,
                 "flatten": True,
             },
         )
@@ -345,13 +345,13 @@ def _build_observations_cfg(cfg: Y2RConfig):
             self.concatenate_dim = 0
             self.concatenate_terms = True
             self.flatten_history_dim = True
-            self.history_length = cfg.observations.history.perception
+            self.history_length = 1
 
     @configclass
     class StudentTargetObsCfg(ObsGroup):
-        """Student targets: only point clouds (no poses)."""
-        target_point_clouds = ObsTerm(
-            func=mdp.target_sequence_obs_b,
+        """Student targets: visible point clouds through target trajectory."""
+        visible_target_sequence = ObsTerm(
+            func=mdp.visible_target_sequence_obs_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),
             clip=cfg.observations.clip_range,
             params={},
@@ -365,6 +365,19 @@ def _build_observations_cfg(cfg: Y2RConfig):
             self.history_length = cfg.observations.history.targets
 
     @configclass
+    class StudentCameraObsCfg(ObsGroup):
+        """Student camera: wrist-mounted 32x32 depth."""
+        wrist_depth = ObsTerm(
+            func=mdp.wrist_depth_image,
+            params={"sensor_cfg": SceneEntityCfg("wrist_camera")},
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = False  # No noise on raw camera
+            self.concatenate_terms = True
+            self.history_length = 1  # No history for camera
+
+    @configclass
     class ObservationsCfg:
         """Observation specifications for the MDP."""
         policy: PolicyCfg = PolicyCfg()
@@ -374,11 +387,14 @@ def _build_observations_cfg(cfg: Y2RConfig):
         # Student groups (only when mode.use_student_mode is True)
         student_perception: StudentPerceptionObsCfg | None = None
         student_targets: StudentTargetObsCfg | None = None
+        student_camera: StudentCameraObsCfg | None = None
 
     obs_cfg = ObservationsCfg()
     if cfg.mode.use_student_mode:
         obs_cfg.student_perception = StudentPerceptionObsCfg()
         obs_cfg.student_targets = StudentTargetObsCfg()
+    if cfg.wrist_camera.enabled:
+        obs_cfg.student_camera = StudentCameraObsCfg()
     return obs_cfg
 
 
@@ -648,6 +664,7 @@ def _build_rewards_cfg(cfg: Y2RConfig):
             params={
                 "threshold": cfg.rewards.joint_limits_margin.params.get("threshold", 0.95),
                 "power": cfg.rewards.joint_limits_margin.params.get("power", 2.0),
+                "max_penalty_per_joint": cfg.rewards.joint_limits_margin.params.get("max_penalty_per_joint", 1.0),
                 "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
             },
         )
@@ -826,3 +843,46 @@ class TrajectoryEnvCfg_PUSH(TrajectoryEnvCfg):
         # Set difficulty from push config
         if self.curriculum is not None:
             self.curriculum.adr.params["init_difficulty"] = cfg.curriculum.difficulty.initial
+
+
+class TrajectoryEnvCfg_STUDENT(TrajectoryEnvCfg):
+    """Trajectory task student distillation environment.
+    
+    Uses student config with:
+    - Wrist camera enabled
+    - Student observation groups (visible point clouds)
+    - Moderate difficulty for distillation
+    """
+
+    def _get_config(self) -> Y2RConfig:
+        """Use student config for distillation."""
+        return get_student_config()
+
+    def __post_init__(self):
+        super().__post_init__()
+        
+        # Start at configured difficulty for distillation
+        if self.curriculum is not None:
+            self.curriculum.adr.params["init_difficulty"] = self.y2r_cfg.curriculum.difficulty.initial
+
+
+class TrajectoryEnvCfg_STUDENT_PLAY(TrajectoryEnvCfg):
+    """Trajectory task student evaluation environment.
+    
+    Uses student play config with:
+    - Wrist camera enabled
+    - Student observation groups (visible point clouds)
+    - Max difficulty for evaluation
+    - Visualization enabled
+    """
+
+    def _get_config(self) -> Y2RConfig:
+        """Use student play config for evaluation."""
+        return get_student_play_config()
+
+    def __post_init__(self):
+        super().__post_init__()
+        
+        # Start at max difficulty for evaluation
+        if self.curriculum is not None:
+            self.curriculum.adr.params["init_difficulty"] = self.y2r_cfg.curriculum.difficulty.initial

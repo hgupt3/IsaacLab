@@ -194,6 +194,7 @@ def joint_pos_limits_margin(
     env: ManagerBasedRLEnv,
     threshold: float = 0.95,
     power: float = 2.0,
+    max_penalty_per_joint: float = 1.0,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """Penalty for operating too close to joint position soft limits.
@@ -204,13 +205,15 @@ def joint_pos_limits_margin(
     Then penalize joints whose |normalized| exceeds `threshold` (e.g. 0.95),
     with a smooth ramp:
 
-        x = clamp((|q_norm| - threshold) / (1 - threshold), 0, inf)
+        x = clamp((|q_norm| - threshold) / (1 - threshold), 0, max_penalty_per_joint)
         penalty = sum(x^power) over joints
 
     Args:
         env: The environment.
         threshold: Normalized proximity threshold in (0, 1). Larger = only penalize very near limits.
         power: Shape of penalty (>= 1). 2.0 gives quadratic growth near limits.
+        max_penalty_per_joint: Maximum value of x before power (prevents unbounded spikes when
+            joints exceed soft limits). Default 1.0 means max penalty is 1^power per joint.
         asset_cfg: Which articulation / joints to penalize. Defaults to all robot joints.
 
     Returns:
@@ -227,7 +230,8 @@ def joint_pos_limits_margin(
     q = asset.data.joint_pos[:, joint_ids]  # (N, J)
 
     q_norm = math_utils.scale_transform(q, limits[..., 0], limits[..., 1])  # (N, J) in [-1, 1]
-    x = (q_norm.abs() - threshold).clamp(min=0.0) / (1.0 - threshold)
+    # Clamp x to max_penalty_per_joint to prevent unbounded spikes when joints exceed soft limits
+    x = (q_norm.abs() - threshold).clamp(min=0.0, max=max_penalty_per_joint * (1.0 - threshold)) / (1.0 - threshold)
     return torch.sum(x**power, dim=1)
 
 

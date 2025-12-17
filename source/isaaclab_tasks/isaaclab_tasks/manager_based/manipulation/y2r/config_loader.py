@@ -101,6 +101,16 @@ def get_push_config() -> "Y2RConfig":
     return get_config("y2r_push_config")
 
 
+def get_student_config() -> "Y2RConfig":
+    """Convenience function to get student distillation config."""
+    return get_config("y2r_student_config")
+
+
+def get_student_play_config() -> "Y2RConfig":
+    """Convenience function to get student play/evaluation config."""
+    return get_config("y2r_student_play_config")
+
+
 # ==============================================================================
 # Type-Safe Config Classes
 # ==============================================================================
@@ -126,6 +136,8 @@ class HistoryConfig:
 class ObservationsConfig:
     """Observation configuration."""
     num_points: int = 32
+    student_num_points: int = 32
+    point_pool_size: int = 256
     clip_range: tuple[float, float] = (-2.0, 2.0)
     history: HistoryConfig = field(default_factory=HistoryConfig)
 
@@ -248,7 +260,7 @@ class RewardsConfig:
         },
     ))
     joint_limits_margin: RewardConfig = field(default_factory=lambda: RewardConfig(
-        weight=-0.05, params={"threshold": 0.95, "power": 2.0}
+        weight=-0.05, params={"threshold": 0.95, "power": 2.0, "max_penalty_per_joint": 1.0}
     ))
     tracking_progress: RewardConfig = field(default_factory=lambda: RewardConfig(
         weight=0.0,
@@ -368,6 +380,8 @@ class VisualizationConfig:
     """Visualization configuration."""
     targets: bool = True
     current_object: bool = True
+    student_visible: bool = False
+    student_target: bool = False
     waypoint_region: bool = True
     goal_region: bool = True
     pose_axes: bool = True
@@ -402,7 +416,6 @@ class PushTConfig:
     outline_usd: str | None = None
     object_scale: float = 1.0
     outline_position: tuple[float, float] = (-0.55, 0.0)
-    episode_duration: float = 20.0  # Episode timeout (seconds)
     rolling_window: float = 3.0     # Trajectory planning horizon (seconds)
     min_speed: float = 0.02         # Minimum speed (m/s)
     include_in_primitives: bool = False  # Include T-shape in random object selection
@@ -433,6 +446,33 @@ class ProceduralObjectsConfig:
     regenerate: bool = False
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     _raw: dict = field(default_factory=dict)  # Store raw dict for procedural_shapes.py
+
+
+@dataclass
+class PseudoCameraConfig:
+    """Pseudo-camera configuration for visible point cloud filtering."""
+    position: tuple[float, float, float] = (0.5, 0.0, 0.8)
+
+
+@dataclass
+class CameraOffsetConfig:
+    """Camera offset configuration relative to parent link."""
+    pos: tuple[float, float, float] = (-0.1, 0.0, 0.05)
+    rot: tuple[float, float, float] = (-90.0, -90.0, 0.0)
+
+
+@dataclass
+class WristCameraConfig:
+    """Wrist-mounted camera configuration."""
+    enabled: bool = False
+    resolution: int = 32
+    focal_length: float = 1.93
+    horizontal_aperture: float = 3.896
+    clipping_range: tuple[float, float] = (0.05, 2.0)
+    offset: CameraOffsetConfig = field(default_factory=CameraOffsetConfig)
+    web_viewer: bool = False
+    viewer_port: int = 8000
+    viewer_update_hz: int = 10
 
 
 @dataclass
@@ -469,6 +509,8 @@ class Y2RConfig:
     robot: RobotConfig = field(default_factory=RobotConfig)
     push_t: PushTConfig = field(default_factory=PushTConfig)
     procedural_objects: ProceduralObjectsConfig = field(default_factory=ProceduralObjectsConfig)
+    wrist_camera: WristCameraConfig = field(default_factory=WristCameraConfig)
+    pseudo_camera: PseudoCameraConfig = field(default_factory=PseudoCameraConfig)
     
     @classmethod
     def from_dict(cls, data: dict) -> "Y2RConfig":
@@ -496,6 +538,8 @@ class Y2RConfig:
             robot=_parse_robot(data.get("robot", {})),
             push_t=_parse_push_t(data.get("push_t", {})),
             procedural_objects=_parse_procedural_objects(data.get("procedural_objects", {})),
+            wrist_camera=_parse_wrist_camera(data.get("wrist_camera", {})),
+            pseudo_camera=_parse_pseudo_camera(data.get("pseudo_camera", {})),
         )
 
 
@@ -522,6 +566,8 @@ def _parse_observations(data: dict) -> ObservationsConfig:
     history_data = data.get("history", {})
     return ObservationsConfig(
         num_points=data.get("num_points", 32),
+        student_num_points=data.get("student_num_points", 32),
+        point_pool_size=data.get("point_pool_size", 256),
         clip_range=_to_tuple(data.get("clip_range"), (-2.0, 2.0)),
         history=HistoryConfig(
             policy=history_data.get("policy", 5),
@@ -639,7 +685,7 @@ def _parse_rewards(data: dict) -> RewardsConfig:
             "contact_threshold": 1.0,
             "only_in_manipulation": True,
         }),
-        joint_limits_margin=parse_reward("joint_limits_margin", {"weight": -0.05, "threshold": 0.95, "power": 2.0}),
+        joint_limits_margin=parse_reward("joint_limits_margin", {"weight": -0.05, "threshold": 0.95, "power": 2.0, "max_penalty_per_joint": 1.0}),
         tracking_progress=parse_reward(
             "tracking_progress",
             {
@@ -737,6 +783,8 @@ def _parse_visualization(data: dict) -> VisualizationConfig:
     return VisualizationConfig(
         targets=data.get("targets", True),
         current_object=data.get("current_object", True),
+        student_visible=data.get("student_visible", False),
+        student_target=data.get("student_target", False),
         waypoint_region=data.get("waypoint_region", True),
         goal_region=data.get("goal_region", True),
         pose_axes=data.get("pose_axes", True),
@@ -771,7 +819,6 @@ def _parse_push_t(data: dict) -> PushTConfig:
         outline_usd=data.get("outline_usd"),
         object_scale=data.get("object_scale", 1.0),
         outline_position=_to_tuple(data.get("outline_position"), (-0.55, 0.0)),
-        episode_duration=data.get("episode_duration", 20.0),
         rolling_window=data.get("rolling_window", 3.0),
         min_speed=data.get("min_speed", 0.02),
         include_in_primitives=data.get("include_in_primitives", False),
@@ -799,4 +846,28 @@ def _parse_procedural_objects(data: dict) -> ProceduralObjectsConfig:
             seed=gen_data.get("seed"),
         ),
         _raw=data,  # Store raw dict for procedural_shapes.py
+    )
+
+
+def _parse_wrist_camera(data: dict) -> WristCameraConfig:
+    offset_data = data.get("offset", {})
+    return WristCameraConfig(
+        enabled=data.get("enabled", False),
+        resolution=data.get("resolution", 32),
+        focal_length=data.get("focal_length", 1.93),
+        horizontal_aperture=data.get("horizontal_aperture", 3.896),
+        clipping_range=_to_tuple(data.get("clipping_range"), (0.05, 2.0)),
+        offset=CameraOffsetConfig(
+            pos=_to_tuple(offset_data.get("pos"), (-0.1, 0.0, 0.05)),
+            rot=_to_tuple(offset_data.get("rot"), (-90.0, -90.0, 0.0)),
+        ),
+        web_viewer=data.get("web_viewer", False),
+        viewer_port=data.get("viewer_port", 8000),
+        viewer_update_hz=data.get("viewer_update_hz", 10),
+    )
+
+
+def _parse_pseudo_camera(data: dict) -> PseudoCameraConfig:
+    return PseudoCameraConfig(
+        position=_to_tuple(data.get("position"), (0.5, 0.0, 0.8)),
     )

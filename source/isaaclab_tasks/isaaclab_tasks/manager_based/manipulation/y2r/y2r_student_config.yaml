@@ -1,0 +1,36 @@
+# ==============================================================================
+# Y2R Student Training/Distillation Configuration
+# ==============================================================================
+# Inherits from y2r_config.yaml - only specify overrides here.
+# This config enables student mode with wrist camera for distillation.
+# ==============================================================================
+
+_base_: y2r_config.yaml
+
+# ==============================================================================
+# STUDENT MODE SETTINGS
+# ==============================================================================
+
+# Enable student observations (visible point clouds + wrist camera)
+mode:
+  use_student_mode: true        # Enables student_perception and student_targets obs groups
+
+# ==============================================================================
+# WRIST CAMERA
+# ==============================================================================
+wrist_camera:
+  enabled: true
+
+# ==============================================================================
+# CURRICULUM FOR DISTILLATION
+# ==============================================================================
+curriculum:
+  difficulty:
+    initial: 0              
+
+# ==============================================================================
+# SIMULATION (can use more envs for distillation)
+# ==============================================================================
+simulation:
+  num_envs: 4096              
+

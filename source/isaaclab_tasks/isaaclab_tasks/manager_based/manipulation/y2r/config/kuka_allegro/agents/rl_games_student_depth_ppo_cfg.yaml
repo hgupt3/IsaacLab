@@ -1,0 +1,156 @@
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# Copyright (c) 2024, Harsh Gupta
+# All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# =============================================================================
+# Student Policy Configuration for DaGGer/BC Distillation
+# =============================================================================
+# Network architecture config for student policy distillation.
+# 
+# Inputs:
+#   - Wrist camera depth (64x64) → SmallResNet → 128-dim features
+#   - Visible point clouds (student_perception, student_targets)
+#   - Proprioceptive observations (joint pos, vel, tips)
+#
+# Teacher uses: perception, targets (privileged full point clouds)
+# Student uses: student_perception, student_targets (visible point clouds only)
+# =============================================================================
+
+params:
+  seed: 42
+
+  # Environment wrapper clipping
+  env:
+    clip_observations: 100.0
+    clip_actions: 100.0
+    
+    # Observation groups for student policy
+    obs_groups:
+      obs: ["policy", "proprio", "student_perception", "student_targets"]
+      camera: ["student_camera"]  # Wrist depth camera (64x64)
+      states: ["policy", "proprio", "perception", "targets"]  # Teacher obs (privileged)
+    concate_obs_groups: True
+
+  algo:
+    name: a2c_continuous
+
+  model:
+    name: continuous_a2c_logstd
+
+  # ==========================================================================
+  # NETWORK ARCHITECTURE
+  # ==========================================================================
+  network:
+    name: depth_resnet_student
+    separate: False
+    
+    # Depth encoder: SmallResNet for 64x64 depth images
+    depth_encoder:
+      resolution: 64
+      channels: [32, 128, 256]
+    
+    space:
+      continuous:
+        mu_activation: None
+        sigma_activation: None
+        mu_init:
+          name: default
+        sigma_init:
+          name: const_initializer
+          val: 0
+        fixed_sigma: True
+    
+    mlp:
+      units: [512, 256, 128]
+      activation: elu
+      d2rl: False
+      initializer:
+        name: default
+      regularizer:
+        name: None
+
+  load_checkpoint: False
+  load_path: ''
+
+  # ==========================================================================
+  # RL-GAMES CONFIG (matches teacher config structure)
+  # ==========================================================================
+  config:
+    name: student_depth_distillation
+    env_name: rlgpu
+    device: 'cuda:0'
+    device_name: 'cuda:0'
+    multi_gpu: False
+    ppo: True
+    mixed_precision: True
+    normalize_input: True
+    normalize_value: True
+    value_bootstrap: False
+    num_actors: -1
+    reward_shaper:
+      scale_value: 0.01
+    normalize_advantage: True
+    gamma: 0.99
+    tau: 0.95
+    learning_rate: 1e-3
+    lr_schedule: adaptive
+    schedule_type: legacy
+    kl_threshold: 0.01
+    score_to_win: 100000000
+    max_epochs: 750000
+    save_best_after: 100
+    save_frequency: 50
+    print_stats: True
+    grad_norm: 1.0
+    entropy_coef: 0.002
+    truncate_grads: True
+    e_clip: 0.2
+    horizon_length: 36
+    minibatch_size: 36864
+    mini_epochs: 5
+    critic_coef: 4
+    clip_value: True
+    clip_actions: False
+    seq_length: 4                 # RNN sequence length for truncated BPTT (if using RNN)
+    bounds_loss_coef: 0.0001
+
+  # ==========================================================================
+  # DISTILLATION SETTINGS (ONLY source for DistillAgent - ignores config above)
+  # Note: seq_length from config: section is used for RNN truncated BPTT
+  # ==========================================================================
+  distillation:
+    # Training
+    learning_rate: 1e-4           # Adam lr for distillation
+    grad_norm: 1.0                # Gradient clipping
+    max_iterations: 100000000       # Total training iterations
+    save_frequency: 500            # Checkpoint save interval (iterations, not frames)
+    save_best_after: 1000            # Don't save "best" until this many epochs/iters (avoid early noise)
+    
+    # DaGGer
+    beta: 0.5                     # Fraction of envs using teacher (0.5 = 50%)
+    
+    # Infrastructure
+    mixed_precision: True         # Use AMP for faster training
+    normalize_input: True         # Normalize observations with RunningMeanStd
+    multi_gpu: False              # DDP (overridden by --distributed flag)
+    
+    # Depth augmentation (GPU-accelerated via NVIDIA Warp)
+    depth_augmentation: True      # Enable depth image augmentation
+    depth_aug_config:             # Override defaults if needed
+      correlated_noise:
+        sigma_s: 0.3              # Spatial noise
+        sigma_d: 0.1             # Depth noise
+      pixel_dropout_and_randu:
+        p_dropout: 0.003          # Dropout probability
+        p_randu: 0.003            # Random uniform probability
+      sticks:
+        p_stick: 0.00025          # Stick artifact probability
+        max_stick_len: 12.0       # Max stick length (pixels)
+        max_stick_width: 2.0      # Max stick width (pixels)
+
+    # Debug: save post-augmentation depth tiles to disk for inspection.
+    # Output path: logs/.../nn/debug_depth/depth_postaug_iter_XXXXXXXX.png
+    debug_save_depth: False
+    debug_depth_every: 10
+    debug_depth_num_envs: 3

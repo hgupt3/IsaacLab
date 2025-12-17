@@ -10,7 +10,8 @@ from isaaclab_assets.robots import KUKA_ALLEGRO_CFG
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.sensors import ContactSensorCfg
+from isaaclab.sensors import TiledCameraCfg, ContactSensorCfg
+from isaaclab.sim import PinholeCameraCfg
 from isaaclab.utils import configclass
 
 from ... import trajectory_env_cfg as trajectory
@@ -136,6 +137,36 @@ class KukaAllegroTrajectoryMixinCfg:
         # Fingers to object reward uses palm and fingertips
         self.rewards.fingers_to_object.params["asset_cfg"] = SceneEntityCfg("robot", body_names=["palm_link", ".*_tip"])
 
+        # Add wrist camera if enabled (using TiledCamera for efficiency)
+        if cfg.wrist_camera.enabled:
+            from scipy.spatial.transform import Rotation
+            
+            # Config has [rx, ry, rz], transform for opengl convention
+            rot_euler = cfg.wrist_camera.offset.rot
+            rot_swapped = (rot_euler[0], rot_euler[2], -rot_euler[1]) # no idea whats going on here, but it works
+            
+            r = Rotation.from_euler('xyz', rot_swapped, degrees=True)
+            quat = r.as_quat()  # [x, y, z, w]
+            quat_wxyz = (float(quat[3]), float(quat[0]), float(quat[1]), float(quat[2]))
+            pos = tuple(float(x) for x in cfg.wrist_camera.offset.pos)
+            
+            self.scene.wrist_camera = TiledCameraCfg(
+                prim_path="{ENV_REGEX_NS}/Robot/ee_link/palm_link/wrist_camera",
+                offset=TiledCameraCfg.OffsetCfg(
+                    pos=pos,
+                    rot=quat_wxyz,
+                    convention="opengl"
+                ),
+                data_types=["distance_to_image_plane"],  # Depth only
+                spawn=PinholeCameraCfg(
+                    focal_length=cfg.wrist_camera.focal_length,
+                    horizontal_aperture=cfg.wrist_camera.horizontal_aperture,
+                    clipping_range=cfg.wrist_camera.clipping_range,
+                ),
+                width=cfg.wrist_camera.resolution,
+                height=cfg.wrist_camera.resolution,
+            )
+
 
 # ==============================================================================
 # FINAL ENV CONFIGS
@@ -156,4 +187,16 @@ class TrajectoryKukaAllegroEnvCfg_PLAY(KukaAllegroTrajectoryMixinCfg, trajectory
 @configclass
 class TrajectoryKukaAllegroEnvCfg_PUSH(KukaAllegroTrajectoryMixinCfg, trajectory.TrajectoryEnvCfg_PUSH):
     """Kuka Allegro Push-T task - T-shape object with direct trajectory to outline goal."""
+    pass
+
+
+@configclass
+class TrajectoryKukaAllegroEnvCfg_STUDENT(KukaAllegroTrajectoryMixinCfg, trajectory.TrajectoryEnvCfg_STUDENT):
+    """Kuka Allegro trajectory task - Student distillation with wrist camera."""
+    pass
+
+
+@configclass
+class TrajectoryKukaAllegroEnvCfg_STUDENT_PLAY(KukaAllegroTrajectoryMixinCfg, trajectory.TrajectoryEnvCfg_STUDENT_PLAY):
+    """Kuka Allegro trajectory task - Student evaluation with wrist camera."""
     pass

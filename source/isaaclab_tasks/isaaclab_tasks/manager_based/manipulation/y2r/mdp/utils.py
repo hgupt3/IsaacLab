@@ -82,6 +82,7 @@ class PointCloudCache:
     - geo_indices: env_id -> geo_idx
     - scales: env_id -> (sx, sy, sz)  
     - all_base_points: (num_geos, pool_size, 3) - stacked so we can index by geo_idx
+    - all_base_normals: (num_geos, pool_size, 3) - surface normals for visibility filtering
     """
     def __init__(self, prim_path: str, num_envs: int, pool_size: int):
         from pxr import Sdf
@@ -127,13 +128,15 @@ class PointCloudCache:
                 if scale_attr and scale_attr.default is not None:
                     self.scales[env_id] = torch.tensor(list(scale_attr.default), dtype=torch.float32)
         
-        # Phase 2: Sample base points for each geometry and stack
+        # Phase 2: Sample base points AND normals for each geometry and stack
         num_geos = len(geo_first_env)
         self.all_base_points = torch.zeros(num_geos, pool_size, 3, dtype=torch.float32)
+        self.all_base_normals = torch.zeros(num_geos, pool_size, 3, dtype=torch.float32)
         
         for geo_idx, env_id in enumerate(geo_first_env):
-            base = _sample_base_points_for_geometry(env_id, pool_size, prim_path, "cpu")
-            self.all_base_points[geo_idx] = base
+            points, normals = _sample_base_points_and_normals_for_geometry(env_id, pool_size, prim_path, "cpu")
+            self.all_base_points[geo_idx] = points
+            self.all_base_normals[geo_idx] = normals
 
 # === STABLE PLACEMENT CACHE (built once for all envs) ===
 # Key: prim_path -> StablePlacementCache
@@ -262,16 +265,18 @@ def _compute_geometry_group_key(prims: list) -> str:
     return "|".join(sorted(parts))
 
 
-POINT_POOL_SIZE = 200  # points per geometry pool
-
-
-def _sample_base_points_for_geometry(
+def _sample_base_points_and_normals_for_geometry(
     env_id: int,
     pool_size: int,
     prim_path: str,
     device: str,
-) -> torch.Tensor:
-    """Sample an unscaled pool of points for an environment's geometry (cached)."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample an unscaled pool of points AND surface normals for an environment's geometry.
+    
+    Returns:
+        Tuple of (points, normals) each with shape (pool_size, 3).
+        Points and normals are in object-local frame (without scale).
+    """
     obj_path = prim_path.replace(".*", str(env_id))
     xform_cache = UsdGeom.XformCache()
     
@@ -285,6 +290,8 @@ def _sample_base_points_for_geometry(
     world_root = xform_cache.GetLocalToWorldTransform(object_prim)
 
     all_samples: list[torch.Tensor] = []
+    all_normals: list[torch.Tensor] = []
+    
     for prim in prims:
         prim_type = prim.GetTypeName()
 
@@ -297,38 +304,53 @@ def _sample_base_points_for_geometry(
         else:
             mesh_tm = create_primitive_mesh(prim)
 
-        # Random surface sampling (area-weighted)
+        # Random surface sampling (area-weighted) - get face indices for normals
         face_weights = mesh_tm.area_faces
-        samples_np, _ = sample_surface(mesh_tm, pool_size, face_weight=face_weights)
+        samples_np, face_indices = sample_surface(mesh_tm, pool_size, face_weight=face_weights)
         local_pts = torch.from_numpy(samples_np.astype(np.float32)).to(device)
+        
+        # Get normals from face indices
+        local_normals_np = mesh_tm.face_normals[face_indices]
+        local_normals = torch.from_numpy(local_normals_np.astype(np.float32)).to(device)
 
         # Transform from prim local frame to object root frame
         rel = xform_cache.GetLocalToWorldTransform(prim) * world_root.GetInverse()
         mat_np = np.array([[rel[r][c] for c in range(4)] for r in range(4)], dtype=np.float32)
         mat_t = torch.from_numpy(mat_np).to(device)
+        
+        # Extract rotation matrix (3x3) for normals
+        rot_mat = mat_t[:3, :3]
 
+        # Transform points (position + rotation)
         ones = torch.ones((pool_size, 1), device=device)
         pts_h = torch.cat([local_pts, ones], dim=1)
         root_h = pts_h @ mat_t
         samples = root_h[:, :3]
+        
+        # Transform normals (rotation only, then normalize)
+        normals = local_normals @ rot_mat.T
+        normals = normals / (normals.norm(dim=-1, keepdim=True) + 1e-8)
 
         # Cone height adjustment
         if prim_type == "Cone":
             samples[:, 2] -= UsdGeom.Cone(prim).GetHeightAttr().Get() / 2
 
         all_samples.append(samples)
+        all_normals.append(normals)
 
     # Combine samples
     if len(all_samples) == 1:
         points = all_samples[0][:pool_size]
+        normals = all_normals[0][:pool_size]
     else:
-        combined = torch.cat(all_samples, dim=0)
-        perm = torch.randperm(combined.shape[0], device=device)[:pool_size]
-        points = combined[perm]
+        combined_pts = torch.cat(all_samples, dim=0)
+        combined_norms = torch.cat(all_normals, dim=0)
+        perm = torch.randperm(combined_pts.shape[0], device=device)[:pool_size]
+        points = combined_pts[perm]
+        normals = combined_norms[perm]
     
-    # Points are now in object-local space at geometry_size (WITHOUT object's scale)
-    # We return them as-is - the main function will apply each env's scale
-    return points
+    # Points and normals are now in object-local space at geometry_size (WITHOUT object's scale)
+    return points, normals
 
 
 def sample_object_point_cloud_random(
@@ -336,6 +358,7 @@ def sample_object_point_cloud_random(
     num_points: int,
     prim_path: str,
     device: str = "cpu",
+    pool_size: int | None = None,
 ) -> torch.Tensor:
     """
     Sample random points on object surfaces for specified environments.
@@ -347,13 +370,17 @@ def sample_object_point_cloud_random(
         num_points: Number of points to sample per environment.
         prim_path: USD prim path pattern with ".*" placeholder for env index.
         device: Device to place the output tensor on.
+        pool_size: Size of point pool to sample from. If None, uses 4x num_points.
 
     Returns:
         torch.Tensor: Shape (len(env_ids), num_points, 3) on `device`.
     """
     global _POINT_CLOUD_CACHE
     
-    pool_size = max(POINT_POOL_SIZE, num_points)
+    # Default pool size is 4x num_points to ensure enough points for visibility filtering
+    if pool_size is None:
+        pool_size = max(256, num_points * 4)
+    pool_size = max(pool_size, num_points)
     cache_key = (prim_path, pool_size)
     
     # === Build cache on first call (one-time cost) ===
@@ -386,6 +413,32 @@ def sample_object_point_cloud_random(
     points = scales.unsqueeze(1) * sampled_points
     
     return points
+
+
+def get_point_cloud_cache(
+    env_ids: list[int],
+    prim_path: str,
+    pool_size: int,
+) -> PointCloudCache:
+    """Get or create a PointCloudCache for the given prim path and pool size.
+    
+    Args:
+        env_ids: List of environment indices.
+        prim_path: USD prim path pattern with ".*" placeholder for env index.
+        pool_size: Size of point pool.
+        
+    Returns:
+        PointCloudCache with points and normals.
+    """
+    global _POINT_CLOUD_CACHE
+    
+    cache_key = (prim_path, pool_size)
+    
+    if cache_key not in _POINT_CLOUD_CACHE:
+        num_envs = max(env_ids) + 1
+        _POINT_CLOUD_CACHE[cache_key] = PointCloudCache(prim_path, num_envs, pool_size)
+    
+    return _POINT_CLOUD_CACHE[cache_key]
 
 
 # ---- Stable Pose Computation ----
