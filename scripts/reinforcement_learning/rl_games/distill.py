@@ -74,7 +74,6 @@ import logging
 import math
 import os
 import random
-import torch
 from datetime import datetime
 
 from rl_games.common import env_configurations, vecenv
@@ -106,24 +105,6 @@ from isaaclab_tasks.manager_based.manipulation.y2r.distillation import DistillAg
 
 # import logger
 logger = logging.getLogger(__name__)
-
-
-class RlGamesVecEnvWrapperWithCamera(RlGamesVecEnvWrapper):
-    """Extended wrapper that passes additional observation groups (like camera)."""
-    
-    def _process_obs(self, obs_dict):
-        """Process observations including additional groups beyond 'obs' and 'states'."""
-        result = super()._process_obs(obs_dict)
-        
-        # Pass through any additional groups defined in obs_groups
-        for group_key, group_names in self._obs_groups.items():
-            if group_key not in ['obs', 'states'] and len(group_names) > 0:
-                # Concatenate all obs in this group
-                group_obs = [obs_dict[name] for name in group_names if name in obs_dict]
-                if group_obs:
-                    result[group_key] = torch.cat(group_obs, dim=-1) if len(group_obs) > 1 else group_obs[0]
-        
-        return result
 
 
 def register_distill_agent_with_runner(runner: Runner):
@@ -248,8 +229,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print("[INFO] Recording videos during training.")
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
     
-    # Wrap for RL-Games (use extended wrapper to pass camera obs)
-    env = RlGamesVecEnvWrapperWithCamera(env, rl_device, clip_obs, clip_actions, obs_groups, concate_obs_groups)
+    # Wrap for RL-Games (depth is packed into obs, no special wrapper needed)
+    env = RlGamesVecEnvWrapper(env, rl_device, clip_obs, clip_actions, obs_groups, concate_obs_groups)
     
     # Register environment
     vecenv.register(

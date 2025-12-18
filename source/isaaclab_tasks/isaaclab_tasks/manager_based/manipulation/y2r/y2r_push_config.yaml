@@ -42,7 +42,7 @@ randomization:
 # ==============================================================================
 curriculum:
   difficulty:
-    initial: 10
+    initial: 5
 
 visualization:
   targets: true                 # Show target point clouds

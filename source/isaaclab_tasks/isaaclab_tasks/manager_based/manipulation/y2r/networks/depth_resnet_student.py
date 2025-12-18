@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Small ResNet-style Depth Encoder for Student Policy Distillation.
+"""Small ResNet-style Depth Encoder for Student Policy Distillation and PPO Fine-tuning.
 
 This module implements a student policy network that processes wrist camera
 depth images through a small ResNet encoder and concatenates features with
@@ -10,12 +10,27 @@ proprioceptive and point cloud observations.
 
 Architecture:
     - Depth encoder: Conv3x3 s=2 → ResBlock(32) → ResBlock(64,s=2) → ResBlock(128,s=2) → AvgPool
-    - Feature fusion: depth_features (128) + proprio + student_perception + student_targets
+    - Feature fusion: depth_features (128) + base_obs (proprio + student_perception + student_targets)
     - Policy MLP: [512, 256, 128] → actions
+
+Depth handling:
+    Depth is ALWAYS packed at the END of the obs tensor (last resolution*resolution floats).
+    The model:
+    1. Slices depth from end of obs
+    2. Applies RunningMeanStd normalization ONLY to base_obs (not depth)
+    3. Applies optional DepthAug during training
+    4. Encodes depth via SmallResNet
+    5. Concatenates normalized base_obs + depth_features
 
 Usage in YAML config:
     network:
       name: depth_resnet_student
+      depth_augmentation: True
+      depth_aug_config:
+        correlated_noise:
+          sigma_s: 0.3
+          sigma_d: 0.1
+        ...
       depth_encoder:
         resolution: 64
         channels: [32, 64, 128]
@@ -165,13 +180,11 @@ class DepthResNetStudentBuilder(NetworkBuilder):
     """Network builder for student policy with depth encoder.
     
     This builder creates a network that:
-    1. Encodes depth images through SmallResNet
-    2. Concatenates with proprioceptive observations
-    3. Feeds through MLP to produce actions
-    
-    The network expects observations to be passed in obs_dict with:
-    - 'obs': Concatenated proprio + student_perception + student_targets
-    - 'camera': Flattened depth image from student_camera group
+    1. Slices depth from END of obs tensor (last resolution*resolution floats)
+    2. Normalizes ONLY base_obs with RunningMeanStd (depth is already [0,1])
+    3. Applies optional DepthAug during training
+    4. Encodes depth through SmallResNet
+    5. Concatenates features and feeds through MLP to produce actions
     """
     
     def __init__(self, **kwargs):
@@ -191,17 +204,31 @@ class DepthResNetStudentBuilder(NetworkBuilder):
             
             # Extract kwargs
             actions_num = kwargs.pop('actions_num')
-            input_shape = kwargs.pop('input_shape')  # Shape of 'obs' (proprio + pc)
+            input_shape = kwargs.pop('input_shape')  # Shape of full 'obs' (base_obs + depth)
             self.value_size = kwargs.pop('value_size', 1)
             self.num_seqs = kwargs.pop('num_seqs', 1)
+            # RL-Games `config.normalize_input` applies a global RMS *before* the model.
+            # Since we pack depth into obs, global RMS would incorrectly normalize depth.
+            # We therefore disable RL-Games normalize_input in the YAML and do base_obs-only
+            # normalization inside this model via `network.normalize_base_obs`.
+            _ = kwargs.pop('normalize_input', False)  # intentionally ignored
             
             # Load params
             self.load(params)
+
+            # Model-side normalization for base_obs only (independent of RL-Games config.normalize_input)
+            self.normalize_base_obs = params.get("normalize_base_obs", True)
             
             # Depth encoder config
             depth_cfg = params.get('depth_encoder', {})
             self.depth_resolution = depth_cfg.get('resolution', 64)
             self.depth_channels = depth_cfg.get('channels', [32, 64, 128])
+            self.depth_dim = self.depth_resolution * self.depth_resolution
+            
+            # Depth augmentation config
+            self.use_depth_aug = params.get('depth_augmentation', False)
+            self.depth_aug_config = params.get('depth_aug_config', None)
+            self.depth_aug = None  # Lazy init on first forward (needs device)
             
             # Build depth encoder
             self.depth_encoder = SmallResNet(
@@ -210,10 +237,16 @@ class DepthResNetStudentBuilder(NetworkBuilder):
             )
             depth_features = self.depth_encoder.out_features  # 128
             
+            # Calculate base_obs dimension (full obs minus depth)
+            full_obs_dim = input_shape[0] if isinstance(input_shape, tuple) else input_shape
+            self.base_obs_dim = full_obs_dim - self.depth_dim
             
-            # Adjust input shape to include depth features
-            obs_dim = input_shape[0] if isinstance(input_shape, tuple) else input_shape
-            mlp_input_size = obs_dim + depth_features
+            # RunningMeanStd for base_obs ONLY (not depth)
+            if self.normalize_base_obs:
+                self.running_mean_std = RunningMeanStd(self.base_obs_dim)
+            
+            # MLP input: normalized base_obs + depth_features
+            mlp_input_size = self.base_obs_dim + depth_features
             
             # Build MLP
             mlp_units = self.units
@@ -269,36 +302,67 @@ class DepthResNetStudentBuilder(NetworkBuilder):
                     mlp_init(m.weight)
                     if m.bias is not None:
                         torch.nn.init.zeros_(m.bias)
+            
+            print(f"[DepthResNetStudent] Initialized:")
+            print(f"  full_obs_dim: {full_obs_dim}")
+            print(f"  base_obs_dim: {self.base_obs_dim}")
+            print(f"  depth_dim: {self.depth_dim} ({self.depth_resolution}x{self.depth_resolution})")
+            print(f"  depth_features: {depth_features}")
+            print(f"  mlp_input_size: {mlp_input_size}")
+            print(f"  normalize_base_obs: {self.normalize_base_obs}")
+            print(f"  depth_augmentation: {self.use_depth_aug}")
+        
+        def _init_depth_aug(self, device: str):
+            """Lazy initialization of DepthAug (needs device info)."""
+            if self.depth_aug is None and self.use_depth_aug:
+                import warp as wp
+                wp.init()
+                from isaaclab_tasks.manager_based.manipulation.y2r.distillation.depth_augs import DepthAug
+                self.depth_aug = DepthAug(device, self.depth_aug_config)
+                print(f"[DepthResNetStudent] DepthAug initialized on {device}")
         
         def forward(self, obs_dict: Dict[str, torch.Tensor]):
             """Forward pass.
             
             Args:
                 obs_dict: Dictionary containing:
-                    - 'obs': Proprio + student_perception + student_targets (B, obs_dim)
-                    - 'camera': Flattened depth image (B, resolution*resolution)
+                    - 'obs': Full observation tensor with depth packed at end
+                             (B, base_obs_dim + depth_dim)
                     
             Returns:
                 mu, sigma, value, states (for continuous actions)
             """
-            obs = obs_dict['obs']
+            full_obs = obs_dict['obs']
+            B = full_obs.shape[0]
             
-            # Process depth if available
-            if 'camera' in obs_dict:
-                depth_flat = obs_dict['camera']
-                B = depth_flat.shape[0]
-                
-                # Reshape to image: (B, res*res) → (B, 1, res, res)
-                depth_img = depth_flat.view(B, 1, self.depth_resolution, self.depth_resolution)
-                
-                # Encode
-                depth_features = self.depth_encoder(depth_img)  # (B, 128)
-                
-                # Concatenate with observations
-                obs = torch.cat([obs, depth_features], dim=-1)
+            # Slice depth from end of obs (depth is ALWAYS at end)
+            base_obs = full_obs[:, :-self.depth_dim]
+            depth_flat = full_obs[:, -self.depth_dim:]
+            
+            # Normalize base_obs only (depth is already normalized to [0,1])
+            if self.normalize_base_obs:
+                base_obs = self.running_mean_std(base_obs)
+            
+            # Reshape depth to image: (B, res*res) → (B, 1, res, res)
+            depth_img = depth_flat.view(B, 1, self.depth_resolution, self.depth_resolution)
+            
+            # Apply depth augmentation during training only
+            if self.training and self.use_depth_aug:
+                self._init_depth_aug(str(depth_img.device))
+                if self.depth_aug is not None:
+                    # DepthAug expects (B, H, W), returns (B, H, W)
+                    depth_3d = depth_img.squeeze(1)  # (B, H, W)
+                    depth_3d = self.depth_aug.augment(depth_3d)
+                    depth_img = depth_3d.unsqueeze(1)  # (B, 1, H, W)
+            
+            # Encode depth
+            depth_features = self.depth_encoder(depth_img)  # (B, 128)
+            
+            # Concatenate: normalized base_obs + depth_features
+            combined = torch.cat([base_obs, depth_features], dim=-1)
             
             # MLP forward
-            out = self.actor_mlp(obs)
+            out = self.actor_mlp(combined)
             
             # Value
             value = self.value_act(self.value(out))
@@ -373,4 +437,3 @@ class DepthResNetStudentBuilder(NetworkBuilder):
                 in_size = unit
             
             return nn.Sequential(*layers)
-

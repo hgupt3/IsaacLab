@@ -4,9 +4,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 # =============================================================================
-# Student Policy Configuration for DaGGer/BC Distillation
+# Student Policy Configuration for DaGGer/BC Distillation and PPO Fine-tuning
 # =============================================================================
-# Network architecture config for student policy distillation.
+# Network architecture config for student policy distillation and RL fine-tuning.
 # 
 # Inputs:
 #   - Wrist camera depth (64x64) → SmallResNet → 128-dim features
@@ -15,6 +15,9 @@
 #
 # Teacher uses: perception, targets (privileged full point clouds)
 # Student uses: student_perception, student_targets (visible point clouds only)
+#
+# Depth is packed into obs (appended at end) so standard train.py works.
+# The model slices depth from obs tail, applies optional DepthAug, and encodes.
 # =============================================================================
 
 params:
@@ -27,9 +30,8 @@ params:
     
     # Observation groups for student policy
     obs_groups:
-      obs: ["policy", "proprio", "student_perception", "student_targets"]
-      camera: ["student_camera"]  # Wrist depth camera (64x64)
-      states: ["policy", "proprio", "perception", "targets"]  # Teacher obs (privileged)
+      obs: ["policy", "proprio", "student_perception", "student_targets", "student_camera"]
+      states: ["policy", "proprio", "perception", "targets"]  # Teacher obs (privileged for asymmetric critic)
     concate_obs_groups: True
 
   algo:
@@ -44,11 +46,32 @@ params:
   network:
     name: depth_resnet_student
     separate: False
+
+    # IMPORTANT:
+    # We pack depth into obs, so RL-Games' global RunningMeanStd (config.normalize_input)
+    # would incorrectly normalize depth. We therefore disable RL-Games normalize_input
+    # and do base_obs-only normalization inside the model instead.
+    normalize_base_obs: True
     
     # Depth encoder: SmallResNet for 64x64 depth images
     depth_encoder:
       resolution: 64
       channels: [32, 128, 256]
+    
+    # Depth augmentation (GPU-accelerated via NVIDIA Warp)
+    # Applied INSIDE the model during training only (self.training=True)
+    depth_augmentation: True
+    depth_aug_config:
+      correlated_noise:
+        sigma_s: 0.3              # Spatial noise
+        sigma_d: 0.1              # Depth noise
+      pixel_dropout_and_randu:
+        p_dropout: 0.003          # Dropout probability
+        p_randu: 0.003            # Random uniform probability
+      sticks:
+        p_stick: 0.00025          # Stick artifact probability
+        max_stick_len: 12.0       # Max stick length (pixels)
+        max_stick_width: 2.0      # Max stick width (pixels)
     
     space:
       continuous:
@@ -84,7 +107,7 @@ params:
     multi_gpu: False
     ppo: True
     mixed_precision: True
-    normalize_input: True
+    normalize_input: False
     normalize_value: True
     value_bootstrap: False
     num_actors: -1
@@ -99,33 +122,37 @@ params:
     kl_threshold: 0.01
     score_to_win: 100000000
     max_epochs: 750000
-    save_best_after: 100
-    save_frequency: 50
+    save_best_after: 1000
+    save_frequency: 500
     print_stats: True
     grad_norm: 1.0
     entropy_coef: 0.002
     truncate_grads: True
     e_clip: 0.2
     horizon_length: 36
-    minibatch_size: 36864
+    minibatch_size: 4608
     mini_epochs: 5
     critic_coef: 4
     clip_value: True
     clip_actions: False
-    seq_length: 4                 # RNN sequence length for truncated BPTT (if using RNN)
+    seq_len: 4
     bounds_loss_coef: 0.0001
 
   # ==========================================================================
-  # DISTILLATION SETTINGS (ONLY source for DistillAgent - ignores config above)
+  # DISTILLATION SETTINGS (used by DistillAgent)
   # Note: seq_length from config: section is used for RNN truncated BPTT
+  # Note: Depth augmentation is handled INSIDE the model (see network.depth_augmentation)
   # ==========================================================================
   distillation:
     # Training
     learning_rate: 1e-4           # Adam lr for distillation
     grad_norm: 1.0                # Gradient clipping
-    max_iterations: 100000000       # Total training iterations
-    save_frequency: 500            # Checkpoint save interval (iterations, not frames)
-    save_best_after: 1000            # Don't save "best" until this many epochs/iters (avoid early noise)
+    max_iterations: 100000000     # Total training iterations
+    save_frequency: 5000          # Checkpoint save interval (iterations, not frames)
+    save_best_after: 10000        # Don't save "best" until this many epochs/iters (avoid early noise)
+    
+    # Value distillation (train critic from teacher value)
+    value_distillation: True      # Enable value distillation (MSE loss on critic)
     
     # DaGGer
     beta: 0.5                     # Fraction of envs using teacher (0.5 = 50%)
@@ -134,20 +161,6 @@ params:
     mixed_precision: True         # Use AMP for faster training
     normalize_input: True         # Normalize observations with RunningMeanStd
     multi_gpu: False              # DDP (overridden by --distributed flag)
-    
-    # Depth augmentation (GPU-accelerated via NVIDIA Warp)
-    depth_augmentation: True      # Enable depth image augmentation
-    depth_aug_config:             # Override defaults if needed
-      correlated_noise:
-        sigma_s: 0.3              # Spatial noise
-        sigma_d: 0.1             # Depth noise
-      pixel_dropout_and_randu:
-        p_dropout: 0.003          # Dropout probability
-        p_randu: 0.003            # Random uniform probability
-      sticks:
-        p_stick: 0.00025          # Stick artifact probability
-        max_stick_len: 12.0       # Max stick length (pixels)
-        max_stick_width: 2.0      # Max stick width (pixels)
 
     # Debug: save post-augmentation depth tiles to disk for inspection.
     # Output path: logs/.../nn/debug_depth/depth_postaug_iter_XXXXXXXX.png

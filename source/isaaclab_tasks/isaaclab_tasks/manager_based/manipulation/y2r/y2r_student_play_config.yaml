@@ -17,7 +17,7 @@ mode:
 # Start at maximum difficulty (fully trained conditions)
 curriculum:
   difficulty:
-    initial: 10                 # Start at max difficulty for evaluation
+    initial: 5                 # Start at max difficulty for evaluation
 
 # Enable debug visualization for analysis
 visualization:

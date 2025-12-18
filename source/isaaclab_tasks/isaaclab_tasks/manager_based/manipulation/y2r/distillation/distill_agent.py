@@ -16,16 +16,13 @@ import os
 import time
 import torch
 import torch.distributed as dist
-import warp as wp
 
 from rl_games.algos_torch.a2c_continuous import A2CAgent
 from rl_games.algos_torch import torch_ext
 from rl_games.algos_torch.model_builder import ModelBuilder
 from rl_games.common.a2c_common import print_statistics
 
-from typing import Dict, Optional
-
-from .depth_augs import DepthAug
+from typing import Dict
 
 
 def l2_loss(pred, target):
@@ -114,26 +111,13 @@ class DistillAgent(A2CAgent):
         # DaGGer
         self.beta = self.distill_config.get('beta', 0.5)
         
+        # Value distillation
+        self.use_value_distillation = self.distill_config.get('value_distillation', True)
+        
         # Infrastructure
         self.distill_mixed_precision = self.distill_config.get('mixed_precision', True)
         self.distill_normalize_input = self.distill_config.get('normalize_input', True)
         # multi_gpu is handled by script via --distributed flag
-        
-        # Depth augmentation
-        self.use_depth_aug = self.distill_config.get('depth_augmentation', True)
-        depth_aug_config = self.distill_config.get('depth_aug_config', None)
-
-        # Optional debug: save post-augmentation depth images for a few envs.
-        # Written to: <log_dir>/nn/debug_depth/depth_postaug_iter_XXXXXXXX.png
-        self.debug_save_depth = bool(self.distill_config.get("debug_save_depth", False))
-        self.debug_depth_every = int(self.distill_config.get("debug_depth_every", 200))
-        self.debug_depth_num_envs = int(self.distill_config.get("debug_depth_num_envs", 4))
-        
-        if self.use_depth_aug:
-            wp.init()
-            self.depth_aug = DepthAug(f"cuda:{self.local_rank}", depth_aug_config)
-        else:
-            self.depth_aug = None
         
         # Set learning rate in optimizer
         for param_group in self.optimizer.param_groups:
@@ -213,7 +197,8 @@ class DistillAgent(A2CAgent):
         print(f"  Save best after: {self.save_best_after}")
         print(f"  Mixed precision: {self.distill_mixed_precision}")
         print(f"  Normalize input: {self.distill_normalize_input}")
-        print(f"  Depth augmentation: {self.use_depth_aug}")
+        print(f"  Value distillation: {self.use_value_distillation}")
+        print("  Depth augmentation: handled inside student model (depth_resnet_student)")
         if self.is_rnn:
             print(f"  RNN enabled:")
             print(f"    seq_length: {self.seq_length}")
@@ -317,69 +302,11 @@ class DistillAgent(A2CAgent):
         while log_counter < self.max_distill_iters:
             step_start = time.perf_counter()
             
-            # Get observations
+            # Get observations (depth is packed at end of obs, handled by model)
             obs = self._preproc_obs(self.obs['obs'])
             
             # Get teacher observations (may be different from student)
             teacher_obs = self._preproc_obs(self.obs['states'])
-            
-            # Get camera observations (depth image) if available
-            camera_obs = None
-            if 'camera' in self.obs:
-                camera_obs = self.obs['camera']  # (B, H*W) flattened
-                
-                # Apply depth augmentation (DEXTRAH-style)
-                if self.use_depth_aug and self.depth_aug is not None:
-                    # Reshape to (B, H, W) for augmentation (warp kernels expect 3D)
-                    B = camera_obs.shape[0]
-                    H = W = int(camera_obs.shape[1] ** 0.5)  # Assuming square
-                    camera_obs_3d = camera_obs.view(B, H, W)
-                    
-                    # Apply augmentation
-                    camera_obs_3d = self.depth_aug.augment(camera_obs_3d)
-                    
-                    # Reshape back to (B, H*W)
-                    camera_obs = camera_obs_3d.view(B, -1)
-
-                # Debug: save post-aug depth tiles for a few envs (never crashes training)
-                if self.debug_save_depth and (log_counter % max(1, self.debug_depth_every) == 0):
-                    try:
-                        import numpy as np
-                        from PIL import Image
-
-                        n = max(1, min(self.debug_depth_num_envs, camera_obs.shape[0]))
-                        hw = int(camera_obs.shape[1] ** 0.5)
-                        if hw * hw == camera_obs.shape[1]:
-                            H = W = hw
-                            imgs = camera_obs[:n].detach().float().cpu().view(n, H, W).numpy()
-
-                            # Per-image min-max normalize for visualization (handles values outside [0,1])
-                            tiles = []
-                            for i in range(n):
-                                im = imgs[i]
-                                mn = float(im.min())
-                                mx = float(im.max())
-                                denom = (mx - mn) if (mx - mn) > 1e-8 else 1.0
-                                im_u8 = (np.clip((im - mn) / denom, 0.0, 1.0) * 255.0).astype(np.uint8)
-                                tiles.append(im_u8)
-
-                            # Concatenate in a single row with 2px separators
-                            sep = 2
-                            canvas = tiles[0]
-                            for t in tiles[1:]:
-                                canvas = np.concatenate([canvas, np.zeros((H, sep), dtype=np.uint8), t], axis=1)
-
-                            out_dir = os.path.join(self.nn_dir, "debug_depth")
-                            os.makedirs(out_dir, exist_ok=True)
-                            Image.fromarray(canvas).save(
-                                os.path.join(out_dir, f"depth_postaug_iter_{log_counter:08d}.png")
-                            )
-                    except Exception:
-                        pass
-                
-                # Debug print on first iteration
-                if log_counter == 0:
-                    print(f"[DEBUG] Camera obs shape: {camera_obs.shape}")
             
             # ===== Get teacher actions (no grad) =====
             # Teacher was trained with AMP, so run inside autocast context
@@ -397,6 +324,7 @@ class DistillAgent(A2CAgent):
                 teacher_res = self.teacher_model(teacher_batch)
                 teacher_mus = teacher_res['mus']
                 teacher_sigmas = teacher_res['sigmas']
+                teacher_values = teacher_res.get('values', None)  # For value distillation
                 
                 if self.is_teacher_rnn:
                     self.teacher_rnn_states = teacher_res['rnn_states']
@@ -416,10 +344,6 @@ class DistillAgent(A2CAgent):
                     'prev_actions': self.prev_actions if hasattr(self, 'prev_actions') else teacher_actions,
                 }
                 
-                # Add camera observations if available
-                if camera_obs is not None:
-                    student_batch['camera'] = camera_obs
-                
                 if self.is_rnn:
                     student_batch['rnn_states'] = self.rnn_states if hasattr(self, 'rnn_states') else self.model.get_default_rnn_state()
                     student_batch['seq_length'] = 1
@@ -428,6 +352,7 @@ class DistillAgent(A2CAgent):
                 student_res = self.model(student_batch)
                 student_mus = student_res['mus']
                 student_sigmas = student_res['sigmas']
+                student_values = student_res.get('values', None)  # For value distillation
                 
                 if self.is_rnn:
                     self.rnn_states = student_res['rnn_states']
@@ -439,7 +364,13 @@ class DistillAgent(A2CAgent):
                 
                 mu_loss = weighted_l2_loss(student_mus, teacher_mus.detach(), weights).mean()
                 sigma_loss = l2_loss(student_sigmas, teacher_sigmas.detach()).mean()
-                total_loss = mu_loss + sigma_loss
+                
+                # Value distillation loss (MSE, no sigma weighting)
+                value_loss = torch.tensor(0.0, device=self.ppo_device)
+                if self.use_value_distillation and teacher_values is not None and student_values is not None:
+                    value_loss = torch.nn.functional.mse_loss(student_values, teacher_values.detach())
+                
+                total_loss = mu_loss + sigma_loss + value_loss
             
             # Sample student actions (outside autocast for stability)
             with torch.no_grad():
@@ -681,6 +612,7 @@ class DistillAgent(A2CAgent):
                 # Distillation-specific losses (similar to RL-Games losses/a_loss, losses/c_loss)
                 self.writer.add_scalar('losses/mu_loss', mu_loss.item(), frame)
                 self.writer.add_scalar('losses/sigma_loss', sigma_loss.item(), frame)
+                self.writer.add_scalar('losses/value_loss', value_loss.item(), frame)
                 self.writer.add_scalar('losses/total_loss', total_loss.item(), frame)
                 
                 # Info metrics (matching RL-Games)
