@@ -4,7 +4,18 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """
-Y2R Kuka Allegro trajectory following environments.
+Y2R Kuka Allegro trajectory following environment.
+
+Single registration with config variant selection via Y2R_VARIANT env var:
+    Y2R_VARIANT=push ./scripts/push.sh --continue
+
+Available variants:
+    - base: Teacher training (default)
+    - play: Teacher evaluation
+    - push: Push-T task evaluation
+    - cup: Cup task evaluation
+    - student: Student training/distillation
+    - student_play: Student evaluation
 """
 
 import gymnasium as gym
@@ -12,7 +23,7 @@ import gymnasium as gym
 from . import agents
 
 ##
-# Trajectory Following Environments
+# Trajectory Following Environment
 ##
 
 gym.register(
@@ -21,59 +32,14 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.trajectory_kuka_allegro_env_cfg:TrajectoryKukaAllegroEnvCfg",
+        # Teacher agent config (default for train.py, play.py)
         "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_trajectory_ppo_cfg.yaml",
+        # Student agent config (use with --agent rl_games_student_cfg_entry_point)
         "rl_games_student_cfg_entry_point": f"{agents.__name__}:rl_games_student_depth_ppo_cfg.yaml",
-        "rl_games_point_transformer_cfg_entry_point": f"{agents.__name__}:rl_games_point_transformer_cfg.yaml",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Y2RKukaAllegroPPORunnerCfg",
-    },
-)
-
-gym.register(
-    id="Isaac-Trajectory-Kuka-Allegro-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.trajectory_kuka_allegro_env_cfg:TrajectoryKukaAllegroEnvCfg_PLAY",
-        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_trajectory_ppo_cfg.yaml",
-        "rl_games_point_transformer_cfg_entry_point": f"{agents.__name__}:rl_games_point_transformer_cfg.yaml",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Y2RKukaAllegroPPORunnerCfg",
-    },
-)
-
-gym.register(
-    id="Isaac-Trajectory-Kuka-Allegro-PushT-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.trajectory_kuka_allegro_env_cfg:TrajectoryKukaAllegroEnvCfg_PUSH",
-        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_trajectory_ppo_cfg.yaml",
-        "rl_games_point_transformer_cfg_entry_point": f"{agents.__name__}:rl_games_point_transformer_cfg.yaml",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Y2RKukaAllegroPPORunnerCfg",
-    },
-)
-
-##
-# Student Distillation Environment
-##
-
-gym.register(
-    id="Isaac-Trajectory-Kuka-Allegro-Student-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.trajectory_kuka_allegro_env_cfg:TrajectoryKukaAllegroEnvCfg_STUDENT",
-        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_student_depth_ppo_cfg.yaml",
-        "rl_games_student_cfg_entry_point": f"{agents.__name__}:rl_games_student_depth_ppo_cfg.yaml",
+        # Teacher config for distillation (used by distill.py --teacher-agent)
         "rl_games_teacher_cfg_entry_point": f"{agents.__name__}:rl_games_trajectory_ppo_cfg.yaml",
-    },
-)
-
-gym.register(
-    id="Isaac-Trajectory-Kuka-Allegro-Student-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.trajectory_kuka_allegro_env_cfg:TrajectoryKukaAllegroEnvCfg_STUDENT_PLAY",
-        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_student_depth_ppo_cfg.yaml",
+        # Other frameworks
+        "rl_games_point_transformer_cfg_entry_point": f"{agents.__name__}:rl_games_point_transformer_cfg.yaml",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Y2RKukaAllegroPPORunnerCfg",
     },
 )

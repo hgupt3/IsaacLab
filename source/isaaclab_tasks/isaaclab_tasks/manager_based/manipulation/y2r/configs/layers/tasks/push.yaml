@@ -1,0 +1,33 @@
+# ==============================================================================
+# Push-T Task Layer
+# ==============================================================================
+# Task definition only - no play/mode settings.
+# Push T-shape object to goal outline position.
+# ==============================================================================
+
+push_t:
+  enabled: true
+  object_usd: "assets/t-shape/t-shape.usd"
+  outline_usd: "assets/t-shape_outline/t-shape_outline.usd"
+  object_scale: 1.0
+  outline_position: [-0.55, 0.0]
+  rolling_window: 2.0
+  min_speed: 0.06
+
+trajectory:
+  duration: 15.0
+  phases:
+    pickup: 0.0
+    manipulate: 15.0
+    release: 0.0
+
+waypoints:
+  count: [0, 0]
+
+goal:
+  x_range: [-0.55, -0.55]
+  y_range: [0.0, 0.0]
+
+randomization:
+  object:
+    scale: [1.0, 1.0]

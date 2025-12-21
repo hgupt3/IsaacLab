@@ -1,0 +1,41 @@
+# ==============================================================================
+# Cup Task Layer
+# ==============================================================================
+# Task definition only - no play/mode settings.
+# Pour bottle into cup (bottle-to-cup trajectory).
+# ==============================================================================
+
+push_t:
+  enabled: true
+  object_usd: "assets/bottle/bottle.usd"
+  outline_usd: "assets/cup/cup.usd"
+  object_scale: 0.8
+  outline_position: [-0.55, 0.15]
+  object_rotation: [1.0, 0.0, 0.0, 0.0]
+  outline_rotation: [1.0, 0.0, 0.0, 0.0]
+  goal_offset: [0.0, 0.0, 0.16]
+  goal_rotation: [0.707, -0.707, 0.0, 0.0]
+  rolling_window: 3.0
+  min_speed: 0.05
+
+trajectory:
+  duration: 6.0
+  phases:
+    pickup: 0.0
+    manipulate: 6.0
+    release: 0.0
+
+waypoints:
+  count: [0, 0]
+
+goal:
+  x_range: [-0.55, -0.55]
+  y_range: [0.0, 0.0]
+
+randomization:
+  object:
+    scale: [1.5, 1.5]
+  reset:
+    object_x: [-0.1, 0.1]
+    object_y: [-0.2, 0.1]
+    object_yaw: [0.0, 0.0]

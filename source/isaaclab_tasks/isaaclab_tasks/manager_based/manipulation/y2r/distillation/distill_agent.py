@@ -16,6 +16,7 @@ import os
 import time
 import torch
 import torch.distributed as dist
+import numpy as np
 
 from rl_games.algos_torch.a2c_continuous import A2CAgent
 from rl_games.algos_torch import torch_ext
@@ -119,6 +120,13 @@ class DistillAgent(A2CAgent):
         self.distill_normalize_input = self.distill_config.get('normalize_input', True)
         # multi_gpu is handled by script via --distributed flag
         
+        # Debug depth video recording
+        self.debug_depth_video = self.distill_config.get('debug_depth_video', False)
+        self.debug_depth_video_fps = self.distill_config.get('debug_depth_video_fps', 30)
+        self.debug_depth_video_num_frames = self.distill_config.get('debug_depth_video_num_frames', 1000)
+        self.depth_video_frames = []  # Accumulate frames for env 0
+        self.depth_video_saved = False  # Only save once
+        
         # Set learning rate in optimizer
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = self.distill_lr
@@ -199,6 +207,8 @@ class DistillAgent(A2CAgent):
         print(f"  Normalize input: {self.distill_normalize_input}")
         print(f"  Value distillation: {self.use_value_distillation}")
         print("  Depth augmentation: handled inside student model (depth_resnet_student)")
+        if self.debug_depth_video:
+            print(f"  Depth video recording: ENABLED (fps={self.debug_depth_video_fps}, num_frames={self.debug_depth_video_num_frames})")
         if self.is_rnn:
             print(f"  RNN enabled:")
             print(f"    seq_length: {self.seq_length}")
@@ -443,6 +453,13 @@ class DistillAgent(A2CAgent):
                 print(f"[DEBUG] Tracking {num_terms} reward terms: {self.reward_term_names}")
             
             self.obs, rewards, self.dones, infos = self.env_step(stepping_actions)
+            
+            # Accumulate post-augmentation depth frame for video recording (env 0 only)
+            if self.debug_depth_video and not self.depth_video_saved:
+                self._accumulate_depth_frame_from_model()
+                # Save when we have enough frames
+                if len(self.depth_video_frames) >= self.debug_depth_video_num_frames:
+                    self._save_depth_video()
             
             # AFTER step: accumulate per-term rewards (step_reward has raw values from this step)
             # step_reward shape: (num_envs, num_terms), _step_reward[:, idx] = value / dt
@@ -754,6 +771,65 @@ class DistillAgent(A2CAgent):
                 break
         
         return self.last_mean_rewards, log_counter
+    
+    def _accumulate_depth_frame_from_model(self):
+        """Accumulate POST-AUGMENTATION depth frame for env 0 from student model.
+        
+        The student model stores `last_depth_img` after applying depth augmentation
+        during forward pass. This captures the augmented depth that the model sees.
+        """
+        # Access post-augmentation depth from student model
+        # Model structure: self.model.a2c_network is the Network instance
+        try:
+            last_depth = self.model.a2c_network.last_depth_img
+            if last_depth is None:
+                return
+        except AttributeError:
+            # Model doesn't have last_depth_img (shouldn't happen with updated model)
+            return
+        
+        # last_depth shape: (B, 1, H, W) - get env 0
+        depth_img = last_depth[0, 0].cpu().numpy()  # (H, W)
+        
+        # Convert to RGB using viridis colormap for visualization
+        import matplotlib.cm as cm
+        depth_colored = cm.viridis(depth_img)[:, :, :3]  # Drop alpha
+        depth_rgb = (depth_colored * 255).astype(np.uint8)
+        
+        self.depth_video_frames.append(depth_rgb)
+    
+    def _save_depth_video(self):
+        """Save accumulated depth frames as video."""
+        if len(self.depth_video_frames) == 0:
+            return
+        
+        try:
+            import imageio
+        except ImportError:
+            print("[WARNING] imageio not installed, cannot save depth video. Install with: pip install imageio[ffmpeg]")
+            self.depth_video_saved = True
+            return
+        
+        # Create output directory
+        video_dir = os.path.join(self.nn_dir, 'depth_videos')
+        os.makedirs(video_dir, exist_ok=True)
+        
+        # Save video
+        video_path = os.path.join(video_dir, 'depth_video.mp4')
+        
+        print(f"\n[DepthVideo] Saving {len(self.depth_video_frames)} frames to {video_path}")
+        
+        # Use imageio to write video
+        writer = imageio.get_writer(video_path, fps=self.debug_depth_video_fps, codec='libx264', quality=8)
+        for frame in self.depth_video_frames:
+            writer.append_data(frame)
+        writer.close()
+        
+        print(f"[DepthVideo] Saved depth video: {video_path}")
+        
+        # Mark as saved
+        self.depth_video_frames = []
+        self.depth_video_saved = True
 
 
 # Register the agent with RL-Games

@@ -58,22 +58,20 @@ def _build_eigen_grasp_action_cfg(cfg: Y2RConfig):
 
 def _build_kuka_allegro_rewards_cfg(cfg: Y2RConfig, base_rewards):
     """Add Kuka Allegro specific rewards to base rewards."""
-    # Add good_finger_contact reward to the base rewards
     base_rewards.good_finger_contact = RewTerm(
         func=mdp.contacts,
         weight=cfg.rewards.good_finger_contact.weight,
-        params={"threshold": cfg.rewards.good_finger_contact.params.get("threshold", 1.0)},
+        params={"threshold": cfg.rewards.good_finger_contact.params["threshold"]},
     )
-    # Penalize over-curling distal joints (joint_3) to discourage nail-side grasps
     base_rewards.distal_joint3_penalty = RewTerm(
         func=mdp.distal_joint3_penalty,
         weight=cfg.rewards.distal_joint3_penalty.weight,
         params={
-            "std": cfg.rewards.distal_joint3_penalty.params.get("std", 1.0),
-            "joint_name_regex": cfg.rewards.distal_joint3_penalty.params.get("joint_name_regex", ".*_joint_3"),
-            "only_when_contact": cfg.rewards.distal_joint3_penalty.params.get("only_when_contact", True),
-            "contact_threshold": cfg.rewards.distal_joint3_penalty.params.get("contact_threshold", 1.0),
-            "only_in_manipulation": cfg.rewards.distal_joint3_penalty.params.get("only_in_manipulation", True),
+            "std": cfg.rewards.distal_joint3_penalty.params["std"],
+            "joint_name_regex": cfg.rewards.distal_joint3_penalty.params["joint_name_regex"],
+            "only_when_contact": cfg.rewards.distal_joint3_penalty.params["only_when_contact"],
+            "contact_threshold": cfg.rewards.distal_joint3_penalty.params["contact_threshold"],
+            "only_in_manipulation": cfg.rewards.distal_joint3_penalty.params["only_in_manipulation"],
         },
     )
     return base_rewards
@@ -169,34 +167,16 @@ class KukaAllegroTrajectoryMixinCfg:
 
 
 # ==============================================================================
-# FINAL ENV CONFIGS
+# FINAL ENV CONFIG
 # ==============================================================================
 
 @configclass
 class TrajectoryKukaAllegroEnvCfg(KukaAllegroTrajectoryMixinCfg, trajectory.TrajectoryEnvCfg):
-    """Kuka Allegro trajectory following task - Training."""
-    pass
-
-
-@configclass
-class TrajectoryKukaAllegroEnvCfg_PLAY(KukaAllegroTrajectoryMixinCfg, trajectory.TrajectoryEnvCfg_PLAY):
-    """Kuka Allegro trajectory following task - Evaluation."""
-    pass
-
-
-@configclass
-class TrajectoryKukaAllegroEnvCfg_PUSH(KukaAllegroTrajectoryMixinCfg, trajectory.TrajectoryEnvCfg_PUSH):
-    """Kuka Allegro Push-T task - T-shape object with direct trajectory to outline goal."""
-    pass
-
-
-@configclass
-class TrajectoryKukaAllegroEnvCfg_STUDENT(KukaAllegroTrajectoryMixinCfg, trajectory.TrajectoryEnvCfg_STUDENT):
-    """Kuka Allegro trajectory task - Student distillation with wrist camera."""
-    pass
-
-
-@configclass
-class TrajectoryKukaAllegroEnvCfg_STUDENT_PLAY(KukaAllegroTrajectoryMixinCfg, trajectory.TrajectoryEnvCfg_STUDENT_PLAY):
-    """Kuka Allegro trajectory task - Student evaluation with wrist camera."""
-    pass
+    """Kuka Allegro trajectory following environment config.
+    
+    Config variant is selected via Y2R_VARIANT environment variable:
+        Y2R_VARIANT=push ./scripts/push.sh --continue
+    
+    This loads the corresponding YAML from configs/{variant}.yaml
+    """
+    pass  # _config_name inherited from TrajectoryEnvCfg (reads Y2R_VARIANT env var)

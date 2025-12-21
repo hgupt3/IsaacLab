@@ -1,0 +1,16 @@
+# ==============================================================================
+# Student Mode Layer
+# ==============================================================================
+# Applied for distillation training (student learning from teacher).
+# Enables student observations (visible point clouds + wrist camera).
+# ==============================================================================
+
+mode:
+  use_student_mode: true
+
+wrist_camera:
+  enabled: true
+
+simulation:
+  num_envs: 4096
+

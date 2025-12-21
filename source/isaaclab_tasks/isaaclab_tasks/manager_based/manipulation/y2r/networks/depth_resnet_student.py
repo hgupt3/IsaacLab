@@ -303,6 +303,9 @@ class DepthResNetStudentBuilder(NetworkBuilder):
                     if m.bias is not None:
                         torch.nn.init.zeros_(m.bias)
             
+            # Store last post-augmentation depth for video recording
+            self.last_depth_img = None  # Will be (B, 1, H, W) after forward
+            
             print(f"[DepthResNetStudent] Initialized:")
             print(f"  full_obs_dim: {full_obs_dim}")
             print(f"  base_obs_dim: {self.base_obs_dim}")
@@ -354,6 +357,9 @@ class DepthResNetStudentBuilder(NetworkBuilder):
                     depth_3d = depth_img.squeeze(1)  # (B, H, W)
                     depth_3d = self.depth_aug.augment(depth_3d)
                     depth_img = depth_3d.unsqueeze(1)  # (B, 1, H, W)
+            
+            # Store post-augmentation depth for video recording
+            self.last_depth_img = depth_img.detach()
             
             # Encode depth
             depth_features = self.depth_encoder(depth_img)  # (B, 128)

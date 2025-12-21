@@ -29,7 +29,7 @@ class ProceduralShapesNotFoundError(Exception):
     pass
 
 
-def get_procedural_shape_paths(cfg: dict[str, Any], y2r_dir: Path) -> list[Path]:
+def get_procedural_shape_paths(cfg, y2r_dir: Path) -> list[Path]:
     """
     Get paths to procedural shapes, erroring if not enough exist.
     
@@ -38,7 +38,7 @@ def get_procedural_shape_paths(cfg: dict[str, Any], y2r_dir: Path) -> list[Path]
         ./isaaclab.sh -p scripts/tools/generate_procedural_shapes.py
     
     Args:
-        cfg: The procedural_objects config section from y2r_config.yaml
+        cfg: ProceduralObjectsConfig dataclass
         y2r_dir: Path to the y2r module directory
     
     Returns:
@@ -47,12 +47,11 @@ def get_procedural_shape_paths(cfg: dict[str, Any], y2r_dir: Path) -> list[Path]
     Raises:
         ProceduralShapesNotFoundError: If not enough shapes exist
     """
-    if not cfg.get("enabled", False):
+    if not cfg.enabled:
         return []
     
-    asset_dir = y2r_dir / cfg.get("asset_dir", "assets/procedural")
-    gen_cfg = cfg.get("generation", {})
-    num_shapes = gen_cfg.get("num_shapes", 100)
+    asset_dir = y2r_dir / cfg.asset_dir
+    num_shapes = cfg.generation.num_shapes
     
     # Check for existing shapes (prefer USD, fallback to OBJ)
     existing_usd = sorted(asset_dir.glob("shape_*.usd"))

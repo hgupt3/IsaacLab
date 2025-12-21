@@ -289,11 +289,25 @@ class TrajectoryManager:
         goal_y = goal_y_local + env_origins[:, 1]
         
         # Get stable placement (z-position + orientation) from trimesh
-        # Skip for push-T mode (use fixed flat orientation on table)
+        # Skip for push-T mode (use config values)
         if cfg.push_t.enabled:
-            # Fixed flat orientation on table surface (90° X then -90 Z rotation)
+            # Base goal on table surface
             goal_z_local = torch.full((n,), self.table_height + cfg.randomization.reset.z_offset, device=self.device)
-            goal_quat = torch.tensor([[0.5, 0.5, -0.5, -0.5]], device=self.device).repeat(n, 1)  # 90° X + -90 Z
+            
+            # Apply goal offset from config (if specified)
+            if cfg.push_t.goal_offset is not None:
+                goal_x_local = goal_x_local + cfg.push_t.goal_offset[0]
+                goal_y_local = goal_y_local + cfg.push_t.goal_offset[1]
+                goal_z_local = goal_z_local + cfg.push_t.goal_offset[2]
+                # Re-compute world frame positions with offset
+                goal_x = goal_x_local + env_origins[:, 0]
+                goal_y = goal_y_local + env_origins[:, 1]
+            
+            # Use goal_rotation from config, or fall back to outline_rotation
+            if cfg.push_t.goal_rotation is not None:
+                goal_quat = torch.tensor([cfg.push_t.goal_rotation], device=self.device).repeat(n, 1)
+            else:
+                goal_quat = torch.tensor([cfg.push_t.outline_rotation], device=self.device).repeat(n, 1)
         else:
             env_ids_list = env_ids.tolist()
             goal_z_local, goal_quat = get_stable_object_placement(

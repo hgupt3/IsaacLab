@@ -872,7 +872,7 @@ class target_sequence_obs_b(ManagerTermBase):
         self.markers = None
         self._debug_draw = None
         self._visualizer_initialized = False
-        if self.visualize:
+        if self.visualize or self.visualize_current:
             self._init_visualizer()
         if self.visualize_waypoint_region or self.visualize_goal_region or self.visualize_pose_axes:
             self._init_region_visualizer()
@@ -1264,7 +1264,7 @@ class target_sequence_obs_b(ManagerTermBase):
         }
         
         # Visualization (point clouds every frame)
-        if self.visualize and self.markers is not None:
+        if (self.visualize or self.visualize_current) and self.markers is not None:
             self._visualize(all_points_w, current_points_w, N)
         
         # Debug draw visualizations (lines) - must redraw every frame after clear
@@ -1314,25 +1314,30 @@ class target_sequence_obs_b(ManagerTermBase):
         target_pts = target_points_w[env_ids]  # (E, W, P, 3)
         current_pts = current_points_w[env_ids]  # (E, P, 3)
         
-        # Flatten targets: (E, W, P, 3) -> (E*W*P, 3)
-        target_flat = target_pts.reshape(-1, 3)
+        # Build positions and indices based on what to visualize
+        positions_list = []
+        indices_list = []
         
-        # Marker indices for targets: [0,0,...,1,1,...,W-1,W-1,...] repeated E times
-        single_env_indices = torch.arange(W, device=device).repeat_interleave(P)  # (W*P,)
-        target_indices = single_env_indices.repeat(E)  # (E*W*P,)
+        # Targets (if enabled)
+        if self.visualize:
+            target_flat = target_pts.reshape(-1, 3)  # (E*W*P, 3)
+            single_env_indices = torch.arange(W, device=device).repeat_interleave(P)  # (W*P,)
+            target_indices = single_env_indices.repeat(E)  # (E*W*P,)
+            positions_list.append(target_flat)
+            indices_list.append(target_indices)
         
+        # Current object (if enabled)
         if self.visualize_current:
-            # Flatten current: (E, P, 3) -> (E*P, 3)
-            current_flat = current_pts.reshape(-1, 3)
+            current_flat = current_pts.reshape(-1, 3)  # (E*P, 3)
             current_indices = torch.full((E * P,), W, dtype=torch.long, device=device)
-            
-            # Combine targets + current
-            all_positions = torch.cat([target_flat, current_flat], dim=0)
-            all_indices = torch.cat([target_indices, current_indices])
-        else:
-            # Targets only
-            all_positions = target_flat
-            all_indices = target_indices
+            positions_list.append(current_flat)
+            indices_list.append(current_indices)
+        
+        if not positions_list:
+            return
+        
+        all_positions = torch.cat(positions_list, dim=0)
+        all_indices = torch.cat(indices_list)
         
         self.markers.visualize(
             translations=all_positions,

@@ -162,8 +162,8 @@ params:
     normalize_input: True         # Normalize observations with RunningMeanStd
     multi_gpu: False              # DDP (overridden by --distributed flag)
 
-    # Debug: save post-augmentation depth tiles to disk for inspection.
-    # Output path: logs/.../nn/debug_depth/depth_postaug_iter_XXXXXXXX.png
-    debug_save_depth: False
-    debug_depth_every: 10
-    debug_depth_num_envs: 3
+    # Debug: save depth video for env 0
+    # Output path: logs/.../nn/depth_video.mp4
+    debug_depth_video: False
+    debug_depth_video_fps: 30
+    debug_depth_video_num_frames: 1000  # Record this many frames then save

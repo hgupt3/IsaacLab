@@ -1,0 +1,29 @@
+# ==============================================================================
+# Play/Evaluation Mode Layer
+# ==============================================================================
+# Applied for teacher play/evaluation.
+# Harder waypoints, max curriculum, basic visualization.
+# ==============================================================================
+
+# Harder waypoint settings for evaluation
+waypoints:
+  count: [1, 2]
+  max_rotation: 2.0
+
+# Start at max difficulty
+curriculum:
+  difficulty:
+    initial: 5
+
+# Basic visualization
+visualization:
+  targets: true
+  current_object: true
+  pose_axes: true
+  env_ids: null
+  debug_print_rewards: true
+
+# Fewer envs for visualization
+simulation:
+  num_envs: 32
+

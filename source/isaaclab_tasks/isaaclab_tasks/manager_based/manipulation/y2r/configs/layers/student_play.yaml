@@ -1,0 +1,17 @@
+# ==============================================================================
+# Student Play Mode Layer
+# ==============================================================================
+# Additional overrides for student play (on top of student + play layers).
+# Enables student-specific visualization markers.
+# ==============================================================================
+
+# Student-specific visualization
+visualization:
+  targets: false
+  current_object: false
+  student_visible: true
+  student_target: true
+
+simulation:
+  num_envs: 4
+

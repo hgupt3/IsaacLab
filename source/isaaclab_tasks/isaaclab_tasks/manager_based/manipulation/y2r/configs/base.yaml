@@ -100,98 +100,112 @@ goal:
 rewards:
   action_l2:
     weight: -0.005
-    finger_scale: 0.1         # 10x less penalty on hand actions
+    params:
+      finger_scale: 0.1         # 10x less penalty on hand actions
     
   action_rate_l2:
     weight: -0.005
-    finger_scale: 0.1         # 10x less penalty on hand actions
+    params:
+      finger_scale: 0.1         # 10x less penalty on hand actions
     
   fingers_to_object:
     weight: 2.0
-    std: 0.4
-    # When tracking error is high, reduce this reward so the policy doesn't
-    # prefer "press + squeeze" instead of recovering trajectory tracking.
-    # Set to null to disable gating.
-    error_gate_pos_threshold: 0.10   # meters (pose mode) / mean error (pc mode)
-    error_gate_pos_slope: 0.02       # meters; smaller = sharper gate
-    error_gate_rot_threshold: 1.0    # radians (pose mode only); set null to ignore rotation
-    error_gate_rot_slope: 0.5        # radians
+    params:
+      std: 0.4
+      # When tracking error is high, reduce this reward so the policy doesn't
+      # prefer "press + squeeze" instead of recovering trajectory tracking.
+      # Set to null to disable gating.
+      error_gate_pos_threshold: 0.10   # meters (pose mode) / mean error (pc mode)
+      error_gate_pos_slope: 0.02       # meters; smaller = sharper gate
+      error_gate_rot_threshold: 1.0    # radians (pose mode only); set null to ignore rotation
+      error_gate_rot_slope: 0.5        # radians
     
   lookahead_tracking:
     weight: 5.0
-    std: 0.03                   # Position/point cloud error std for positive reward
-    rot_std: 0.3                # Rotation error std (pose mode only) 
-    decay: 0.3                  # Exponential decay for lookahead weights
-    contact_threshold: 1.0      # Currently unused
-    # Soft contact gating: scales tracking reward but never hard-zeros it.
-    contact_ramp: 1.0           # Newtons; contact_factor ramps from 0→1 over this range
-    contact_min_factor: 0.05    # lower bound so reward doesn't fully collapse
-    # Negative penalty zones (activates when error > threshold):
-    neg_scale: 0.2              # Max penalty magnitude (0.5 = can go to -0.5)
-    neg_threshold: 0.04         # Position error > 8cm triggers penalty
-    neg_std: 0.1                # How fast position penalty grows
-    rot_neg_threshold: 0.4      # Rotation error > 0.6 rad (~34°) triggers penalty
-    rot_neg_std: 1.0            # How fast rotation penalty grows
+    params:
+      std: 0.03                   # Position/point cloud error std for positive reward
+      rot_std: 0.3                # Rotation error std (pose mode only) 
+      decay: 0.3                  # Exponential decay for lookahead weights
+      contact_threshold: 1.0      # Currently unused
+      # Soft contact gating: scales tracking reward but never hard-zeros it.
+      contact_ramp: 1.0           # Newtons; contact_factor ramps from 0→1 over this range
+      contact_min_factor: 0.05    # lower bound so reward doesn't fully collapse
+      # Negative penalty zones (activates when error > threshold):
+      neg_scale: 0.2              # Max penalty magnitude (0.5 = can go to -0.5)
+      neg_threshold: 0.04         # Position error > 8cm triggers penalty
+      neg_std: 0.1                # How fast position penalty grows
+      rot_neg_threshold: 0.4      # Rotation error > 0.6 rad (~34°) triggers penalty
+      rot_neg_std: 1.0            # How fast rotation penalty grows
     
   trajectory_success:
     weight: 10.0
-    # Success thresholds [initial (lenient), final (strict)]
-    point_cloud_threshold: [0.05, 0.05]     # meters
-    position_threshold: [0.05, 0.05]        # meters (pose mode)
-    rotation_threshold: [0.5, 0.5]          # radians (pose mode) ~34° → ~11°
+    params:
+      # Success thresholds [initial (lenient), final (strict)]
+      point_cloud_threshold: [0.05, 0.05]     # meters
+      position_threshold: [0.05, 0.05]        # meters (pose mode)
+      rotation_threshold: [0.5, 0.5]          # radians (pose mode) ~34° → ~11°
     
   early_termination:
     weight: -4.0
-    term_keys: ["abnormal_robot", "trajectory_deviation"]
+    params:
+      term_keys: ["abnormal_robot", "trajectory_deviation"]
     
   arm_table_penalty:
     weight: -0.5
-    table_z: 0.255
-    threshold_mid: 0.07         # Safe height above table for links 3,4,5
-    threshold_distal: 0.04      # Safe height above table for links 6,7,palm
+    params:
+      table_z: 0.255
+      threshold_mid: 0.07         # Safe height above table for links 3,4,5
+      threshold_distal: 0.04      # Safe height above table for links 6,7,palm
     
   # Robot-specific (Kuka Allegro)
   good_finger_contact:
     weight: 0.5
-    threshold: 1.0              # Contact force threshold (Newtons)
+    params:
+      threshold: 1.0              # Contact force threshold (Newtons)
     
   finger_manipulation:
-    weight: 4.0                 # Shaping reward - encourages in-hand adjustment
-    pos_std: 0.02               # Position change threshold (meters)
-    rot_std: 0.2                # Rotation change threshold (radians)
+    weight: 4.0
+    params:
+      pos_std: 0.02               # Position change threshold (meters)
+      rot_std: 0.2                # Rotation change threshold (radians)
     
   distal_joint3_penalty:
-    weight: -0.3                # Weak regularizer to discourage over-curling distal joints
-    std: 1.6                    # (rad) larger = more lenient
-    joint_name_regex: ".*_joint_3"
-    only_when_contact: false
-    contact_threshold: 1.0
-    only_in_manipulation: false
+    weight: -0.3
+    params:
+      std: 1.6                    # (rad) larger = more lenient
+      joint_name_regex: ".*_joint_3"
+      only_when_contact: false
+      contact_threshold: 1.0
+      only_in_manipulation: false
     
   palm_velocity_penalty:
-    weight: -0.3                # Negative = penalty during manipulation phase
-    angular_std: 0.7            # Angular velocity threshold (rad/s) - stricter
-    linear_std: 1.0             # Linear velocity threshold (m/s)
-    linear_scale: 0.1           # 5x more lenient on linear than angular
+    weight: -0.3
+    params:
+      angular_std: 0.7            # Angular velocity threshold (rad/s) - stricter
+      linear_std: 1.0             # Linear velocity threshold (m/s)
+      linear_scale: 0.1           # 5x more lenient on linear than angular
     
   palm_orientation_penalty:
-    weight: -0.5                # Weak penalty to avoid awkward wrist configs
-    std: 1.0                    # Angular deviation std (rad) - lenient
+    weight: -0.5
+    params:
+      std: 1.0                    # Angular deviation std (rad) - lenient
 
   # Penalize being too close to joint soft limits (encourages "comfort zone" postures)
   joint_limits_margin:
     weight: -0.05
-    threshold: 0.95             # in (0,1): 0.95 means penalize last 5% near either limit
-    power: 2.0                  # >=1: higher = sharper penalty near limits
-    max_penalty_per_joint: 2.0  # cap per-joint penalty to prevent spikes when exceeding soft limits
+    params:
+      threshold: 0.95             # in (0,1): 0.95 means penalize last 5% near either limit
+      power: 2.0                  # >=1: higher = sharper penalty near limits
+      max_penalty_per_joint: 2.0  # cap per-joint penalty to prevent spikes when exceeding soft limits
 
   # Rewards *reducing* current target error (helps recovery if policy freezes).
   tracking_progress:
     weight: 2.0
-    pos_weight: 1.0
-    rot_weight: 1.0
-    positive_only: true
-    clip: 1.0
+    params:
+      pos_weight: 1.0
+      rot_weight: 1.0
+      positive_only: true
+      clip: 1.0
 
 # ==============================================================================
 # TERMINATIONS
@@ -298,6 +312,10 @@ push_t:
   outline_usd: "assets/t-shape_outline/t-shape_outline.usd"  # Path to outline USD for goal visualization
   object_scale: 1.0             # Scale for both object and outline
   outline_position: [-0.55, 0.0]  # Fixed goal position on table
+  object_rotation: [0.5, 0.5, -0.5, -0.5]   # Object quaternion wxyz (T-shape flat on table)
+  outline_rotation: [0.5, 0.5, -0.5, -0.5]  # Outline quaternion wxyz (T-shape flat on table)
+  goal_offset: null             # [x, y, z] offset from outline position (null = no offset)
+  goal_rotation: null           # Goal quaternion wxyz (null = use outline_rotation)
   rolling_window: 3.0           # Trajectory planning horizon (seconds)
   min_speed: 0.02               # Minimum speed (m/s) to prevent infinite slowdown
   include_in_primitives: true   # Include T-shape in random object selection pool

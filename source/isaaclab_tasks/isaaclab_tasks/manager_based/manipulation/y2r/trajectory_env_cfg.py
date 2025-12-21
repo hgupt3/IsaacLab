@@ -33,7 +33,7 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from . import mdp
 from .adr_curriculum import build_curriculum_cfg
-from .config_loader import get_config, get_play_config, get_push_config, get_student_config, get_student_play_config, Y2RConfig
+from .config_loader import get_config, Y2RConfig
 from .procedural_shapes import get_procedural_shape_paths
 
 
@@ -101,7 +101,7 @@ def _build_object_cfg(cfg: Y2RConfig) -> RigidObjectCfg:
     
     # Add procedural shapes if enabled
     if proc_cfg.enabled:
-        shape_paths = get_procedural_shape_paths(proc_cfg._raw, y2r_dir)
+        shape_paths = get_procedural_shape_paths(proc_cfg, y2r_dir)
         
         if shape_paths:
             # Create UsdFileCfg for each procedural shape
@@ -555,7 +555,7 @@ def _build_rewards_cfg(cfg: Y2RConfig):
             weight=cfg.rewards.action_l2.weight,
             params={
                 "arm_joint_count": cfg.robot.arm_joint_count,
-                "finger_scale": cfg.rewards.action_l2.params.get("finger_scale", 0.1),
+                "finger_scale": cfg.rewards.action_l2.params["finger_scale"],
             },
         )
 
@@ -564,38 +564,37 @@ def _build_rewards_cfg(cfg: Y2RConfig):
             weight=cfg.rewards.action_rate_l2.weight,
             params={
                 "arm_joint_count": cfg.robot.arm_joint_count,
-                "finger_scale": cfg.rewards.action_rate_l2.params.get("finger_scale", 0.1),
+                "finger_scale": cfg.rewards.action_rate_l2.params["finger_scale"],
             },
         )
 
         fingers_to_object = RewTerm(
             func=mdp.object_ee_distance,
-            params={
-                "std": cfg.rewards.fingers_to_object.params.get("std", 0.4),
-                # Error gating to avoid squeeze-and-freeze when tracking is bad
-                "error_gate_pos_threshold": cfg.rewards.fingers_to_object.params.get("error_gate_pos_threshold", None),
-                "error_gate_pos_slope": cfg.rewards.fingers_to_object.params.get("error_gate_pos_slope", 0.02),
-                "error_gate_rot_threshold": cfg.rewards.fingers_to_object.params.get("error_gate_rot_threshold", None),
-                "error_gate_rot_slope": cfg.rewards.fingers_to_object.params.get("error_gate_rot_slope", 0.5),
-            },
             weight=cfg.rewards.fingers_to_object.weight,
+            params={
+                "std": cfg.rewards.fingers_to_object.params["std"],
+                "error_gate_pos_threshold": cfg.rewards.fingers_to_object.params["error_gate_pos_threshold"],
+                "error_gate_pos_slope": cfg.rewards.fingers_to_object.params["error_gate_pos_slope"],
+                "error_gate_rot_threshold": cfg.rewards.fingers_to_object.params["error_gate_rot_threshold"],
+                "error_gate_rot_slope": cfg.rewards.fingers_to_object.params["error_gate_rot_slope"],
+            },
         )
 
         lookahead_tracking = RewTerm(
             func=mdp.lookahead_tracking,
             weight=cfg.rewards.lookahead_tracking.weight,
             params={
-                "std": cfg.rewards.lookahead_tracking.params.get("std", 0.03),
-                "decay": cfg.rewards.lookahead_tracking.params.get("decay", 0.2),
-                "contact_threshold": cfg.rewards.lookahead_tracking.params.get("contact_threshold", 2.0),
-                "contact_ramp": cfg.rewards.lookahead_tracking.params.get("contact_ramp", 1.0),
-                "contact_min_factor": cfg.rewards.lookahead_tracking.params.get("contact_min_factor", 0.05),
-                "rot_std": cfg.rewards.lookahead_tracking.params.get("rot_std", 0.3),
-                "neg_threshold": cfg.rewards.lookahead_tracking.params.get("neg_threshold", 0.08),
-                "neg_std": cfg.rewards.lookahead_tracking.params.get("neg_std", 0.1),
-                "neg_scale": cfg.rewards.lookahead_tracking.params.get("neg_scale", 0.5),
-                "rot_neg_threshold": cfg.rewards.lookahead_tracking.params.get("rot_neg_threshold", 0.6),
-                "rot_neg_std": cfg.rewards.lookahead_tracking.params.get("rot_neg_std", 0.4),
+                "std": cfg.rewards.lookahead_tracking.params["std"],
+                "decay": cfg.rewards.lookahead_tracking.params["decay"],
+                "contact_threshold": cfg.rewards.lookahead_tracking.params["contact_threshold"],
+                "contact_ramp": cfg.rewards.lookahead_tracking.params["contact_ramp"],
+                "contact_min_factor": cfg.rewards.lookahead_tracking.params["contact_min_factor"],
+                "rot_std": cfg.rewards.lookahead_tracking.params["rot_std"],
+                "neg_threshold": cfg.rewards.lookahead_tracking.params["neg_threshold"],
+                "neg_std": cfg.rewards.lookahead_tracking.params["neg_std"],
+                "neg_scale": cfg.rewards.lookahead_tracking.params["neg_scale"],
+                "rot_neg_threshold": cfg.rewards.lookahead_tracking.params["rot_neg_threshold"],
+                "rot_neg_std": cfg.rewards.lookahead_tracking.params["rot_neg_std"],
             },
         )
 
@@ -611,9 +610,7 @@ def _build_rewards_cfg(cfg: Y2RConfig):
         early_termination = RewTerm(
             func=mdp.is_terminated_term,
             weight=cfg.rewards.early_termination.weight,
-            params={"term_keys": cfg.rewards.early_termination.params.get(
-                "term_keys", ["abnormal_robot", "trajectory_deviation"]
-            )},
+            params={"term_keys": cfg.rewards.early_termination.params["term_keys"]},
         )
 
         arm_table_penalty = RewTerm(
@@ -621,9 +618,9 @@ def _build_rewards_cfg(cfg: Y2RConfig):
             weight=cfg.rewards.arm_table_penalty.weight,
             params={
                 "asset_cfg": SceneEntityCfg("robot", body_names=["iiwa7_link_(3|4|5|6|7)|palm_link"]),
-                "table_z": cfg.rewards.arm_table_penalty.params.get("table_z", 0.255),
-                "threshold_mid": cfg.rewards.arm_table_penalty.params.get("threshold_mid", 0.06),
-                "threshold_distal": cfg.rewards.arm_table_penalty.params.get("threshold_distal", 0.03),
+                "table_z": cfg.rewards.arm_table_penalty.params["table_z"],
+                "threshold_mid": cfg.rewards.arm_table_penalty.params["threshold_mid"],
+                "threshold_distal": cfg.rewards.arm_table_penalty.params["threshold_distal"],
             },
         )
 
@@ -631,8 +628,8 @@ def _build_rewards_cfg(cfg: Y2RConfig):
             func=mdp.finger_manipulation,
             weight=cfg.rewards.finger_manipulation.weight,
             params={
-                "pos_std": cfg.rewards.finger_manipulation.params.get("pos_std", 0.01),
-                "rot_std": cfg.rewards.finger_manipulation.params.get("rot_std", 0.1),
+                "pos_std": cfg.rewards.finger_manipulation.params["pos_std"],
+                "rot_std": cfg.rewards.finger_manipulation.params["rot_std"],
                 "robot_cfg": SceneEntityCfg("robot"),
                 "object_cfg": SceneEntityCfg("object"),
             },
@@ -642,9 +639,9 @@ def _build_rewards_cfg(cfg: Y2RConfig):
             func=mdp.palm_velocity_penalty,
             weight=cfg.rewards.palm_velocity_penalty.weight,
             params={
-                "angular_std": cfg.rewards.palm_velocity_penalty.params.get("angular_std", 0.5),
-                "linear_std": cfg.rewards.palm_velocity_penalty.params.get("linear_std", 0.3),
-                "linear_scale": cfg.rewards.palm_velocity_penalty.params.get("linear_scale", 0.2),
+                "angular_std": cfg.rewards.palm_velocity_penalty.params["angular_std"],
+                "linear_std": cfg.rewards.palm_velocity_penalty.params["linear_std"],
+                "linear_scale": cfg.rewards.palm_velocity_penalty.params["linear_scale"],
                 "robot_cfg": SceneEntityCfg("robot"),
             },
         )
@@ -653,7 +650,7 @@ def _build_rewards_cfg(cfg: Y2RConfig):
             func=mdp.palm_orientation_penalty,
             weight=cfg.rewards.palm_orientation_penalty.weight,
             params={
-                "std": cfg.rewards.palm_orientation_penalty.params.get("std", 0.5),
+                "std": cfg.rewards.palm_orientation_penalty.params["std"],
                 "robot_cfg": SceneEntityCfg("robot"),
             },
         )
@@ -662,22 +659,21 @@ def _build_rewards_cfg(cfg: Y2RConfig):
             func=mdp.joint_pos_limits_margin,
             weight=cfg.rewards.joint_limits_margin.weight,
             params={
-                "threshold": cfg.rewards.joint_limits_margin.params.get("threshold", 0.95),
-                "power": cfg.rewards.joint_limits_margin.params.get("power", 2.0),
-                "max_penalty_per_joint": cfg.rewards.joint_limits_margin.params.get("max_penalty_per_joint", 1.0),
+                "threshold": cfg.rewards.joint_limits_margin.params["threshold"],
+                "power": cfg.rewards.joint_limits_margin.params["power"],
+                "max_penalty_per_joint": cfg.rewards.joint_limits_margin.params["max_penalty_per_joint"],
                 "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
             },
         )
 
-        # Optional: off by default (weight=0). Turn on only if you still see "freeze+press".
         tracking_progress = RewTerm(
             func=mdp.tracking_progress,
             weight=cfg.rewards.tracking_progress.weight,
             params={
-                "pos_weight": cfg.rewards.tracking_progress.params.get("pos_weight", 1.0),
-                "rot_weight": cfg.rewards.tracking_progress.params.get("rot_weight", 0.5),
-                "positive_only": cfg.rewards.tracking_progress.params.get("positive_only", False),
-                "clip": cfg.rewards.tracking_progress.params.get("clip", 1.0),
+                "pos_weight": cfg.rewards.tracking_progress.params["pos_weight"],
+                "rot_weight": cfg.rewards.tracking_progress.params["rot_weight"],
+                "positive_only": cfg.rewards.tracking_progress.params["positive_only"],
+                "clip": cfg.rewards.tracking_progress.params["clip"],
             },
         )
 
@@ -710,6 +706,10 @@ def _build_terminations_cfg(cfg: Y2RConfig):
 # MAIN ENV CONFIG
 # ==============================================================================
 
+import os as _os
+_Y2R_MODE = _os.environ.get("Y2R_MODE", "train")
+_Y2R_TASK = _os.environ.get("Y2R_TASK", "base")
+
 @configclass
 class TrajectoryEnvCfg(ManagerBasedEnvCfg):
     """Trajectory following task definition.
@@ -717,17 +717,26 @@ class TrajectoryEnvCfg(ManagerBasedEnvCfg):
     The robot must follow a sequence of point cloud targets along a smooth Bezier trajectory.
     Includes pickup from table, variable-speed manipulation, and place-back phases.
     
-    All config values are loaded dynamically in __post_init__ from the appropriate YAML file.
-    Subclasses override _get_config() to use different YAML files.
+    All config values are loaded dynamically in __post_init__ from the YAML file.
+    Config is determined by Y2R_MODE and Y2R_TASK environment variables.
+    
+    Y2R_MODE: train | distill | play | play_student
+    Y2R_TASK: base | push | cup
+    
+    Example: Y2R_MODE=play Y2R_TASK=cup ./scripts/play.sh --continue
     """
 
-    # Static settings (no config dependencies)
+    # Config parameters - read from env vars at module load time
+    _config_mode: str = _Y2R_MODE
+    _config_task: str = _Y2R_TASK
+    
+    # Static settings
     viewer: ViewerCfg = ViewerCfg(eye=(-2.25, 0.0, 0.75), lookat=(0.0, 0.0, 0.45), origin_type="env")
     
-    # Scene - will be configured in __post_init__
-    scene: TrajectorySceneCfg = TrajectorySceneCfg(num_envs=1, env_spacing=3.0)  # Placeholder values
+    # Scene - configured in __post_init__
+    scene: TrajectorySceneCfg = TrajectorySceneCfg(num_envs=1, env_spacing=3.0)
     
-    # These will be built dynamically in __post_init__
+    # Built dynamically in __post_init__
     observations = None
     actions: ActionsCfg = ActionsCfg()
     commands: CommandsCfg = CommandsCfg()
@@ -739,81 +748,58 @@ class TrajectoryEnvCfg(ManagerBasedEnvCfg):
     # Config reference (set in __post_init__)
     y2r_cfg: Y2RConfig = None
 
-    def _get_config(self) -> Y2RConfig:
-        """Return config to use. Override in subclasses for different configs."""
-        return get_config()
-
     def __post_init__(self):
-        """Build all config-dependent managers from the correct config."""
-        # Load the right config for this env type
-        cfg = self._get_config()
+        """Build all config-dependent managers."""
+        cfg = get_config(mode=self._config_mode, task=self._config_task)
         self.y2r_cfg = cfg
         
-        # Build scene with config values
+        # Build scene
         self.scene = TrajectorySceneCfg(
             num_envs=cfg.simulation.num_envs,
             env_spacing=cfg.simulation.env_spacing,
             replicate_physics=cfg.simulation.replicate_physics,
         )
         
-        # Override object config with dynamic mix of primitives + procedural shapes
-        self.scene.object = _build_object_cfg(cfg)
+        # Build object config (primitives + procedural shapes OR push_t USD)
+        push_t_mode = cfg.push_t.enabled and cfg.push_t.object_usd
+        if push_t_mode:
+            self._setup_push_t_scene(cfg)
+        else:
+            self.scene.object = _build_object_cfg(cfg)
         
-        # Build managers from config
+        # Build managers
         self.observations = _build_observations_cfg(cfg)
         self.events = _build_events_cfg(cfg)
         self.rewards = _build_rewards_cfg(cfg)
         self.terminations = _build_terminations_cfg(cfg)
         self.curriculum = build_curriculum_cfg(cfg)
         
-        # Set simulation parameters
+        # Override object reset for push_t mode (after events is built)
+        if push_t_mode:
+            self._setup_push_t_events(cfg)
+        
+        # Set curriculum initial difficulty
+        if self.curriculum is not None:
+            self.curriculum.adr.params["init_difficulty"] = cfg.curriculum.difficulty.initial
+        
+        # Simulation parameters
         self.decimation = cfg.simulation.decimation
         self.episode_length_s = cfg.trajectory.duration
         self.is_finite_horizon = True
-        
         self.sim.dt = cfg.simulation.physics_dt
         self.sim.render_interval = self.decimation
         self.sim.physx.bounce_threshold_velocity = 0.01
         self.sim.physx.gpu_max_rigid_patch_count = 4 * 5 * 2**15
 
-
-class TrajectoryEnvCfg_PLAY(TrajectoryEnvCfg):
-    """Trajectory task evaluation environment definition."""
-
-    def _get_config(self) -> Y2RConfig:
-        """Use play config for evaluation."""
-        return get_play_config()
-
-    def __post_init__(self):
-        super().__post_init__()
-        
-        # Start at configured difficulty for evaluation
-        if self.curriculum is not None:
-            self.curriculum.adr.params["init_difficulty"] = self.y2r_cfg.curriculum.difficulty.initial
-
-
-class TrajectoryEnvCfg_PUSH(TrajectoryEnvCfg):
-    """Push-T task evaluation environment definition.
-    
-    Uses T-shaped object with direct trajectory to goal (outline position).
-    """
-
-    def _get_config(self) -> Y2RConfig:
-        """Use push config for push-T task."""
-        return get_push_config()
-
-    def __post_init__(self):
-        super().__post_init__()
-        
-        cfg = self.y2r_cfg
+    def _setup_push_t_scene(self, cfg: Y2RConfig):
+        """Setup push_t scene: USD object and outline."""
         config_dir = Path(__file__).parent
         
-        # Override object to T-shape USD
-        object_usd_path = str(config_dir / cfg.push_t.object_usd)
+        # Object from USD
         self.scene.object = RigidObjectCfg(
             prim_path="{ENV_REGEX_NS}/Object",
             spawn=sim_utils.UsdFileCfg(
-                usd_path=object_usd_path,
+                usd_path=str(config_dir / cfg.push_t.object_usd),
                 scale=(cfg.push_t.object_scale,) * 3,
                 rigid_props=sim_utils.RigidBodyPropertiesCfg(
                     solver_position_iteration_count=16,
@@ -823,66 +809,42 @@ class TrajectoryEnvCfg_PUSH(TrajectoryEnvCfg):
                 collision_props=sim_utils.CollisionPropertiesCfg(),
                 mass_props=sim_utils.MassPropertiesCfg(mass=0.2),
             ),
-            init_state=RigidObjectCfg.InitialStateCfg(pos=(-0.55, 0.0, 0.45)),
-        )
-        
-        # Add visual outline (visual-only, no physics) at goal position
-        outline_usd_path = str(config_dir / cfg.push_t.outline_usd)
-        self.scene.outline = AssetBaseCfg(
-            prim_path="{ENV_REGEX_NS}/Outline",
-            spawn=sim_utils.UsdFileCfg(
-                usd_path=outline_usd_path,
-                scale=(cfg.push_t.object_scale,) * 3,
-            ),
-            init_state=AssetBaseCfg.InitialStateCfg(
-                pos=(*cfg.push_t.outline_position, cfg.workspace.table_surface_z + 0.001),
-                rot=(0.5, 0.5, -0.5, -0.5),  # 90° X then -90° Z to lay flat and rotate
+            init_state=RigidObjectCfg.InitialStateCfg(
+                pos=(-0.55, 0.0, cfg.workspace.table_surface_z + 0.01),
+                rot=cfg.push_t.object_rotation,
             ),
         )
         
-        # Set difficulty from push config
-        if self.curriculum is not None:
-            self.curriculum.adr.params["init_difficulty"] = cfg.curriculum.difficulty.initial
+        # Visual outline at goal position
+        if cfg.push_t.outline_usd:
+            self.scene.outline = AssetBaseCfg(
+                prim_path="{ENV_REGEX_NS}/Outline",
+                spawn=sim_utils.UsdFileCfg(
+                    usd_path=str(config_dir / cfg.push_t.outline_usd),
+                    scale=(cfg.push_t.object_scale,) * 3,
+                    rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=True),
+                    collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+                ),
+                init_state=AssetBaseCfg.InitialStateCfg(
+                    pos=(*cfg.push_t.outline_position, cfg.workspace.table_surface_z + 0.001),
+                    rot=cfg.push_t.outline_rotation,
+                ),
+            )
+
+    def _setup_push_t_events(self, cfg: Y2RConfig):
+        """Override object reset for push_t mode (fixed rotation)."""
+        self.events.reset_object = EventTerm(
+            func=mdp.reset_root_state_uniform,
+            mode="reset",
+            params={
+                "pose_range": {
+                    "x": list(cfg.randomization.reset.object_x),
+                    "y": list(cfg.randomization.reset.object_y),
+                    "z": [0.005, 0.005],
+                },
+                "velocity_range": {"x": [0.0, 0.0], "y": [0.0, 0.0], "z": [0.0, 0.0]},
+                "asset_cfg": SceneEntityCfg("object"),
+            },
+        )
 
 
-class TrajectoryEnvCfg_STUDENT(TrajectoryEnvCfg):
-    """Trajectory task student distillation environment.
-    
-    Uses student config with:
-    - Wrist camera enabled
-    - Student observation groups (visible point clouds)
-    - Moderate difficulty for distillation
-    """
-
-    def _get_config(self) -> Y2RConfig:
-        """Use student config for distillation."""
-        return get_student_config()
-
-    def __post_init__(self):
-        super().__post_init__()
-        
-        # Start at configured difficulty for distillation
-        if self.curriculum is not None:
-            self.curriculum.adr.params["init_difficulty"] = self.y2r_cfg.curriculum.difficulty.initial
-
-
-class TrajectoryEnvCfg_STUDENT_PLAY(TrajectoryEnvCfg):
-    """Trajectory task student evaluation environment.
-    
-    Uses student play config with:
-    - Wrist camera enabled
-    - Student observation groups (visible point clouds)
-    - Max difficulty for evaluation
-    - Visualization enabled
-    """
-
-    def _get_config(self) -> Y2RConfig:
-        """Use student play config for evaluation."""
-        return get_student_play_config()
-
-    def __post_init__(self):
-        super().__post_init__()
-        
-        # Start at max difficulty for evaluation
-        if self.curriculum is not None:
-            self.curriculum.adr.params["init_difficulty"] = self.y2r_cfg.curriculum.difficulty.initial
