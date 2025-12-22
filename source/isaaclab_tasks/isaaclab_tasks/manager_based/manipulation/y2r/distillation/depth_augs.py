@@ -131,10 +131,18 @@ def add_correlated_noise_kernel(
     d_max: float,
     # outputs
     noisy_depths: wp.array(dtype=float, ndim=3)):
+    """Apply correlated spatial + depth noise for normalized [0,1] depth.
+    
+    This kernel applies two types of correlated noise:
+    1. Spatial noise: Bilinear interpolation from nearby pixels (simulates stereo matching errors)
+    2. Depth noise: Additive noise scaled by depth squared (farther = more noise, like real sensors)
+    
+    Works with normalized depth in [0, 1] range (not real-world mm units).
+    """
 
     batch_index, pixel_row, pixel_column = wp.tid()
 
-    # Draw float pixel coordinates
+    # Draw float pixel coordinates (spatial noise)
     nx = rand_sigma_s_x[batch_index, pixel_row, pixel_column]
     ny = rand_sigma_s_y[batch_index, pixel_row, pixel_column]
 
@@ -161,27 +169,21 @@ def add_correlated_noise_kernel(
     w_10 = fu * (1. - fv)
     w_11 = fu * fv
 
-    # Interpolated depth
-    noisy_depths[batch_index, pixel_row, pixel_column] =\
+    # Interpolated depth (spatial noise via bilinear sampling)
+    interp_depth =\
         depths[batch_index, v0, u0] * w_00 +\
         depths[batch_index, v0, u1] * w_01 +\
         depths[batch_index, v1, u0] * w_10 +\
         depths[batch_index, v1, u1] * w_11
     
-
-    #noisy_depths[batch_index, pixel_row, pixel_column]
-
-    baseline = float(35130.)
-    ref = float(8.)
-
-    denominator = baseline / noisy_depths[batch_index, pixel_row, pixel_column] +\
-                  rand_sigma_d[batch_index, pixel_row, pixel_column] + 0.5
+    # Depth-dependent noise: farther objects have more noise (quadratic scaling)
+    # This mimics real depth sensor behavior where uncertainty grows with distance
+    # For normalized depth d in [0,1], noise scale = d^2 * sigma_d
+    depth_noise = rand_sigma_d[batch_index, pixel_row, pixel_column] * interp_depth * interp_depth
     
-    noisy_depths[batch_index, pixel_row, pixel_column] =\
-        baseline / (wp.rint(denominator / ref) * ref)
-        #float(int(baseline) / int(wp.rint(denominator / ref)) * int(ref))
-    #noisy_depths[batch_index, pixel_row, pixel_column] =\
-    #    baseline / denominator
+    # Apply depth noise and clamp to valid range
+    noisy_depth = interp_depth + depth_noise
+    noisy_depths[batch_index, pixel_row, pixel_column] = wp.clamp(noisy_depth, d_min, d_max)
 
 @wp.kernel
 def add_normal_noise_kernel(
@@ -342,9 +344,9 @@ class DepthAug():
             d_min, d_max
         )
         
-        # Clamp invalid values
-        depths[depths > d_max] = 0.
-        depths[depths < d_min] = 0.
+        # Clamp to valid range (don't zero out - that corrupts far depth!)
+        # Only set truly invalid values (negative) to 0
+        depths = depths.clamp(d_min, d_max)
         
         return depths
 

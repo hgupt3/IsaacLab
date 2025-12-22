@@ -323,6 +323,8 @@ class PushTConfig:
     rolling_window: float
     min_speed: float
     include_in_primitives: bool
+    object_z_offset: float | None  # null = auto-compute from mesh geometry
+    outline_z_offset: float | None  # null = auto-compute from mesh geometry
 
 
 @dataclass

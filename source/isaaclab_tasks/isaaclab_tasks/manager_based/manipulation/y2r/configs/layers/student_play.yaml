@@ -11,7 +11,3 @@ visualization:
   current_object: false
   student_visible: true
   student_target: true
-
-simulation:
-  num_envs: 4
-

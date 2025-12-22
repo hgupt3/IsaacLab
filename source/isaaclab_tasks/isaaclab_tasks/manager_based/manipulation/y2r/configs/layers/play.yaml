@@ -25,5 +25,5 @@ visualization:
 
 # Fewer envs for visualization
 simulation:
-  num_envs: 32
+  num_envs: 4
 

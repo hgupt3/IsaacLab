@@ -94,12 +94,10 @@ def _make_primitive(ptype: str, size: float):
     import numpy as np
     import trimesh
     
-    if ptype == "ellipsoid":
-        # Random aspect ratios for ellipsoid
-        scales = np.random.uniform(0.2, 1.0, size=3)
-        scales = scales / np.linalg.norm(scales) * size * np.sqrt(3)
-        mesh = trimesh.creation.icosphere(subdivisions=2, radius=1.0)
-        mesh.apply_scale(scales)
+    if ptype == "sphere":
+        # Simple sphere with randomized radius
+        radius = size * np.random.uniform(0.4, 1.0)
+        mesh = trimesh.creation.icosphere(subdivisions=2, radius=radius)
     elif ptype == "box":
         # Random aspect ratios for box
         extents = np.random.uniform(0.1, 1.0, size=3)
@@ -115,6 +113,12 @@ def _make_primitive(ptype: str, size: float):
         radius = size * np.random.uniform(0.2, 1.0)
         height = size * np.random.uniform(0.2, 1.0)
         mesh = trimesh.creation.cylinder(radius=radius, height=height)
+    elif ptype == "annulus":
+        # Ring/washer shape with random inner and outer radius
+        r_min = size * np.random.uniform(0.3, 0.55)
+        r_max = size * np.random.uniform(0.6, 1.0)
+        height = size * np.random.uniform(0.2, 0.5)
+        mesh = trimesh.creation.annulus(r_min=r_min, r_max=r_max, height=height)
     else:
         # Default to sphere
         mesh = trimesh.creation.icosphere(subdivisions=2, radius=size)
@@ -156,72 +160,66 @@ def grow_object(cfg: dict[str, Any], rng=None):
     old_state = np.random.get_state()
     np.random.seed(rng.integers(0, 2**31))
     
-    try:
-        # Determine number of primitives
-        min_prims, max_prims = cfg.get("primitives_per_shape", [3, 8])
-        num_primitives = rng.integers(min_prims, max_prims + 1)
-        
-        # Create root primitive
-        base_size_min, base_size_max = cfg.get("base_size", [0.03, 0.08])
-        root_size = rng.uniform(base_size_min, base_size_max)
-        root_type = _weighted_choice(cfg.get("primitive_types", {"ellipsoid": 1.0}))
-        
-        primitives = [_make_primitive(root_type, root_size)]
-        current_size = root_size
-        
-        # Grow by attaching children
-        for _ in range(num_primitives - 1):
-            # Pick random existing primitive to attach to
-            parent_idx = rng.integers(0, len(primitives))
-            parent = primitives[parent_idx]
-            
-            # Sample point on parent surface
-            point, normal = _sample_surface_point(parent)
-            
-            # Create child primitive (smaller)
-            current_size *= cfg.get("size_decay", 0.8)
-            child_type = _weighted_choice(cfg.get("primitive_types", {"ellipsoid": 1.0}))
-            child = _make_primitive(child_type, current_size)
-            
-            # Get child's approximate radius for offset
-            # Use MINIMUM dimension to ensure good overlap for elongated shapes
-            child_bounds = child.bounds
-            child_extents = child_bounds[1] - child_bounds[0]
-            child_min_radius = np.min(child_extents) / 2
-            
-            # Position child so it overlaps with parent
-            # Place center at point + normal * (min_radius * overlap_factor)
-            # With factor < 1.0, the child penetrates into the parent
-            overlap_factor = rng.uniform(0.2, 0.5)  # Random overlap depth
-            offset = point + normal * child_min_radius * overlap_factor
-            child.apply_translation(offset)
-            
-            primitives.append(child)
-        
-        # Boolean union all primitives
-        if len(primitives) == 1:
-            result = primitives[0]
-        else:
-            result = primitives[0]
-            for mesh in primitives[1:]:
-                try:
-                    result = result.union(mesh, engine="blender")
-                except Exception:
-                    # Fallback: just concatenate if boolean fails
-                    result = trimesh.util.concatenate([result, mesh])
-        
-        # Clean up and ensure watertight
-        result.process(validate=True)
-        
-        # Center at origin
-        result.vertices -= result.centroid
-        
-        return result
+    # Determine number of primitives
+    min_prims, max_prims = cfg.get("primitives_per_shape", [3, 8])
+    num_primitives = rng.integers(min_prims, max_prims + 1)
     
-    finally:
-        np.random.set_state(old_state)
-
-
+    # Create root primitive
+    base_size_min, base_size_max = cfg.get("base_size", [0.03, 0.08])
+    root_size = rng.uniform(base_size_min, base_size_max)
+    root_type = _weighted_choice(cfg.get("primitive_types", {"sphere": 1.0}))
+    
+    primitives = [_make_primitive(root_type, root_size)]
+    current_size = root_size
+    
+    # Grow by attaching children
+    for _ in range(num_primitives - 1):
+        # Pick random existing primitive to attach to
+        parent_idx = rng.integers(0, len(primitives))
+        parent = primitives[parent_idx]
+        
+        # Sample point on parent surface
+        point, normal = _sample_surface_point(parent)
+        
+        # Create child primitive (smaller)
+        current_size *= cfg.get("size_decay", 0.8)
+        child_type = _weighted_choice(cfg.get("primitive_types", {"sphere": 1.0}))
+        child = _make_primitive(child_type, current_size)
+        
+        # Get child's approximate radius for offset
+        # Use MINIMUM dimension to ensure good overlap for elongated shapes
+        child_bounds = child.bounds
+        child_extents = child_bounds[1] - child_bounds[0]
+        child_min_radius = np.min(child_extents) / 2
+        
+        # Position child so it overlaps with parent
+        # Place center at point + normal * (min_radius * overlap_factor)
+        # With factor < 1.0, the child penetrates into the parent
+        overlap_factor = rng.uniform(0.2, 0.5)  # Random overlap depth
+        offset = point + normal * child_min_radius * overlap_factor
+        child.apply_translation(offset)
+        
+        primitives.append(child)
+    
+    # Boolean union all primitives
+    if len(primitives) == 1:
+        result = primitives[0]
+    else:
+        result = primitives[0]
+        for mesh in primitives[1:]:
+            result = result.union(mesh, engine="manifold")
+    
+    # Clean up mesh
+    result.merge_vertices()
+    result.remove_unreferenced_vertices()
+    result.fill_holes()
+    result.process(validate=True)
+    
+    # Center at origin
+    result.vertices -= result.centroid
+    
+    return result
+    
 def generate_procedural_shapes(cfg: dict[str, Any], y2r_dir: Path) -> list[Path]:
     """
     Generate procedural shapes and save to asset directory.
@@ -281,39 +279,32 @@ def _export_mesh(mesh, output_path: Path) -> None:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # Try Isaac Sim's converter first
-    try:
-        from isaaclab.sim.converters import MeshConverter, MeshConverterCfg
-        from isaaclab.sim.schemas import (
-            MassPropertiesCfg,
-            RigidBodyPropertiesCfg,
-            CollisionPropertiesCfg,
-            ConvexDecompositionPropertiesCfg,
-        )
+    from isaaclab.sim.converters import MeshConverter, MeshConverterCfg
+    from isaaclab.sim.schemas import (
+        MassPropertiesCfg,
+        RigidBodyPropertiesCfg,
+        CollisionPropertiesCfg,
+        ConvexDecompositionPropertiesCfg,
+    )
+    
+    # Export to temporary OBJ
+    temp_obj = output_path.with_suffix(".obj")
+    mesh.export(str(temp_obj))
+    
+    # Convert to USD with convex decomposition
+    converter_cfg = MeshConverterCfg(
+        asset_path=str(temp_obj),
+        usd_dir=str(output_path.parent),
+        usd_file_name=output_path.name,
+        force_usd_conversion=True,
+        make_instanceable=False,
+        mass_props=MassPropertiesCfg(mass=0.2),
+        rigid_props=RigidBodyPropertiesCfg(),
+        collision_props=CollisionPropertiesCfg(),
+        mesh_collision_props=ConvexDecompositionPropertiesCfg(),
+    )
+    converter = MeshConverter(converter_cfg)
+    
+    # Clean up temp OBJ
+    temp_obj.unlink(missing_ok=True)
         
-        # Export to temporary OBJ
-        temp_obj = output_path.with_suffix(".obj")
-        mesh.export(str(temp_obj))
-        
-        # Convert to USD with convex decomposition
-        converter_cfg = MeshConverterCfg(
-            asset_path=str(temp_obj),
-            usd_dir=str(output_path.parent),
-            usd_file_name=output_path.name,
-            force_usd_conversion=True,
-            make_instanceable=False,
-            mass_props=MassPropertiesCfg(mass=0.2),
-            rigid_props=RigidBodyPropertiesCfg(),
-            collision_props=CollisionPropertiesCfg(),
-            mesh_collision_props=ConvexDecompositionPropertiesCfg(),
-        )
-        converter = MeshConverter(converter_cfg)
-        
-        # Clean up temp OBJ
-        temp_obj.unlink(missing_ok=True)
-        
-    except ImportError:
-        # Fallback: export as OBJ
-        obj_path = output_path.with_suffix(".obj")
-        mesh.export(str(obj_path))
-        print(f"Warning: Isaac Sim converter not available, exported as OBJ: {obj_path}")

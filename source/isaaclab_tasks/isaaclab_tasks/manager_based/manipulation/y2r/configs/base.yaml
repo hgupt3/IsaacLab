@@ -101,12 +101,12 @@ rewards:
   action_l2:
     weight: -0.005
     params:
-      finger_scale: 0.1         # 10x less penalty on hand actions
+      finger_scale: 0.2         
     
   action_rate_l2:
     weight: -0.005
     params:
-      finger_scale: 0.1         # 10x less penalty on hand actions
+      finger_scale: 0.2     
     
   fingers_to_object:
     weight: 2.0
@@ -192,11 +192,10 @@ rewards:
 
   # Penalize being too close to joint soft limits (encourages "comfort zone" postures)
   joint_limits_margin:
-    weight: -0.05
+    weight: -0.1
     params:
-      threshold: 0.95             # in (0,1): 0.95 means penalize last 5% near either limit
+      threshold: 0.95             # in (0,1): 0.9 means penalize last 10% near either limit
       power: 2.0                  # >=1: higher = sharper penalty near limits
-      max_penalty_per_joint: 2.0  # cap per-joint penalty to prevent spikes when exceeding soft limits
 
   # Rewards *reducing* current target error (helps recovery if policy freezes).
   tracking_progress:
@@ -276,7 +275,7 @@ randomization:
     object_yaw: [-3.14, 3.14]   # Object yaw rotation
     robot_joints: [-0.5, 0.5]   # Joint position offset
     robot_wrist: [-3.0, 3.0]    # Wrist joint (larger range)
-    z_offset: 0.0005            # Safety margin above table
+    z_offset: 0.005             # Safety margin above table (5mm)
 
 # ==============================================================================
 # VISUALIZATION
@@ -319,6 +318,8 @@ push_t:
   rolling_window: 3.0           # Trajectory planning horizon (seconds)
   min_speed: 0.02               # Minimum speed (m/s) to prevent infinite slowdown
   include_in_primitives: true   # Include T-shape in random object selection pool
+  object_z_offset: null         # Center-to-bottom distance (null = auto-compute from mesh)
+  outline_z_offset: null        # Center-to-bottom distance (null = auto-compute from mesh)
 
 # ==============================================================================
 # PSEUDO CAMERA (for visible point cloud filtering)
@@ -366,8 +367,9 @@ procedural_objects:
     base_size: [0.035, 0.075]       # [min, max] base primitive size (meters)
     size_decay: 0.7               # Each child primitive is this fraction of parent
     primitive_types:              # Weighted selection of primitive types
-      ellipsoid: 0.1
-      box: 0.5
-      capsule: 0.1
-      cylinder: 0.3
+      sphere: 0.1
+      box: 0.3
+      capsule: 0.2
+      cylinder: 0.2
+      annulus: 0.2
     seed: null                    # Random seed (null = different each generation)

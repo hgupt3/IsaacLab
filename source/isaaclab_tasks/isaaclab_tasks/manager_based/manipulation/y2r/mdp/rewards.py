@@ -194,7 +194,6 @@ def joint_pos_limits_margin(
     env: ManagerBasedRLEnv,
     threshold: float = 0.95,
     power: float = 2.0,
-    max_penalty_per_joint: float = 1.0,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """Penalty for operating too close to joint position soft limits.
@@ -203,21 +202,21 @@ def joint_pos_limits_margin(
         -1 -> lower soft limit, +1 -> upper soft limit.
 
     Then penalize joints whose |normalized| exceeds `threshold` (e.g. 0.95),
-    with a smooth ramp:
+    with a smooth ramp from 0 to 1:
 
-        x = clamp((|q_norm| - threshold) / (1 - threshold), 0, max_penalty_per_joint)
+        x = clamp((|q_norm| - threshold) / (1 - threshold), 0, 1)
         penalty = sum(x^power) over joints
+
+    Positions beyond the limit are clamped to the limit (max penalty = 1^power per joint).
 
     Args:
         env: The environment.
         threshold: Normalized proximity threshold in (0, 1). Larger = only penalize very near limits.
         power: Shape of penalty (>= 1). 2.0 gives quadratic growth near limits.
-        max_penalty_per_joint: Maximum value of x before power (prevents unbounded spikes when
-            joints exceed soft limits). Default 1.0 means max penalty is 1^power per joint.
         asset_cfg: Which articulation / joints to penalize. Defaults to all robot joints.
 
     Returns:
-        Tensor of shape (num_envs,) with per-env penalties.
+        Tensor of shape (num_envs,) with per-env penalties (max = num_joints when all at limit).
     """
     if not (0.0 < threshold < 1.0):
         raise ValueError(f"threshold must be in (0, 1), got {threshold}.")
@@ -229,9 +228,11 @@ def joint_pos_limits_margin(
     limits = asset.data.soft_joint_pos_limits[:, joint_ids]  # (N, J, 2)
     q = asset.data.joint_pos[:, joint_ids]  # (N, J)
 
-    q_norm = math_utils.scale_transform(q, limits[..., 0], limits[..., 1])  # (N, J) in [-1, 1]
-    # Clamp x to max_penalty_per_joint to prevent unbounded spikes when joints exceed soft limits
-    x = (q_norm.abs() - threshold).clamp(min=0.0, max=max_penalty_per_joint * (1.0 - threshold)) / (1.0 - threshold)
+    # Normalize to [-1, 1], clamp to handle positions beyond limits
+    q_norm = math_utils.scale_transform(q, limits[..., 0], limits[..., 1]).clamp(-1.0, 1.0)
+    
+    # Ramp from 0 (at threshold) to 1 (at limit)
+    x = ((q_norm.abs() - threshold) / (1.0 - threshold)).clamp(min=0.0)
     return torch.sum(x**power, dim=1)
 
 

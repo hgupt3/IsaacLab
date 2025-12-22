@@ -1163,6 +1163,7 @@ class target_sequence_obs_b(ManagerTermBase):
             # Get environment origins
             env_origins = env.scene.env_origins[reset_ids]
             
+            # Scales are read once at trajectory_manager init from USD prims
             self.trajectory_manager.reset(reset_ids, start_poses, env_origins)
         
         # Step trajectory (advance time)

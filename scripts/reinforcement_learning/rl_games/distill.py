@@ -115,7 +115,7 @@ def register_distill_agent_with_runner(runner: Runner):
     )
 
 
-@hydra_task_config(args_cli.task, "rl_games_cfg_entry_point")
+@hydra_task_config(args_cli.task, "rl_games_student_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: dict):
     """Run teacher-student distillation."""
     

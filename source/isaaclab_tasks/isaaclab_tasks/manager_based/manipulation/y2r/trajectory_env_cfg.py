@@ -34,6 +34,7 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from . import mdp
 from .adr_curriculum import build_curriculum_cfg
 from .config_loader import get_config, Y2RConfig
+from .mdp.utils import compute_z_offset_from_usd
 from .procedural_shapes import get_procedural_shape_paths
 
 
@@ -661,7 +662,6 @@ def _build_rewards_cfg(cfg: Y2RConfig):
             params={
                 "threshold": cfg.rewards.joint_limits_margin.params["threshold"],
                 "power": cfg.rewards.joint_limits_margin.params["power"],
-                "max_penalty_per_joint": cfg.rewards.joint_limits_margin.params["max_penalty_per_joint"],
                 "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
             },
         )
@@ -792,14 +792,38 @@ class TrajectoryEnvCfg(ManagerBasedEnvCfg):
         self.sim.physx.gpu_max_rigid_patch_count = 4 * 5 * 2**15
 
     def _setup_push_t_scene(self, cfg: Y2RConfig):
-        """Setup push_t scene: USD object and outline."""
+        """Setup push_t scene: USD object and outline.
+        
+        Z-offsets (center-to-bottom distance) can be set manually in config or auto-computed:
+        - If object_z_offset is None: auto-compute from mesh geometry
+        - If object_z_offset is set: use that value directly
+        Same for outline_z_offset.
+        """
         config_dir = Path(__file__).parent
+        safety_margin = cfg.randomization.reset.z_offset  # 5mm default
+        
+        # Compute object z-offset: use config value or auto-compute from mesh
+        usd_path = str(config_dir / cfg.push_t.object_usd)
+        # Use max of scale_range for init_state z to ensure no penetration at largest scale
+        # Smaller scales will spawn slightly higher, but physics will settle them
+        scale_range = cfg.randomization.object.scale
+        max_scale = max(scale_range)
+        
+        if cfg.push_t.object_z_offset is not None:
+            object_z_offset = cfg.push_t.object_z_offset
+        else:
+            object_z_offset = compute_z_offset_from_usd(
+                usd_path=usd_path,
+                rotation_wxyz=tuple(cfg.push_t.object_rotation),
+                scale=max_scale,
+            )
+        object_z = cfg.workspace.table_surface_z + object_z_offset + safety_margin
         
         # Object from USD
         self.scene.object = RigidObjectCfg(
             prim_path="{ENV_REGEX_NS}/Object",
             spawn=sim_utils.UsdFileCfg(
-                usd_path=str(config_dir / cfg.push_t.object_usd),
+                usd_path=usd_path,
                 scale=(cfg.push_t.object_scale,) * 3,
                 rigid_props=sim_utils.RigidBodyPropertiesCfg(
                     solver_position_iteration_count=16,
@@ -810,29 +834,46 @@ class TrajectoryEnvCfg(ManagerBasedEnvCfg):
                 mass_props=sim_utils.MassPropertiesCfg(mass=0.2),
             ),
             init_state=RigidObjectCfg.InitialStateCfg(
-                pos=(-0.55, 0.0, cfg.workspace.table_surface_z + 0.01),
+                pos=(-0.55, 0.0, object_z),
                 rot=cfg.push_t.object_rotation,
             ),
         )
         
         # Visual outline at goal position
         if cfg.push_t.outline_usd:
+            outline_path = str(config_dir / cfg.push_t.outline_usd)
+            
+            # Compute outline z-offset: use config value or auto-compute from mesh
+            if cfg.push_t.outline_z_offset is not None:
+                outline_z_offset = cfg.push_t.outline_z_offset
+            else:
+                outline_z_offset = compute_z_offset_from_usd(
+                    usd_path=outline_path,
+                    rotation_wxyz=tuple(cfg.push_t.outline_rotation),
+                    scale=cfg.push_t.object_scale,
+                )
+            outline_z = cfg.workspace.table_surface_z + outline_z_offset + 0.001  # Small offset to avoid z-fighting
+            
             self.scene.outline = AssetBaseCfg(
                 prim_path="{ENV_REGEX_NS}/Outline",
                 spawn=sim_utils.UsdFileCfg(
-                    usd_path=str(config_dir / cfg.push_t.outline_usd),
+                    usd_path=outline_path,
                     scale=(cfg.push_t.object_scale,) * 3,
                     rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=True),
                     collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
                 ),
                 init_state=AssetBaseCfg.InitialStateCfg(
-                    pos=(*cfg.push_t.outline_position, cfg.workspace.table_surface_z + 0.001),
+                    pos=(*cfg.push_t.outline_position, outline_z),
                     rot=cfg.push_t.outline_rotation,
                 ),
             )
 
     def _setup_push_t_events(self, cfg: Y2RConfig):
-        """Override object reset for push_t mode (fixed rotation)."""
+        """Override object reset for push_t mode (fixed rotation).
+        
+        The initial state already has the correct z computed from mesh geometry,
+        so we don't add any z offset during reset (z range is [0, 0]).
+        """
         self.events.reset_object = EventTerm(
             func=mdp.reset_root_state_uniform,
             mode="reset",
@@ -840,7 +881,7 @@ class TrajectoryEnvCfg(ManagerBasedEnvCfg):
                 "pose_range": {
                     "x": list(cfg.randomization.reset.object_x),
                     "y": list(cfg.randomization.reset.object_y),
-                    "z": [0.005, 0.005],
+                    "z": [0.0, 0.0],  # Z already correct from init_state
                 },
                 "velocity_range": {"x": [0.0, 0.0], "y": [0.0, 0.0], "z": [0.0, 0.0]},
                 "asset_cfg": SceneEntityCfg("object"),

@@ -72,8 +72,9 @@ def main():
     from isaaclab_tasks.manager_based.manipulation.y2r.procedural_shapes import generate_procedural_shapes
     
     # Load config
+    from dataclasses import asdict
     cfg = get_config(args.config)
-    proc_cfg = cfg.procedural_objects._raw.copy()
+    proc_cfg = asdict(cfg.procedural_objects)
     
     # Override with command line args
     if args.regenerate:

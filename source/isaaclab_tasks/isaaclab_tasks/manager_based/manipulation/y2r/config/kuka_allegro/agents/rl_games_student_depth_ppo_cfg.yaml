@@ -166,4 +166,4 @@ params:
     # Output path: logs/.../nn/depth_video.mp4
     debug_depth_video: False
     debug_depth_video_fps: 30
-    debug_depth_video_num_frames: 1000  # Record this many frames then save
+    debug_depth_video_num_frames: 100  # Record this many frames then save

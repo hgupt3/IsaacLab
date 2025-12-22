@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 
 from isaaclab.utils.math import quat_mul, quat_from_euler_xyz, quat_apply, sample_uniform
 
-from .mdp.utils import get_stable_object_placement
+from .mdp.utils import get_stable_object_placement, compute_z_offset_from_usd, read_object_scales_from_usd
 
 if TYPE_CHECKING:
     from .config_loader import Y2RConfig
@@ -102,6 +102,35 @@ class TrajectoryManager:
         # For push-T replanning: track when to regenerate trajectory
         self.last_replan_idx = torch.zeros(num_envs, dtype=torch.long, device=device)
         self.current_object_poses = torch.zeros(num_envs, 7, device=device)
+        
+        # Object scales for variable scale support
+        # Read from USD prims after prestartup scale randomization
+        if object_prim_path is not None:
+            scales = read_object_scales_from_usd(object_prim_path, num_envs)
+            self._object_scales = scales.to(device)
+        else:
+            self._object_scales = torch.ones(num_envs, device=device)
+        
+        # Pre-compute push_t base z-offset (scale=1.0) for goal positioning
+        # At reset time, we multiply by actual object scale
+        self._push_t_base_z_offset = None
+        if cfg.push_t.enabled and cfg.push_t.object_usd:
+            from pathlib import Path
+            config_dir = Path(__file__).parent
+            usd_path = str(config_dir / cfg.push_t.object_usd)
+            
+            if cfg.push_t.object_z_offset is not None:
+                # Config specifies exact z_offset, use as-is (no scaling)
+                self._push_t_base_z_offset = cfg.push_t.object_z_offset
+            else:
+                # Compute base z_offset with scale=1.0
+                # Will be multiplied by actual object scale at reset time
+                goal_rot = cfg.push_t.goal_rotation if cfg.push_t.goal_rotation else cfg.push_t.outline_rotation
+                self._push_t_base_z_offset = compute_z_offset_from_usd(
+                    usd_path=usd_path,
+                    rotation_wxyz=tuple(goal_rot),
+                    scale=1.0,  # Base z_offset at unit scale
+                )
 
     def reset(
         self,
@@ -131,6 +160,8 @@ class TrajectoryManager:
         # Store start poses and environment origins
         self.start_poses[env_ids] = start_poses
         self.env_origins[env_ids] = env_origins
+        
+        # Object scales are read once at init from USD prims (after prestartup randomization)
         
         # Sample waypoints
         self._sample_waypoints(env_ids, start_poses, env_origins)
@@ -289,10 +320,13 @@ class TrajectoryManager:
         goal_y = goal_y_local + env_origins[:, 1]
         
         # Get stable placement (z-position + orientation) from trimesh
-        # Skip for push-T mode (use config values)
+        # Skip for push-T mode (use config values or auto-computed z-offset)
         if cfg.push_t.enabled:
-            # Base goal on table surface
-            goal_z_local = torch.full((n,), self.table_height + cfg.randomization.reset.z_offset, device=self.device)
+            # Base goal on table surface + center-to-bottom distance + safety margin
+            # Multiply base_z_offset by actual object scale for variable scale support
+            base_z_offset = self._push_t_base_z_offset
+            actual_z_offset = base_z_offset * self._object_scales[env_ids]
+            goal_z_local = self.table_height + actual_z_offset + cfg.randomization.reset.z_offset
             
             # Apply goal offset from config (if specified)
             if cfg.push_t.goal_offset is not None:
@@ -673,9 +707,17 @@ class TrajectoryManager:
         Returns:
             Adjusted positions with all point cloud points above table.
         """
+        # Minimum clearance above table surface (in local frame)
+        min_clearance = self.cfg.randomization.reset.z_offset
+        
         if self.points_local is None:
-            # Fallback to start pose Z if no point cloud available
-            min_z = self.start_poses[env_ids, 2:3].unsqueeze(1)
+            # Fallback: use a conservative estimate based on object half-height
+            # Clamp positions to ensure center is at least table + clearance + estimated half-height
+            # Use start pose Z as proxy for object half-height above table
+            start_height_above_table = self.start_poses[env_ids, 2:3] - self.env_origins[env_ids, 2:3]
+            min_z = self.table_height + self.env_origins[env_ids, 2:3].unsqueeze(1) + min_clearance
+            # Also ensure we don't go below start height (which should be valid)
+            min_z = torch.maximum(min_z, self.start_poses[env_ids, 2:3].unsqueeze(1))
             positions[:, :, 2:3] = torch.maximum(positions[:, :, 2:3], min_z)
             return positions
         

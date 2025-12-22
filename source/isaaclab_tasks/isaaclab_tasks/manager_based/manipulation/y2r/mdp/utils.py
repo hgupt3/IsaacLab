@@ -231,6 +231,38 @@ class StablePlacementCache:
             self.valid[env_tensor] = True
 
 
+def read_object_scales_from_usd(prim_path: str, num_envs: int) -> torch.Tensor:
+    """Read per-environment object scales from USD prims.
+    
+    This reads the xformOp:scale attribute that was set by randomize_rigid_body_scale
+    during prestartup. Scales are stored on USD prims and don't change during simulation.
+    
+    Args:
+        prim_path: Prim path pattern with .* for env_id (e.g., "/World/envs/env_.*/Object")
+        num_envs: Number of environments
+        
+    Returns:
+        Tensor of shape (num_envs,) with z-scale for each environment
+    """
+    from pxr import Sdf
+    from isaaclab.sim.utils import get_current_stage
+    
+    scales_z = torch.ones(num_envs, dtype=torch.float32)
+    
+    stage = get_current_stage()
+    root_layer = stage.GetRootLayer()
+    
+    for env_id in range(num_envs):
+        obj_path = prim_path.replace(".*", str(env_id))
+        prim_spec = root_layer.GetPrimAtPath(obj_path)
+        if prim_spec:
+            scale_attr = prim_spec.attributes.get("xformOp:scale")
+            if scale_attr and scale_attr.default is not None:
+                scales_z[env_id] = float(scale_attr.default[2])
+    
+    return scales_z
+
+
 def clear_random_pointcloud_cache():
     """Clear the random point cloud caches."""
     _POINT_CLOUD_CACHE.clear()
@@ -238,7 +270,11 @@ def clear_random_pointcloud_cache():
 
 
 def _compute_geometry_group_key(prims: list) -> str:
-    """Compute a key for grouping envs by geometry type (shape + dimensions, excluding scale)."""
+    """Compute a key for grouping envs by geometry type (shape + dimensions, excluding scale).
+    
+    For Mesh types, includes bounding box dimensions to distinguish meshes with the same
+    vertex/face count but different sizes (e.g., different procedural shapes).
+    """
     parts = []
     for prim in prims:
         prim_type = prim.GetTypeName()
@@ -246,7 +282,11 @@ def _compute_geometry_group_key(prims: list) -> str:
             mesh = UsdGeom.Mesh(prim)
             verts = mesh.GetPointsAttr().Get()
             faces = mesh.GetFaceVertexIndicesAttr().Get()
-            parts.append(f"Mesh:{len(verts)}:{len(faces)}")
+            # Include bounding box to distinguish meshes with same vert/face count but different sizes
+            verts_np = np.asarray(verts, dtype=np.float32)
+            bbox_min = tuple(np.round(verts_np.min(axis=0), 4))
+            bbox_max = tuple(np.round(verts_np.max(axis=0), 4))
+            parts.append(f"Mesh:{len(verts)}:{len(faces)}:{bbox_min}:{bbox_max}")
         elif prim_type == "Cube":
             size = UsdGeom.Cube(prim).GetSizeAttr().Get()
             parts.append(f"Cube:{size:.6f}")
@@ -542,7 +582,85 @@ def get_stable_object_placement(
     # Apply fallback for invalid envs
     z_positions = torch.where(valid, z_positions, torch.full_like(z_positions, table_surface_z + 0.1))
     
+    # Safety clamp: ensure z-position is never below table surface + minimum clearance
+    # This protects against any numerical errors or edge cases in stable pose computation
+    min_z = table_surface_z + max(z_offset, 0.003)  # At least 3mm above table
+    z_positions = torch.maximum(z_positions, torch.full_like(z_positions, min_z))
+    
     return z_positions, quaternions
+
+
+def compute_z_offset_from_usd(
+    usd_path: str,
+    rotation_wxyz: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0),
+    scale: float = 1.0,
+) -> float:
+    """
+    Compute the z-offset (origin-to-bottom distance) for a USD mesh in a given orientation.
+    
+    Uses USD's built-in BBoxCache on every boundable prim, unions the bounds in
+    world space, applies rotation + scale, and returns origin->bottom distance.
+    
+    Args:
+        usd_path: Path to the USD file.
+        rotation_wxyz: Quaternion (w, x, y, z) for the desired orientation.
+        scale: Uniform scale factor to apply.
+        
+    Returns:
+        Distance from object origin to its lowest point after rotation and scale.
+        Add this to table_surface_z + safety_margin to get correct spawn z.
+    """
+    from pxr import Usd, UsdGeom
+    from scipy.spatial.transform import Rotation
+    
+    stage = Usd.Stage.Open(str(usd_path))
+    assert stage is not None, f"Failed to open USD stage: {usd_path}"
+    
+    # Include common purposes for bbox computation
+    purposes = [UsdGeom.Tokens.default_, UsdGeom.Tokens.render, UsdGeom.Tokens.proxy]
+    bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), purposes)
+    
+    # Collect bboxes from all boundable prims
+    mins = []
+    maxs = []
+    for prim in stage.Traverse():
+        if prim.IsA(UsdGeom.Boundable):
+            world_bbox = bbox_cache.ComputeWorldBound(prim)
+            aligned = world_bbox.ComputeAlignedBox()
+            mn = aligned.GetMin()
+            mx = aligned.GetMax()
+            mins.append(np.array([mn[0], mn[1], mn[2]]))
+            maxs.append(np.array([mx[0], mx[1], mx[2]]))
+    
+    assert len(mins) > 0, f"No boundable prims found in USD: {usd_path}"
+    
+    # Union all bboxes
+    min_pt = np.min(np.stack(mins, axis=0), axis=0)
+    max_pt = np.max(np.stack(maxs, axis=0), axis=0)
+    
+    # Build 8 corners for rotation
+    corners = np.array([
+        [min_pt[0], min_pt[1], min_pt[2]],
+        [min_pt[0], min_pt[1], max_pt[2]],
+        [min_pt[0], max_pt[1], min_pt[2]],
+        [min_pt[0], max_pt[1], max_pt[2]],
+        [max_pt[0], min_pt[1], min_pt[2]],
+        [max_pt[0], min_pt[1], max_pt[2]],
+        [max_pt[0], max_pt[1], min_pt[2]],
+        [max_pt[0], max_pt[1], max_pt[2]],
+    ])
+    
+    # Apply rotation (convert wxyz to xyzw for scipy)
+    quat_xyzw = [rotation_wxyz[1], rotation_wxyz[2], rotation_wxyz[3], rotation_wxyz[0]]
+    rotation = Rotation.from_quat(quat_xyzw)
+    rotated = rotation.apply(corners)
+    
+    # Apply scale
+    scaled = rotated * scale
+    
+    # Origin-to-bottom distance = -z_min (z_min is the lowest point relative to origin)
+    z_min = scaled[:, 2].min()
+    return float(-z_min)
 
 
 def _compute_geometry_hash(prim, prim_type: str) -> str:
