@@ -43,18 +43,49 @@ observations:
 # ==============================================================================
 # TRAJECTORY TIMING
 # ==============================================================================
+# Episode duration = grasp + manipulate_base + (manipulate_per_keypoint * max_keypoints) + hand_release
 trajectory:
-  duration: 9.0                # Total episode length (seconds)
   target_hz: 6.667              # Target update rate (20/3 Hz = 150ms between targets)
   window_size: 5                # Number of lookahead targets in observation
   
-  # Phase durations (seconds) - must sum to duration
+  # Phase durations (seconds)
   phases:
-    pickup: 0.5                 # Stationary at start for grasping
-    manipulate: 8.0             # Main movement phase with easing
-    release: 0.5                # Stationary at goal for release
+    grasp: 2.0                  # Hand approaches object
+    manipulate_base: 3.0        # Base manipulation time
+    manipulate_per_keypoint: 2.5  # Additional time per grasp keypoint
+    hand_release: 3.0           # Hand retreats from object
   
   easing_power: 1.0             # Quadratic ease curves (higher = sharper transitions)
+
+# ==============================================================================
+# HAND TRAJECTORY (palm pose guidance)
+# ==============================================================================
+# Generates palm pose targets alongside object trajectory.
+# Palm pose is a guiding signal - policy can deviate when necessary.
+hand_trajectory:
+  enabled: true                # Set true to enable hand pose trajectory generation
+  
+  # Grasp region sampling (surface normal based)
+  # Palm approaches from surface normal direction, Z axis (blue) faces object
+  grasp_sampling:
+    standoff_range: [0.02, 0.07]  # Palm distance from object surface (meters)
+    exclude_bottom_fraction: 0.5  # Exclude bottom 30% of object surface (table side)
+    exclude_toward_robot: true    # Flip grasps where fingers point toward robot
+    toward_robot_threshold: 0.0  # Reject if finger_dir.x > this (0=strict, 1=permissive)
+  
+  # Grasp keypoints (perturbed transforms during manipulation for in-hand manipulation)
+  keypoints:
+    count: [0, 2]               # Random number of additional grasp keypoints
+    pos_perturbation: 0.05      # Max position perturbation (meters)
+    rot_perturbation: 0.6       # Max rotation perturbation (radians, ~34°)
+  
+  # Release phase - sample random position in region (like waypoints)
+  release:
+    position_range:
+      x: null                   # null = use workspace.x bounds
+      y: null                   # null = use workspace.y bounds  
+      z: [0.35, 0.55]           # Above table, safe height range
+    min_distance_from_object: 0.15  # Ensure palm doesn't overlap with goal object
 
 # ==============================================================================
 # WORKSPACE BOUNDS
@@ -72,6 +103,7 @@ workspace:
 # Intermediate points between start and goal (0-2 randomly sampled)
 waypoints:
   count: [0, 2]                 # [min, max] waypoints per trajectory
+  pause_duration: 0.5           # Seconds to pause at each waypoint before continuing
   
   # Position sampling (null = use workspace bounds, else offset from start)
   position_range:
@@ -109,7 +141,7 @@ rewards:
       finger_scale: 0.2     
     
   fingers_to_object:
-    weight: 2.0
+    weight: 0.0
     params:
       std: 0.4
       # When tracking error is high, reduce this reward so the policy doesn't
@@ -206,6 +238,23 @@ rewards:
       positive_only: true
       clip: 1.0
 
+  # Hand pose following reward (when hand_trajectory.enabled)
+  # Guides hand to follow palm pose trajectory through grasp/manipulation/release
+  hand_pose_following:
+    weight: 2.0                   # Medium weight - guiding signal, not strict
+    params:
+      # Phase-varying tolerances: exp(-pos_error/tol) * exp(-rot_error/tol)
+      grasp_pos_tol: 0.06         # 6cm position tolerance during grasp
+      grasp_rot_tol: 0.4          # ~23° rotation tolerance during grasp
+      manipulation_pos_tol: 0.10  # 10cm (loose) during manipulation
+      manipulation_rot_tol: 0.5   # ~29° (loose) during manipulation
+      release_pos_tol: 0.06       # 6cm during release
+      release_rot_tol: 0.4        # ~23° during release
+      # Release phase gating - linearly gate other rewards if hand deviates
+      gate_in_release: true
+      gate_start_threshold: 0.06  # Start dropping gate at 6cm
+      gate_end_threshold: 0.12    # Gate reaches 0 at 12cm
+
 # ==============================================================================
 # TERMINATIONS
 # ==============================================================================
@@ -289,6 +338,7 @@ visualization:
   waypoint_region: false         # Show waypoint sampling box
   goal_region: false             # Show goal sampling region on table
   pose_axes: false               # Show axis arrows for poses
+  hand_pose_targets: false       # Show hand (palm) pose target axes
   env_ids: []                   # Which envs to visualize ([] = none, null = all)
   debug_print_rewards: false    # Print reward breakdown every 10 steps
 

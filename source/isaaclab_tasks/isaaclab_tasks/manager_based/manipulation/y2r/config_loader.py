@@ -123,18 +123,58 @@ class ObservationsConfig:
 
 @dataclass
 class PhasesConfig:
-    pickup: float
-    manipulate: float
-    release: float
+    grasp: float
+    manipulate_base: float
+    manipulate_per_keypoint: float
+    hand_release: float
 
 
 @dataclass
 class TrajectoryConfig:
-    duration: float
     target_hz: float
     window_size: int
     phases: PhasesConfig
     easing_power: float
+
+
+# ==============================================================================
+# HAND TRAJECTORY CONFIG
+# ==============================================================================
+
+@dataclass
+class GraspSamplingConfig:
+    standoff_range: tuple[float, float]
+    exclude_bottom_fraction: float
+    exclude_toward_robot: bool
+    toward_robot_threshold: float
+
+
+@dataclass
+class GraspKeypointsConfig:
+    count: tuple[int, int]
+    pos_perturbation: float
+    rot_perturbation: float
+
+
+@dataclass
+class ReleasePositionRangeConfig:
+    x: tuple[float, float] | None
+    y: tuple[float, float] | None
+    z: tuple[float, float] | None
+
+
+@dataclass
+class ReleaseConfig:
+    position_range: ReleasePositionRangeConfig
+    min_distance_from_object: float
+
+
+@dataclass
+class HandTrajectoryConfig:
+    enabled: bool
+    grasp_sampling: GraspSamplingConfig
+    keypoints: GraspKeypointsConfig
+    release: ReleaseConfig
 
 
 @dataclass
@@ -155,6 +195,7 @@ class PositionRangeConfig:
 @dataclass
 class WaypointsConfig:
     count: tuple[int, int]
+    pause_duration: float
     position_range: PositionRangeConfig
     vary_orientation: bool
     max_rotation: float
@@ -189,6 +230,7 @@ class RewardsConfig:
     distal_joint3_penalty: RewardConfig
     joint_limits_margin: RewardConfig
     tracking_progress: RewardConfig
+    hand_pose_following: RewardConfig
 
 
 @dataclass
@@ -288,6 +330,7 @@ class VisualizationConfig:
     waypoint_region: bool
     goal_region: bool
     pose_axes: bool
+    hand_pose_targets: bool
     env_ids: list[int] | None
     debug_print_rewards: bool
 
@@ -376,6 +419,7 @@ class Y2RConfig:
     mode: ModeConfig
     observations: ObservationsConfig
     trajectory: TrajectoryConfig
+    hand_trajectory: HandTrajectoryConfig
     workspace: WorkspaceConfig
     waypoints: WaypointsConfig
     goal: GoalConfig
@@ -427,6 +471,8 @@ def get_config(mode: str = "train", task: str = "base") -> Y2RConfig:
         cfg = _deep_merge(cfg, _load_yaml("layers/student"))
         cfg = _deep_merge(cfg, _load_yaml("layers/play"))
         cfg = _deep_merge(cfg, _load_yaml("layers/student_play"))
+    elif mode == "keyboard":
+        cfg = _deep_merge(cfg, _load_yaml("layers/keyboard"))
     # mode == "train" uses base only
     
     # Task layer (optional, applied last)

@@ -50,7 +50,7 @@ class EigenGraspRelativeJointPositionAction(ActionTerm):
         
         # Resolve joint names
         self._joint_ids, self._joint_names = self._asset.find_joints(
-            self.cfg.joint_names, preserve_order=False
+            self.cfg.joint_names, preserve_order=True
         )
         self._num_joints = len(self._joint_ids)
         

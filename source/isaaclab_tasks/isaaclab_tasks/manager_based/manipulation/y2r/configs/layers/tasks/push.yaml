@@ -3,6 +3,7 @@
 # ==============================================================================
 # Task definition only - no play/mode settings.
 # Push T-shape object to goal outline position.
+# Duration comes from push_t.rolling_window, not phases.
 # ==============================================================================
 
 push_t:
@@ -13,13 +14,6 @@ push_t:
   outline_position: [-0.55, 0.0]
   rolling_window: 2.0
   min_speed: 0.06
-
-trajectory:
-  duration: 15.0
-  phases:
-    pickup: 0.0
-    manipulate: 15.0
-    release: 0.0
 
 waypoints:
   count: [0, 0]

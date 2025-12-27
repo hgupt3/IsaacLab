@@ -834,6 +834,7 @@ class target_sequence_obs_b(ManagerTermBase):
         self.visualize_waypoint_region = y2r_cfg.visualization.waypoint_region
         self.visualize_goal_region = y2r_cfg.visualization.goal_region
         self.visualize_pose_axes = y2r_cfg.visualization.pose_axes
+        self.visualize_hand_pose_targets = y2r_cfg.visualization.hand_pose_targets
         self.visualize_env_ids = y2r_cfg.visualization.env_ids
         
         self.object: RigidObject = env.scene[self.object_cfg.name]
@@ -874,7 +875,7 @@ class target_sequence_obs_b(ManagerTermBase):
         self._visualizer_initialized = False
         if self.visualize or self.visualize_current:
             self._init_visualizer()
-        if self.visualize_waypoint_region or self.visualize_goal_region or self.visualize_pose_axes:
+        if self.visualize_waypoint_region or self.visualize_goal_region or self.visualize_pose_axes or self.visualize_hand_pose_targets:
             self._init_region_visualizer()
     
     def _init_visualizer(self):
@@ -1057,7 +1058,7 @@ class target_sequence_obs_b(ManagerTermBase):
         target_quat_w: torch.Tensor,
         num_envs: int,
     ):
-        """Visualize pose axes (XYZ arrows) for current object and targets.
+        """Visualize pose axes (XYZ arrows) for current object, targets, and palm.
         
         Args:
             object_pos_w: (N, 3) current object position in world frame.
@@ -1069,8 +1070,9 @@ class target_sequence_obs_b(ManagerTermBase):
         if self._debug_draw is None:
             return
         
-        # Axis arrow length
-        AXIS_LENGTH = 0.08
+        # Axis arrow lengths
+        AXIS_LENGTH = 0.08        # Object and target axes
+        PALM_AXIS_LENGTH = 0.10   # Palm axes (medium size)
         
         # Select envs to visualize
         if self.visualize_env_ids is None:
@@ -1124,14 +1126,72 @@ class target_sequence_obs_b(ManagerTermBase):
             all_ends.append(tgt_pos + axis_world)
             all_colors.extend([color] * E)
         
+        # === Palm link axes (standard RGB, medium size) ===
+        # Get palm_link body index (cache it)
+        if not hasattr(self, '_palm_body_idx'):
+            palm_ids = self.ref_asset.find_bodies("palm_link")[0]
+            if len(palm_ids) > 0:
+                self._palm_body_idx = palm_ids[0]
+            else:
+                self._palm_body_idx = None
+        
+        if self._palm_body_idx is not None:
+            palm_pos_w = self.ref_asset.data.body_pos_w[:, self._palm_body_idx]  # (N, 3)
+            palm_quat_w = self.ref_asset.data.body_quat_w[:, self._palm_body_idx]  # (N, 4)
+            
+            palm_pos = palm_pos_w[env_ids]  # (E, 3)
+            palm_quat = palm_quat_w[env_ids]  # (E, 4)
+            
+            # Standard RGB axes (10cm)
+            # Based on observation: X = finger direction, Z = palm normal (out of palm)
+            for axis, color in [(x_axis, (1.0, 0.0, 0.0, 1.0)),    # Red for X (finger direction)
+                                (y_axis, (0.0, 1.0, 0.0, 1.0)),    # Green for Y
+                                (z_axis, (0.0, 0.0, 1.0, 1.0))]:   # Blue for Z (palm normal)
+                axis_exp = axis.unsqueeze(0).expand(E, 3)
+                axis_world = quat_apply(palm_quat, axis_exp) * PALM_AXIS_LENGTH
+                
+                all_starts.append(palm_pos)
+                all_ends.append(palm_pos + axis_world)
+                all_colors.extend([color] * E)
+        
+        # === Hand pose TARGET axes (dim RGB, similar to object target) ===
+        # Show ALL targets in the window, with decreasing brightness for future targets
+        if self.visualize_hand_pose_targets:
+            cfg = self.env.cfg.y2r_cfg
+            if cfg.hand_trajectory.enabled:
+                HAND_TARGET_AXIS_LENGTH = 0.10
+                W = cfg.trajectory.window_size
+                
+                # Get all hand pose targets in window
+                hand_targets = self.trajectory_manager.get_hand_window_targets()  # (N, W, 7)
+                
+                for w in range(W):
+                    hand_pos = hand_targets[env_ids, w, :3]  # (E, 3)
+                    hand_quat = hand_targets[env_ids, w, 3:7]  # (E, 4)
+                    
+                    # Brightness decreases for future targets (1.0 -> 0.3)
+                    brightness = 0.6 - 0.4 * (w / max(W - 1, 1))
+                    
+                    # Dim RGB axes
+                    for axis, base_color in [(x_axis, (1.0, 0.0, 0.0)),    # Red for X
+                                             (y_axis, (0.0, 1.0, 0.0)),    # Green for Y
+                                             (z_axis, (0.0, 0.0, 1.0))]:   # Blue for Z
+                        color = (base_color[0] * brightness, base_color[1] * brightness, base_color[2] * brightness, 0.8)
+                        axis_exp = axis.unsqueeze(0).expand(E, 3)
+                        axis_world = quat_apply(hand_quat, axis_exp) * HAND_TARGET_AXIS_LENGTH
+                        
+                        all_starts.append(hand_pos)
+                        all_ends.append(hand_pos + axis_world)
+                        all_colors.extend([color] * E)
+        
         # Concatenate and draw
-        starts = torch.cat(all_starts, dim=0)  # (6*E, 3)
-        ends = torch.cat(all_ends, dim=0)      # (6*E, 3)
+        starts = torch.cat(all_starts, dim=0)  # (9*E, 3) with palm axes
+        ends = torch.cat(all_ends, dim=0)
         
         starts_list = starts.cpu().tolist()
         ends_list = ends.cpu().tolist()
         n = len(starts_list)
-        self._debug_draw.draw_lines(starts_list, ends_list, all_colors, [3.0] * n)
+        self._debug_draw.draw_lines(starts_list, ends_list, all_colors, [4.0] * n)
     
     def __call__(
         self,
@@ -1269,12 +1329,12 @@ class target_sequence_obs_b(ManagerTermBase):
             self._visualize(all_points_w, current_points_w, N)
         
         # Debug draw visualizations (lines) - must redraw every frame after clear
-        if self._debug_draw is not None and (self.visualize_pose_axes or self.visualize_waypoint_region or self.visualize_goal_region):
+        if self._debug_draw is not None and (self.visualize_pose_axes or self.visualize_hand_pose_targets or self.visualize_waypoint_region or self.visualize_goal_region):
             # Clear previous frame's lines first
             self._debug_draw.clear_lines()
             
-            # Pose axes visualization (current + targets)
-            if self.visualize_pose_axes:
+            # Pose axes visualization (current + targets + hand targets)
+            if self.visualize_pose_axes or self.visualize_hand_pose_targets:
                 self._visualize_pose_axes(object_pos_w, object_quat_w, target_pos_w, target_quat_w, N)
             
             # Region boxes (waypoint/goal)
@@ -1391,6 +1451,64 @@ def target_sequence_poses_b(
     ).reshape(N, W, 3)
     
     # Orientation: multiply by inverse robot quat
+    target_quat_b = quat_mul(
+        ref_quat_inv.unsqueeze(1).expand(N, W, 4).reshape(-1, 4),
+        target_quat_w.reshape(-1, 4)
+    ).reshape(N, W, 4)
+    
+    # Combine to poses in robot frame: (N, W, 7)
+    target_poses_b = torch.cat([target_pos_b, target_quat_b], dim=-1)
+    
+    # Flatten: (N, W * 7)
+    return target_poses_b.reshape(N, -1)
+
+
+def hand_pose_targets_b(
+    env: ManagerBasedRLEnv,
+    ref_asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Hand (palm) pose targets in robot's base frame.
+    
+    Returns the window of target palm poses from the trajectory manager.
+    Only active when hand_trajectory.enabled is True.
+    
+    Args:
+        env: The environment (must have trajectory_manager attached).
+        ref_asset_cfg: Reference frame (robot). Defaults to ``SceneEntityCfg("robot")``.
+    
+    Returns:
+        Flattened tensor (num_envs, window_size * 7) - target palm poses in robot frame.
+        Returns zeros if hand trajectory is disabled.
+    """
+    cfg = env.cfg.y2r_cfg
+    N = env.num_envs
+    W = cfg.trajectory.window_size
+    
+    # Return zeros if hand trajectory is disabled
+    if not cfg.hand_trajectory.enabled:
+        return torch.zeros(N, W * 7, device=env.device)
+    
+    trajectory_manager = env.trajectory_manager
+    ref_asset: Articulation = env.scene[ref_asset_cfg.name]
+    
+    # Get hand window targets: (N, W, 7) - pos(3) + quat(4)
+    hand_targets = trajectory_manager.get_hand_window_targets()
+    target_pos_w = hand_targets[:, :, :3]   # (N, W, 3)
+    target_quat_w = hand_targets[:, :, 3:7]  # (N, W, 4)
+    
+    # Reference frame
+    ref_pos_w = ref_asset.data.root_pos_w   # (N, 3)
+    ref_quat_w = ref_asset.data.root_quat_w  # (N, 4)
+    ref_quat_inv = quat_inv(ref_quat_w)  # (N, 4)
+    
+    # Transform target positions to robot base frame
+    target_pos_rel = target_pos_w - ref_pos_w.unsqueeze(1)  # (N, W, 3)
+    target_pos_b = quat_apply(
+        ref_quat_inv.unsqueeze(1).expand(N, W, 4).reshape(-1, 4),
+        target_pos_rel.reshape(-1, 3)
+    ).reshape(N, W, 3)
+    
+    # Transform orientations to robot base frame
     target_quat_b = quat_mul(
         ref_quat_inv.unsqueeze(1).expand(N, W, 4).reshape(-1, 4),
         target_quat_w.reshape(-1, 4)

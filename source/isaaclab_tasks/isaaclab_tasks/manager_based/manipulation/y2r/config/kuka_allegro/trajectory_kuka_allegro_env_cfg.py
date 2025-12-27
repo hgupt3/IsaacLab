@@ -25,13 +25,24 @@ from ... import mdp
 
 def _build_rel_joint_action_cfg(cfg: Y2RConfig):
     """Build standard relative joint position action config."""
+    # Explicit ordered joint list: arm joints first, then hand joints.
+    KUKA_ALLEGRO_JOINT_ORDER = [
+        # arm (7)
+        "iiwa7_joint_1", "iiwa7_joint_2", "iiwa7_joint_3", "iiwa7_joint_4",
+        "iiwa7_joint_5", "iiwa7_joint_6", "iiwa7_joint_7",
+        # hand (16)
+        "index_joint_0", "index_joint_1", "index_joint_2", "index_joint_3",
+        "middle_joint_0", "middle_joint_1", "middle_joint_2", "middle_joint_3",
+        "ring_joint_0",   "ring_joint_1",   "ring_joint_2",   "ring_joint_3",
+        "thumb_joint_0",  "thumb_joint_1",  "thumb_joint_2",  "thumb_joint_3",
+    ]
     
     @configclass
     class KukaAllegroRelJointPosActionCfg:
         """Standard relative joint position action (23D)."""
         action = mdp.RelativeJointPositionActionCfg(
             asset_name="robot",
-            joint_names=[".*"],
+            joint_names=KUKA_ALLEGRO_JOINT_ORDER,
             scale=cfg.robot.action_scale,
         )
     
@@ -40,13 +51,24 @@ def _build_rel_joint_action_cfg(cfg: Y2RConfig):
 
 def _build_eigen_grasp_action_cfg(cfg: Y2RConfig):
     """Build eigen grasp action config."""
+    # Explicit ordered joint list: arm joints first, then hand joints.
+    KUKA_ALLEGRO_JOINT_ORDER = [
+        # arm (7)
+        "iiwa7_joint_1", "iiwa7_joint_2", "iiwa7_joint_3", "iiwa7_joint_4",
+        "iiwa7_joint_5", "iiwa7_joint_6", "iiwa7_joint_7",
+        # hand (16)
+        "index_joint_0", "index_joint_1", "index_joint_2", "index_joint_3",
+        "middle_joint_0", "middle_joint_1", "middle_joint_2", "middle_joint_3",
+        "ring_joint_0",   "ring_joint_1",   "ring_joint_2",   "ring_joint_3",
+        "thumb_joint_0",  "thumb_joint_1",  "thumb_joint_2",  "thumb_joint_3",
+    ]
     
     @configclass
     class KukaAllegroEigenGraspActionCfg:
         """Eigen grasp action with residual (28D input -> 23D output)."""
         action = mdp.EigenGraspRelativeJointPositionActionCfg(
             asset_name="robot",
-            joint_names=[".*"],
+            joint_names=KUKA_ALLEGRO_JOINT_ORDER,
             scale=cfg.robot.action_scale,
             arm_joint_count=cfg.robot.arm_joint_count,
             hand_joint_count=cfg.robot.hand_joint_count,

@@ -20,6 +20,17 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
+def _get_hand_pose_gate(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Get hand pose gate factor, defaulting to 1.0 if not set.
+    
+    The gate is computed by hand_pose_following reward and stored on env.
+    During release phase, it ramps from 1→0 as hand deviates from target.
+    """
+    if hasattr(env, 'hand_pose_gate'):
+        return env.hand_pose_gate
+    return torch.ones(env.num_envs, device=env.device)
+
+
 def action_rate_l2_clamped(
     env: ManagerBasedRLEnv,
     arm_joint_count: int = 7,
@@ -128,9 +139,11 @@ def object_ee_distance(
     return reward
 
 
-def contacts(env: ManagerBasedRLEnv, threshold: float) -> torch.Tensor:
-    """Check if good finger contact is present (thumb + at least one other finger)."""
-
+def _contacts_bool(env: ManagerBasedRLEnv, threshold: float) -> torch.Tensor:
+    """Check if good finger contact is present (thumb + at least one other finger).
+    
+    Internal helper that returns boolean tensor.
+    """
     thumb_contact_sensor: ContactSensor = env.scene.sensors["thumb_link_3_object_s"]
     index_contact_sensor: ContactSensor = env.scene.sensors["index_link_3_object_s"]
     middle_contact_sensor: ContactSensor = env.scene.sensors["middle_link_3_object_s"]
@@ -148,8 +161,18 @@ def contacts(env: ManagerBasedRLEnv, threshold: float) -> torch.Tensor:
     good_contact_cond1 = (thumb_contact_mag > threshold) & (
         (index_contact_mag > threshold) | (middle_contact_mag > threshold) | (ring_contact_mag > threshold)
     )
-
     return good_contact_cond1
+
+
+def contacts(env: ManagerBasedRLEnv, threshold: float) -> torch.Tensor:
+    """Reward for good finger contact (thumb + at least one other finger).
+    
+    Returns a gated float reward (0.0 or 1.0 * gate).
+    Gate reduces reward during release if hand is not following target trajectory.
+    """
+    good_contact = _contacts_bool(env, threshold)
+    reward = good_contact.float() * _get_hand_pose_gate(env)
+    return reward
 
 
 def contact_factor(
@@ -357,6 +380,9 @@ def lookahead_tracking(
         
         reward = pos_reward - neg_scale * neg_penalty
     
+    # Apply hand pose gate (reduces reward during release if hand not following target)
+    reward = reward * _get_hand_pose_gate(env)
+    
     return reward
 
 
@@ -424,6 +450,10 @@ def tracking_progress(
 
     if clip is not None:
         progress = progress.clamp(min=-float(clip), max=float(clip))
+    
+    # Apply hand pose gate
+    progress = progress * _get_hand_pose_gate(env)
+    
     return progress
 
 
@@ -474,8 +504,13 @@ def trajectory_success(
         at_goal = current_error < error_threshold
         
     # Success = both conditions
-    success_mask = in_release & at_goal 
-    return success_mask.float()
+    success_mask = in_release & at_goal
+    reward = success_mask.float()
+    
+    # Apply hand pose gate
+    reward = reward * _get_hand_pose_gate(env)
+    
+    return reward
 
 
 def arm_table_binary_penalty(
@@ -653,10 +688,13 @@ def finger_manipulation(
     
     # Gate by error improvement: only reward when tracking is getting better
     reward = torch.where(error_improved, reward, torch.zeros_like(reward))
-    reward = torch.where(contacts(env, 1.0), reward, torch.zeros_like(reward))
+    reward = torch.where(_contacts_bool(env, 1.0), reward, torch.zeros_like(reward))
     
     # Zero out reward for reset frames
     reward = torch.where(reset_mask, torch.zeros_like(reward), reward)
+    
+    # Apply hand pose gate
+    reward = reward * _get_hand_pose_gate(env)
     
     return reward
 
@@ -844,3 +882,128 @@ def distal_joint3_penalty(
         penalty = torch.where(in_manip, penalty, torch.zeros_like(penalty))
 
     return penalty
+
+
+# ==================== Hand Pose Following ====================
+
+
+def hand_pose_following(
+    env: ManagerBasedRLEnv,
+    grasp_pos_tol: float = 0.06,
+    grasp_rot_tol: float = 0.4,
+    manipulation_pos_tol: float = 0.10,
+    manipulation_rot_tol: float = 0.5,
+    release_pos_tol: float = 0.06,
+    release_rot_tol: float = 0.4,
+    gate_in_release: bool = True,
+    gate_start_threshold: float = 0.06,
+    gate_end_threshold: float = 0.12,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """
+    Reward for following hand (palm) pose trajectory.
+    
+    Uses exp(-error/tol) kernel with phase-varying tolerances:
+    - Grasp phase: tight tolerance (learn structured approach)
+    - Manipulation phase: loose tolerance (allow in-hand adjustment)
+    - Release phase: tight tolerance (ensure hand leaves properly)
+    
+    Also computes a gate factor stored on env.hand_pose_gate for gating other rewards.
+    The gate is active only during release phase and smoothly ramps from 1→0
+    as position error increases from gate_start_threshold to gate_end_threshold.
+    
+    Args:
+        env: The environment.
+        grasp_pos_tol: Position tolerance during grasp phase (meters).
+        grasp_rot_tol: Rotation tolerance during grasp phase (radians).
+        manipulation_pos_tol: Position tolerance during manipulation phase (meters).
+        manipulation_rot_tol: Rotation tolerance during manipulation phase (radians).
+        release_pos_tol: Position tolerance during release phase (meters).
+        release_rot_tol: Rotation tolerance during release phase (radians).
+        gate_in_release: If True, compute gate factor for other rewards.
+        gate_start_threshold: Position error where gate starts dropping (meters).
+        gate_end_threshold: Position error where gate reaches 0 (meters).
+        robot_cfg: Scene entity config for robot.
+    
+    Returns:
+        Reward tensor (num_envs,) in range [0, 1].
+    """
+    cfg = env.cfg.y2r_cfg
+    N = env.num_envs
+    
+    # If hand trajectory is disabled, return zeros and set gate to 1
+    if not cfg.hand_trajectory.enabled:
+        env.hand_pose_gate = torch.ones(N, device=env.device)
+        return torch.zeros(N, device=env.device)
+    
+    robot: Articulation = env.scene[robot_cfg.name]
+    trajectory_manager = env.trajectory_manager
+    
+    # Get palm body index (cache it)
+    if not hasattr(env, '_palm_body_idx'):
+        palm_ids = robot.find_bodies("palm_link")[0]
+        if len(palm_ids) == 0:
+            env.hand_pose_gate = torch.ones(N, device=env.device)
+            return torch.zeros(N, device=env.device)
+        env._palm_body_idx = palm_ids[0]
+    
+    palm_idx = env._palm_body_idx
+    
+    # Get actual palm pose in world frame
+    palm_pos_w = robot.data.body_pos_w[:, palm_idx]  # (N, 3)
+    palm_quat_w = robot.data.body_quat_w[:, palm_idx]  # (N, 4)
+    
+    # Get target palm pose from trajectory
+    hand_target = trajectory_manager.get_current_hand_target()  # (N, 7)
+    target_pos_w = hand_target[:, :3]  # (N, 3)
+    target_quat_w = hand_target[:, 3:7]  # (N, 4)
+    
+    # Compute errors
+    pos_error = (palm_pos_w - target_pos_w).norm(dim=-1)  # (N,)
+    rot_error = quat_error_magnitude(palm_quat_w, target_quat_w)  # (N,)
+    
+    # Get current phase (0=grasp, 1=manipulation, 2=release)
+    phase = trajectory_manager.get_phase()  # (N,)
+    
+    # Phase-varying tolerances
+    pos_tol = torch.where(
+        phase == 0, 
+        torch.full((N,), grasp_pos_tol, device=env.device),
+        torch.where(
+            phase == 1,
+            torch.full((N,), manipulation_pos_tol, device=env.device),
+            torch.full((N,), release_pos_tol, device=env.device)
+        )
+    )
+    rot_tol = torch.where(
+        phase == 0,
+        torch.full((N,), grasp_rot_tol, device=env.device),
+        torch.where(
+            phase == 1,
+            torch.full((N,), manipulation_rot_tol, device=env.device),
+            torch.full((N,), release_rot_tol, device=env.device)
+        )
+    )
+    
+    # Compute reward: exp(-error/tol) for position and rotation
+    pos_reward = torch.exp(-pos_error / pos_tol)
+    rot_reward = torch.exp(-rot_error / rot_tol)
+    reward = (pos_reward + rot_reward) / 2.0
+    
+    # Compute gate factor for release phase
+    if gate_in_release:
+        in_release = (phase == 2)
+        
+        # Linear ramp: 1.0 at start_threshold, 0.0 at end_threshold
+        gate_range = gate_end_threshold - gate_start_threshold
+        gate = 1.0 - (pos_error - gate_start_threshold) / gate_range
+        gate = gate.clamp(0.0, 1.0)
+        
+        # Only apply gate during release phase
+        gate = torch.where(in_release, gate, torch.ones_like(gate))
+        
+        env.hand_pose_gate = gate
+    else:
+        env.hand_pose_gate = torch.ones(N, device=env.device)
+    
+    return reward

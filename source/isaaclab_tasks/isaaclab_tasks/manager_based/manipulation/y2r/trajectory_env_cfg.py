@@ -677,6 +677,23 @@ def _build_rewards_cfg(cfg: Y2RConfig):
             },
         )
 
+        hand_pose_following = RewTerm(
+            func=mdp.hand_pose_following,
+            weight=cfg.rewards.hand_pose_following.weight,
+            params={
+                "grasp_pos_tol": cfg.rewards.hand_pose_following.params["grasp_pos_tol"],
+                "grasp_rot_tol": cfg.rewards.hand_pose_following.params["grasp_rot_tol"],
+                "manipulation_pos_tol": cfg.rewards.hand_pose_following.params["manipulation_pos_tol"],
+                "manipulation_rot_tol": cfg.rewards.hand_pose_following.params["manipulation_rot_tol"],
+                "release_pos_tol": cfg.rewards.hand_pose_following.params["release_pos_tol"],
+                "release_rot_tol": cfg.rewards.hand_pose_following.params["release_rot_tol"],
+                "gate_in_release": cfg.rewards.hand_pose_following.params["gate_in_release"],
+                "gate_start_threshold": cfg.rewards.hand_pose_following.params["gate_start_threshold"],
+                "gate_end_threshold": cfg.rewards.hand_pose_following.params["gate_end_threshold"],
+                "robot_cfg": SceneEntityCfg("robot"),
+            },
+        )
+
     return RewardsCfg()
 
 
@@ -784,7 +801,22 @@ class TrajectoryEnvCfg(ManagerBasedEnvCfg):
         
         # Simulation parameters
         self.decimation = cfg.simulation.decimation
-        self.episode_length_s = cfg.trajectory.duration
+        
+        # Compute episode duration dynamically based on mode
+        phases = cfg.trajectory.phases
+        if cfg.push_t.enabled:
+            self.episode_length_s = cfg.push_t.rolling_window
+        else:
+            max_keypoints = cfg.hand_trajectory.keypoints.count[1]
+            max_waypoints = cfg.waypoints.count[1]
+            self.episode_length_s = (
+                phases.grasp
+                + phases.manipulate_base
+                + phases.manipulate_per_keypoint * max_keypoints
+                + cfg.waypoints.pause_duration * max_waypoints  # Pause at each waypoint
+                + phases.hand_release
+            )
+        
         self.is_finite_horizon = True
         self.sim.dt = cfg.simulation.physics_dt
         self.sim.render_interval = self.decimation

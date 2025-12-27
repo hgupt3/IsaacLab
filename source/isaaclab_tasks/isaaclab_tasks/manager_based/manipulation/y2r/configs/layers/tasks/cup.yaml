@@ -3,6 +3,7 @@
 # ==============================================================================
 # Task definition only - no play/mode settings.
 # Pour bottle into cup (bottle-to-cup trajectory).
+# Duration comes from push_t.rolling_window, not phases.
 # ==============================================================================
 
 push_t:
@@ -17,13 +18,6 @@ push_t:
   goal_rotation: [0.707, -0.707, 0.0, 0.0]
   rolling_window: 3.0
   min_speed: 0.05
-
-trajectory:
-  duration: 6.0
-  phases:
-    pickup: 0.0
-    manipulate: 6.0
-    release: 0.0
 
 waypoints:
   count: [0, 0]

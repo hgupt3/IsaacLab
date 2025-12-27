@@ -1,0 +1,25 @@
+# ==============================================================================
+# Keyboard Debug Mode Layer
+# ==============================================================================
+# Minimal config for keyboard-controlled palm exploration.
+# Usage: Y2R_MODE=keyboard ./scripts/keyboard.sh
+# ==============================================================================
+
+simulation:
+  num_envs: 1
+
+terminations:
+  trajectory_deviation:
+    point_cloud_threshold: [2.00, 2.00]
+    position_threshold: [2.00, 2.00]
+    rotation_threshold: [3.14, 3.14]
+
+visualization:
+  pose_axes: true
+  targets: false
+  current_object: false
+  waypoint_region: false
+  goal_region: false
+  env_ids: null
+  debug_print_rewards: true
+
