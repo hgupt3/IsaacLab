@@ -320,6 +320,11 @@ def _build_observations_cfg(cfg: Y2RConfig):
             noise=Unoise(n_min=-0.0, n_max=0.0),
             clip=cfg.observations.clip_range,
         )
+        hand_pose_targets = ObsTerm(
+            func=mdp.hand_pose_targets_b,
+            noise=Unoise(n_min=-0.0, n_max=0.0),
+            clip=cfg.observations.clip_range,
+        )
 
         def __post_init__(self):
             self.enable_corruption = True
@@ -356,6 +361,11 @@ def _build_observations_cfg(cfg: Y2RConfig):
             noise=Unoise(n_min=-0.0, n_max=0.0),
             clip=cfg.observations.clip_range,
             params={},
+        )
+        hand_pose_targets = ObsTerm(
+            func=mdp.hand_pose_targets_b,
+            noise=Unoise(n_min=-0.0, n_max=0.0),
+            clip=cfg.observations.clip_range,
         )
 
         def __post_init__(self):
