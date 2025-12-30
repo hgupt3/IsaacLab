@@ -877,6 +877,10 @@ class target_sequence_obs_b(ManagerTermBase):
             self._init_visualizer()
         if self.visualize_waypoint_region or self.visualize_goal_region or self.visualize_pose_axes or self.visualize_hand_pose_targets:
             self._init_region_visualizer()
+        
+        # Cache palm body index for hand trajectory
+        palm_ids = self.ref_asset.find_bodies("palm_link")[0]
+        self._palm_body_idx = palm_ids[0] if len(palm_ids) > 0 else None
     
     def _init_visualizer(self):
         """Initialize visualization markers for targets + current object."""
@@ -1127,14 +1131,6 @@ class target_sequence_obs_b(ManagerTermBase):
             all_colors.extend([color] * E)
         
         # === Palm link axes (standard RGB, medium size) ===
-        # Get palm_link body index (cache it)
-        if not hasattr(self, '_palm_body_idx'):
-            palm_ids = self.ref_asset.find_bodies("palm_link")[0]
-            if len(palm_ids) > 0:
-                self._palm_body_idx = palm_ids[0]
-            else:
-                self._palm_body_idx = None
-        
         if self._palm_body_idx is not None:
             palm_pos_w = self.ref_asset.data.body_pos_w[:, self._palm_body_idx]  # (N, 3)
             palm_quat_w = self.ref_asset.data.body_quat_w[:, self._palm_body_idx]  # (N, 4)
@@ -1223,8 +1219,15 @@ class target_sequence_obs_b(ManagerTermBase):
             # Get environment origins
             env_origins = env.scene.env_origins[reset_ids]
             
+            # Get current palm poses for hand trajectory (if enabled)
+            start_palm_poses = None
+            if self.y2r_cfg.hand_trajectory.enabled and self._palm_body_idx is not None:
+                palm_pos = self.ref_asset.data.body_pos_w[reset_ids, self._palm_body_idx]
+                palm_quat = self.ref_asset.data.body_quat_w[reset_ids, self._palm_body_idx]
+                start_palm_poses = torch.cat([palm_pos, palm_quat], dim=-1)
+            
             # Scales are read once at trajectory_manager init from USD prims
-            self.trajectory_manager.reset(reset_ids, start_poses, env_origins)
+            self.trajectory_manager.reset(reset_ids, start_poses, env_origins, start_palm_poses)
         
         # Step trajectory (advance time)
         # For push-T mode: pass current object poses for replanning

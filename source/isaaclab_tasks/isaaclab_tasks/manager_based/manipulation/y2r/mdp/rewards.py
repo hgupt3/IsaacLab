@@ -24,7 +24,7 @@ def _get_hand_pose_gate(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Get hand pose gate factor, defaulting to 1.0 if not set.
     
     The gate is computed by hand_pose_following reward and stored on env.
-    During release phase, it ramps from 1→0 as hand deviates from target.
+    During grasp and release phases, it ramps from 1→0 as hand deviates from target.
     """
     if hasattr(env, 'hand_pose_gate'):
         return env.hand_pose_gate
@@ -909,7 +909,7 @@ def hand_pose_following(
     - Release phase: tight tolerance (ensure hand leaves properly)
     
     Also computes a gate factor stored on env.hand_pose_gate for gating other rewards.
-    The gate is active only during release phase and smoothly ramps from 1→0
+    The gate is active during grasp and release phases and smoothly ramps from 1→0
     as position error increases from gate_start_threshold to gate_end_threshold.
     
     Args:
@@ -990,17 +990,19 @@ def hand_pose_following(
     rot_reward = torch.exp(-rot_error / rot_tol)
     reward = (pos_reward + rot_reward) / 2.0
     
-    # Compute gate factor for release phase
+    # Compute gate factor for grasp and release phases
     if gate_in_release:
+        in_grasp = (phase == 0)
         in_release = (phase == 2)
+        in_gated_phase = in_grasp | in_release
         
         # Linear ramp: 1.0 at start_threshold, 0.0 at end_threshold
         gate_range = gate_end_threshold - gate_start_threshold
         gate = 1.0 - (pos_error - gate_start_threshold) / gate_range
         gate = gate.clamp(0.0, 1.0)
         
-        # Only apply gate during release phase
-        gate = torch.where(in_release, gate, torch.ones_like(gate))
+        # Only apply gate during grasp and release phases
+        gate = torch.where(in_gated_phase, gate, torch.ones_like(gate))
         
         env.hand_pose_gate = gate
     else:

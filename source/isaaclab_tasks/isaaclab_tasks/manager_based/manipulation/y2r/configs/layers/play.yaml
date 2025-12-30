@@ -34,3 +34,6 @@ terminations:
 simulation:
   num_envs: 4
 
+procedural_objects:
+  generation:
+    num_shapes: 10  

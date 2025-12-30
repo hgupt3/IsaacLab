@@ -197,16 +197,8 @@ class TrajectoryManager:
         
         # === Hand trajectory generation (if enabled) ===
         if self.cfg.hand_trajectory.enabled:
-            # Store starting palm pose
-            if start_palm_poses is not None:
-                self.start_palm_pose[env_ids] = start_palm_poses
-            else:
-                # Default: palm above object, facing down
-                default_palm_pos = start_poses[:, :3].clone()
-                default_palm_pos[:, 2] += 0.15  # 15cm above object
-                default_palm_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).expand(n, 4)
-                self.start_palm_pose[env_ids, :3] = default_palm_pos
-                self.start_palm_pose[env_ids, 3:7] = default_palm_quat
+            # Store starting palm pose (required when hand trajectory is enabled)
+            self.start_palm_pose[env_ids] = start_palm_poses
             
             # Sample grasp region and compute grasp pose
             grasp_pos, grasp_quat = self._sample_grasp_region(env_ids, start_poses)

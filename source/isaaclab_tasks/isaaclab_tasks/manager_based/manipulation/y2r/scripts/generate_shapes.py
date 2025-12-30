@@ -10,17 +10,17 @@ primitives. The shapes are exported as USD files with convex decomposition
 for proper collision detection.
 
 Usage:
-    # Generate shapes (default 100)
-    ./isaaclab.sh -p scripts/tools/generate_procedural_shapes.py
+    # Generate shapes (reads num_shapes from base.yaml config)
+    ./isaaclab.sh -p source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/y2r/scripts/generate_shapes.py
     
     # Force regeneration even if shapes exist
-    ./isaaclab.sh -p scripts/tools/generate_procedural_shapes.py --regenerate
+    ./isaaclab.sh -p source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/y2r/scripts/generate_shapes.py --regenerate
     
     # Generate specific number of shapes
-    ./isaaclab.sh -p scripts/tools/generate_procedural_shapes.py --num-shapes 200
+    ./isaaclab.sh -p source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/y2r/scripts/generate_shapes.py --num-shapes 200
     
     # Use specific seed for reproducibility
-    ./isaaclab.sh -p scripts/tools/generate_procedural_shapes.py --seed 42
+    ./isaaclab.sh -p source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/y2r/scripts/generate_shapes.py --seed 42
 """
 
 from __future__ import annotations
@@ -44,19 +44,13 @@ def main():
         "--num-shapes", "-n",
         type=int,
         default=None,
-        help="Number of shapes to generate (default: from config)",
+        help="Number of shapes to generate (default: from base.yaml config)",
     )
     parser.add_argument(
         "--seed", "-s",
         type=int,
         default=None,
         help="Random seed for reproducibility",
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="y2r_config",
-        help="Config name to use (default: y2r_config)",
     )
     args = parser.parse_args()
     
@@ -68,24 +62,26 @@ def main():
     simulation_app = SimulationApp({"headless": True})
     
     # Now we can import Isaac Lab modules
+    from dataclasses import asdict
+    
+    # Import from y2r package (works because we're in the package)
     from isaaclab_tasks.manager_based.manipulation.y2r.config_loader import get_config
     from isaaclab_tasks.manager_based.manipulation.y2r.procedural_shapes import generate_procedural_shapes
     
-    # Load config
-    from dataclasses import asdict
-    cfg = get_config(args.config)
+    # Get y2r directory (this script is in y2r/scripts/)
+    y2r_dir = Path(__file__).parent.parent
+    
+    # Load config from base.yaml
+    cfg = get_config()
     proc_cfg = asdict(cfg.procedural_objects)
     
     # Override with command line args
     if args.regenerate:
         proc_cfg["regenerate"] = True
     if args.num_shapes is not None:
-        proc_cfg.setdefault("generation", {})["num_shapes"] = args.num_shapes
+        proc_cfg["generation"]["num_shapes"] = args.num_shapes
     if args.seed is not None:
-        proc_cfg.setdefault("generation", {})["seed"] = args.seed
-    
-    # Get y2r directory
-    y2r_dir = Path(__file__).parent.parent.parent / "source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/y2r"
+        proc_cfg["generation"]["seed"] = args.seed
     
     # Check if shapes already exist
     asset_dir = y2r_dir / proc_cfg.get("asset_dir", "assets/procedural")

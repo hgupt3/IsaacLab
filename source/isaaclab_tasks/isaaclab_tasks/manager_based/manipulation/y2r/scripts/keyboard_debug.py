@@ -13,8 +13,8 @@ Uses the full y2r environment with all visualization features.
 Controls:
     WASDQE  - Move palm (X/Y/Z)
     ZXTGCV  - Rotate palm (roll/pitch/yaw)
-    K       - Toggle gripper open/close
-    L       - Reset pose
+    J/K     - Close/Open gripper (eigengrasp)
+    R       - Reset pose
     ESC     - Quit
 
 Usage:
@@ -47,6 +47,9 @@ import torch
 import time
 from scipy.spatial.transform import Rotation as R
 
+import carb
+import omni
+
 # Isaac Lab imports
 from isaaclab.controllers.differential_ik import DifferentialIKController
 from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
@@ -59,6 +62,9 @@ from isaaclab.utils.math import (
 # Import tasks to register them
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils.hydra import hydra_task_config
+
+# Import eigengrasp PCA matrix
+from isaaclab_tasks.manager_based.manipulation.y2r.mdp.actions import ALLEGRO_PCA_MATRIX
 
 from isaaclab.envs import ManagerBasedRLEnvCfg, DirectRLEnvCfg, DirectMARLEnvCfg
 
@@ -103,6 +109,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     arm_joint_ids, _ = robot.find_joints(arm_joint_names, preserve_order=True)
     arm_joint_ids = list(arm_joint_ids)
     
+    # Find hand joint IDs (16 joints for Allegro)
+    hand_joint_names = [
+        "index_joint_0", "index_joint_1", "index_joint_2", "index_joint_3",
+        "middle_joint_0", "middle_joint_1", "middle_joint_2", "middle_joint_3",
+        "ring_joint_0", "ring_joint_1", "ring_joint_2", "ring_joint_3",
+        "thumb_joint_0", "thumb_joint_1", "thumb_joint_2", "thumb_joint_3",
+    ]
+    hand_joint_ids, _ = robot.find_joints(hand_joint_names, preserve_order=True)
+    hand_joint_ids = list(hand_joint_ids)
+    
+    # Get first eigengrasp basis (primary open/close synergy)
+    eigen_basis = ALLEGRO_PCA_MATRIX[0].to(device)  # Shape: (16,)
+    
+    # Eigengrasp coefficient state (positive = close, negative = open)
+    eigen_coeff = torch.zeros(1, device=device)
+    eigen_speed = 0.02  # Coefficient change per frame when key held
+    eigen_range = [-2.0, 2.0]  # Min/max coefficient range
+    
     # Setup IK controller - ABSOLUTE mode (tracks fixed target)
     ik_cfg = DifferentialIKControllerCfg(
         command_type="pose",
@@ -140,6 +164,33 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Add callback for 'R' key using Se3Keyboard's built-in mechanism
     se3_keyboard.add_callback("R", on_reset_key)
     
+    # Gripper key states (J = close, K = open) - track press/release for continuous control
+    # Note: Using K for open since L is used for reset in Se3Keyboard
+    gripper_delta = [0.0]  # Mutable container for closure access
+    
+    def on_gripper_keyboard_event(event, *args):
+        """Handle J/K keys for continuous gripper control (eigengrasp)."""
+        if event.type == carb.input.KeyboardEventType.KEY_PRESS:
+            if event.input.name == "J":
+                gripper_delta[0] += eigen_speed  # Close (positive eigen coeff)
+            elif event.input.name == "K":
+                gripper_delta[0] -= eigen_speed  # Open (negative eigen coeff)
+        elif event.type == carb.input.KeyboardEventType.KEY_RELEASE:
+            if event.input.name == "J":
+                gripper_delta[0] -= eigen_speed  # Stop closing
+            elif event.input.name == "K":
+                gripper_delta[0] += eigen_speed  # Stop opening
+        return True
+    
+    # Subscribe to keyboard events for gripper control
+    appwindow = omni.appwindow.get_default_app_window()
+    kb_input = carb.input.acquire_input_interface()
+    keyboard = appwindow.get_keyboard()
+    gripper_kb_sub = kb_input.subscribe_to_keyboard_events(
+        keyboard,
+        lambda event, *args: on_gripper_keyboard_event(event, *args),
+    )
+    
     # Timing for periodic prints
     last_print_time = time.time()
     print_interval = 1.0  # Print every 1 second
@@ -154,7 +205,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print("  Z/X     - Roll (around X)")
     print("  T/G     - Pitch (around Y)")
     print("  C/V     - Yaw (around Z)")
-    print("  K       - Toggle gripper open/close")
+    print("  J       - Close gripper (hold)")
+    print("  K       - Open gripper (hold)")
     print("  R       - Reset to default pose")
     print("  ESC     - Quit")
     print("=" * 60 + "\n")
@@ -186,6 +238,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if reset_state["pressed"]:
             target_pos_b = default_pos_b.clone()
             target_quat_b = default_quat_b.clone()
+            eigen_coeff.zero_()  # Reset gripper to default
             reset_state["pressed"] = False
             print("[INFO] Reset to default pose")
         
@@ -229,8 +282,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # Compute error from current to target
         pos_error = (target_pos_b - palm_pos_b).norm().item()
         
-        # Set joint position targets
+        # Set arm joint position targets
         robot.set_joint_position_target(arm_target, joint_ids=arm_joint_ids)
+        
+        # Update eigengrasp coefficient based on gripper delta
+        eigen_coeff += gripper_delta[0]
+        eigen_coeff.clamp_(eigen_range[0], eigen_range[1])
+        
+        # Compute hand joint targets from eigengrasp
+        # hand_target = default_pos + eigen_coeff * eigen_basis
+        default_hand_pos = robot.data.default_joint_pos[:, hand_joint_ids]  # (1, 16)
+        hand_delta = eigen_coeff * eigen_basis  # (1,) * (16,) = (16,)
+        hand_target = default_hand_pos + hand_delta.unsqueeze(0)  # (1, 16)
+        
+        # Set hand joint position targets
+        robot.set_joint_position_target(hand_target, joint_ids=hand_joint_ids)
         
         # Step simulation
         unwrapped_env.scene.write_data_to_sim()
@@ -243,7 +309,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if current_time - last_print_time >= print_interval:
             roll, pitch, yaw = quat_to_euler_deg(palm_quat_w[0])
             print(f"[Step {step_count:6d}] Palm: ({palm_pos_w[0,0]:.3f}, {palm_pos_w[0,1]:.3f}, {palm_pos_w[0,2]:.3f}) | "
-                  f"Euler: ({roll:.1f}, {pitch:.1f}, {yaw:.1f}) | Error: {pos_error*100:.1f}cm")
+                  f"Euler: ({roll:.1f}, {pitch:.1f}, {yaw:.1f}) | Error: {pos_error*100:.1f}cm | "
+                  f"Grip: {eigen_coeff.item():.2f}")
             last_print_time = current_time
     
     # Cleanup

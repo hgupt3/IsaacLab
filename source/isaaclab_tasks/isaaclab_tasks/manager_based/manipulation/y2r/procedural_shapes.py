@@ -12,7 +12,7 @@ Generates random objects by hierarchically attaching primitives:
 
 Usage:
     # Generate shapes (run once with Isaac Sim)
-    ./isaaclab.sh -p scripts/tools/generate_procedural_shapes.py
+    ./isaaclab.sh -p source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/y2r/scripts/generate_shapes.py
     
     # Then train as normal
     ./isaaclab.sh -p scripts/rl_games/train.py task=Isaac-Y2R-Kuka-Allegro-v0
@@ -65,9 +65,9 @@ def get_procedural_shape_paths(cfg, y2r_dir: Path) -> list[Path]:
             f"  Found: {len(existing)} in {asset_dir}\n"
             f"\n"
             f"Please generate shapes first by running:\n"
-            f"  ./isaaclab.sh -p scripts/tools/generate_procedural_shapes.py\n"
+            f"  ./isaaclab.sh -p source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/y2r/scripts/generate_shapes.py\n"
             f"\n"
-            f"Or disable procedural objects in y2r_config.yaml:\n"
+            f"Or disable procedural objects in configs/base.yaml:\n"
             f"  procedural_objects:\n"
             f"    enabled: false"
         )
@@ -207,7 +207,12 @@ def grow_object(cfg: dict[str, Any], rng=None):
     else:
         result = primitives[0]
         for mesh in primitives[1:]:
-            result = result.union(mesh, engine="manifold")
+            try:
+                result = result.union(mesh, engine="manifold")
+            except (ValueError, Exception):
+                # Boolean failed (non-volume mesh) - abort this shape
+                np.random.set_state(old_state)
+                return None
     
     # Clean up mesh
     result.merge_vertices()
@@ -218,6 +223,7 @@ def grow_object(cfg: dict[str, Any], rng=None):
     # Center at origin
     result.vertices -= result.centroid
     
+    np.random.set_state(old_state)
     return result
     
 def generate_procedural_shapes(cfg: dict[str, Any], y2r_dir: Path) -> list[Path]:
@@ -251,9 +257,17 @@ def generate_procedural_shapes(cfg: dict[str, Any], y2r_dir: Path) -> list[Path]
         rng = np.random.default_rng()
     
     generated = []
-    for i in range(num_shapes):
-        # Generate mesh
+    i = 0
+    failures = 0
+    max_failures = num_shapes * 3  # Prevent infinite loop
+    
+    while len(generated) < num_shapes and failures < max_failures:
+        # Generate mesh (may return None if boolean fails)
         mesh = grow_object(gen_cfg, rng)
+        
+        if mesh is None:
+            failures += 1
+            continue
         
         # Export - try USD first, fallback to OBJ
         output_path = asset_dir / f"shape_{i:03d}.usd"
@@ -262,15 +276,20 @@ def generate_procedural_shapes(cfg: dict[str, Any], y2r_dir: Path) -> list[Path]
         # Track what was actually created
         if output_path.exists():
             generated.append(output_path)
+            i += 1
         else:
             obj_path = output_path.with_suffix(".obj")
             if obj_path.exists():
                 generated.append(obj_path)
+                i += 1
+            else:
+                failures += 1
+                continue
         
-        if (i + 1) % 10 == 0:
-            print(f"  Generated {i + 1}/{num_shapes} shapes")
+        if len(generated) % 10 == 0:
+            print(f"  Generated {len(generated)}/{num_shapes} shapes (skipped {failures})")
     
-    print(f"Generated {len(generated)} procedural shapes")
+    print(f"Generated {len(generated)} procedural shapes (skipped {failures} failed attempts)")
     return generated
 
 
