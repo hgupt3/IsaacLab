@@ -96,13 +96,13 @@ class DifficultyScheduler(ManagerTermBase):
         
         # Get current success thresholds from reward manager (already curriculum-adjusted)
         success_cfg = env.reward_manager.get_term_cfg("trajectory_success")
-        current_error_threshold = success_cfg.params.get("error_threshold", 0.02)
-        current_rot_threshold = success_cfg.params.get("rot_threshold", 0.2)
+        current_pos_threshold = success_cfg.params.get("pos_threshold", 0.05)
+        current_rot_threshold = success_cfg.params.get("rot_threshold", 0.3)
         
         # Use provided tolerances or fall back to current success thresholds
-        effective_pos_tol = pos_tol if pos_tol is not None else current_error_threshold
+        effective_pos_tol = pos_tol if pos_tol is not None else current_pos_threshold
         effective_rot_tol = rot_tol if rot_tol is not None else current_rot_threshold
-        effective_pc_tol = pc_tol if pc_tol is not None else current_error_threshold
+        effective_pc_tol = pc_tol if pc_tol is not None else current_pos_threshold
         
         # Check if in release phase
         in_release = trajectory_manager.is_in_release_phase()[env_ids]

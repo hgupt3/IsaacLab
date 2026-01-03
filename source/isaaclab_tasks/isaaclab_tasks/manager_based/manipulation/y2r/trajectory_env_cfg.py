@@ -26,6 +26,7 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import ContactSensorCfg
 from isaaclab.sim import CapsuleCfg, ConeCfg, CuboidCfg, CylinderCfg, RigidBodyMaterialCfg, SphereCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
@@ -160,6 +161,7 @@ def _build_object_cfg(cfg: Y2RConfig) -> RigidObjectCfg:
             ),
             collision_props=sim_utils.CollisionPropertiesCfg(),
             mass_props=sim_utils.MassPropertiesCfg(mass=0.2),
+            activate_contact_sensors=True,  # Required for object_table_contact sensor
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=(-0.55, 0.0, 0.45)),
     )
@@ -184,6 +186,7 @@ class TrajectorySceneCfg(InteractiveSceneCfg):
             ),
             collision_props=sim_utils.CollisionPropertiesCfg(),
             mass_props=sim_utils.MassPropertiesCfg(mass=0.2),
+            activate_contact_sensors=True,  # Required for object_table_contact sensor
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=(-0.55, 0.0, 0.45)),
     )
@@ -219,6 +222,12 @@ class TrajectorySceneCfg(InteractiveSceneCfg):
 
     # Visual outline for push-T mode (set dynamically in TrajectoryEnvCfg_PUSH)
     outline: AssetBaseCfg | None = None
+    
+    # Object-table contact sensor (for detecting stable placement during release)
+    object_table_contact: ContactSensorCfg = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Object",
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/table"],
+    )
 
 
 @configclass
@@ -561,6 +570,28 @@ def _build_rewards_cfg(cfg: Y2RConfig):
     class RewardsCfg:
         """Reward terms for the MDP."""
 
+        # MUST BE FIRST - computes hand_pose_gate used by other rewards
+        # (lookahead_tracking, trajectory_success, finger_manipulation, tracking_progress)
+        hand_pose_following = RewTerm(
+            func=mdp.hand_pose_following,
+            weight=cfg.rewards.hand_pose_following.weight,
+            params={
+                "grasp_pos_tol": cfg.rewards.hand_pose_following.params["grasp_pos_tol"],
+                "grasp_rot_tol": cfg.rewards.hand_pose_following.params["grasp_rot_tol"],
+                "manipulation_pos_tol": cfg.rewards.hand_pose_following.params["manipulation_pos_tol"],
+                "manipulation_rot_tol": cfg.rewards.hand_pose_following.params["manipulation_rot_tol"],
+                "release_pos_tol": cfg.rewards.hand_pose_following.params["release_pos_tol"],
+                "release_rot_tol": cfg.rewards.hand_pose_following.params["release_rot_tol"],
+                "gate_in_release": cfg.rewards.hand_pose_following.params["gate_in_release"],
+                "gate_start_threshold": cfg.rewards.hand_pose_following.params["gate_start_threshold"],
+                "gate_end_threshold": cfg.rewards.hand_pose_following.params["gate_end_threshold"],
+                "gate_rot_start_threshold": cfg.rewards.hand_pose_following.params["gate_rot_start_threshold"],
+                "gate_rot_end_threshold": cfg.rewards.hand_pose_following.params["gate_rot_end_threshold"],
+                "gate_floor": cfg.rewards.hand_pose_following.params["gate_floor"],
+                "robot_cfg": SceneEntityCfg("robot"),
+            },
+        )
+
         action_l2 = RewTerm(
             func=mdp.action_l2_clamped,
             weight=cfg.rewards.action_l2.weight,
@@ -588,6 +619,7 @@ def _build_rewards_cfg(cfg: Y2RConfig):
                 "error_gate_pos_slope": cfg.rewards.fingers_to_object.params["error_gate_pos_slope"],
                 "error_gate_rot_threshold": cfg.rewards.fingers_to_object.params["error_gate_rot_threshold"],
                 "error_gate_rot_slope": cfg.rewards.fingers_to_object.params["error_gate_rot_slope"],
+                "disable_in_release": cfg.rewards.fingers_to_object.disable_in_release,
             },
         )
 
@@ -606,6 +638,7 @@ def _build_rewards_cfg(cfg: Y2RConfig):
                 "neg_scale": cfg.rewards.lookahead_tracking.params["neg_scale"],
                 "rot_neg_threshold": cfg.rewards.lookahead_tracking.params["rot_neg_threshold"],
                 "rot_neg_std": cfg.rewards.lookahead_tracking.params["rot_neg_std"],
+                "disable_in_release": cfg.rewards.lookahead_tracking.disable_in_release,
             },
         )
 
@@ -613,8 +646,14 @@ def _build_rewards_cfg(cfg: Y2RConfig):
             func=mdp.trajectory_success,
             weight=cfg.rewards.trajectory_success.weight,
             params={
-                "error_threshold": cfg.rewards.trajectory_success.params["point_cloud_threshold"][0],
-                "rot_threshold": cfg.rewards.trajectory_success.params["rotation_threshold"][0],
+                "pos_threshold": cfg.rewards.trajectory_success.params["pos_threshold"][0],
+                "rot_threshold": cfg.rewards.trajectory_success.params["rot_threshold"][0],
+                "pos_std": cfg.rewards.trajectory_success.params["pos_std"],
+                "rot_std": cfg.rewards.trajectory_success.params["rot_std"],
+                "sparse_weight": cfg.rewards.trajectory_success.params["sparse_weight"],
+                "contact_gate_threshold": cfg.rewards.trajectory_success.params["contact_gate_threshold"],
+                "contact_gate_ramp": cfg.rewards.trajectory_success.params["contact_gate_ramp"],
+                "contact_gate_floor": cfg.rewards.trajectory_success.params["contact_gate_floor"],
             },
         )
 
@@ -641,6 +680,7 @@ def _build_rewards_cfg(cfg: Y2RConfig):
             params={
                 "pos_std": cfg.rewards.finger_manipulation.params["pos_std"],
                 "rot_std": cfg.rewards.finger_manipulation.params["rot_std"],
+                "disable_in_release": cfg.rewards.finger_manipulation.disable_in_release,
                 "robot_cfg": SceneEntityCfg("robot"),
                 "object_cfg": SceneEntityCfg("object"),
             },
@@ -684,22 +724,17 @@ def _build_rewards_cfg(cfg: Y2RConfig):
                 "rot_weight": cfg.rewards.tracking_progress.params["rot_weight"],
                 "positive_only": cfg.rewards.tracking_progress.params["positive_only"],
                 "clip": cfg.rewards.tracking_progress.params["clip"],
+                "disable_in_release": cfg.rewards.tracking_progress.disable_in_release,
             },
         )
 
-        hand_pose_following = RewTerm(
-            func=mdp.hand_pose_following,
-            weight=cfg.rewards.hand_pose_following.weight,
+        finger_release = RewTerm(
+            func=mdp.finger_release,
+            weight=cfg.rewards.finger_release.weight,
             params={
-                "grasp_pos_tol": cfg.rewards.hand_pose_following.params["grasp_pos_tol"],
-                "grasp_rot_tol": cfg.rewards.hand_pose_following.params["grasp_rot_tol"],
-                "manipulation_pos_tol": cfg.rewards.hand_pose_following.params["manipulation_pos_tol"],
-                "manipulation_rot_tol": cfg.rewards.hand_pose_following.params["manipulation_rot_tol"],
-                "release_pos_tol": cfg.rewards.hand_pose_following.params["release_pos_tol"],
-                "release_rot_tol": cfg.rewards.hand_pose_following.params["release_rot_tol"],
-                "gate_in_release": cfg.rewards.hand_pose_following.params["gate_in_release"],
-                "gate_start_threshold": cfg.rewards.hand_pose_following.params["gate_start_threshold"],
-                "gate_end_threshold": cfg.rewards.hand_pose_following.params["gate_end_threshold"],
+                "scale": cfg.rewards.finger_release.params["scale"],
+                "arm_joint_count": cfg.robot.arm_joint_count,
+                "hand_joint_count": cfg.robot.hand_joint_count,
                 "robot_cfg": SceneEntityCfg("robot"),
             },
         )
@@ -817,13 +852,15 @@ class TrajectoryEnvCfg(ManagerBasedEnvCfg):
         if cfg.push_t.enabled:
             self.episode_length_s = cfg.push_t.rolling_window
         else:
-            max_keypoints = cfg.hand_trajectory.keypoints.count[1]
             max_waypoints = cfg.waypoints.count[1]
+            settle_duration = getattr(phases, 'settle', 0.0)
+            # Per-waypoint time = movement + pause
+            waypoint_duration = cfg.waypoints.movement_duration + cfg.waypoints.pause_duration
             self.episode_length_s = (
                 phases.grasp
                 + phases.manipulate_base
-                + phases.manipulate_per_keypoint * max_keypoints
-                + cfg.waypoints.pause_duration * max_waypoints  # Pause at each waypoint
+                + waypoint_duration * max_waypoints  # Movement + pause per waypoint
+                + settle_duration  # Settle phase before retreat
                 + phases.hand_release
             )
         
@@ -874,6 +911,7 @@ class TrajectoryEnvCfg(ManagerBasedEnvCfg):
                 ),
                 collision_props=sim_utils.CollisionPropertiesCfg(),
                 mass_props=sim_utils.MassPropertiesCfg(mass=0.2),
+                activate_contact_sensors=True,  # Required for object_table_contact sensor
             ),
             init_state=RigidObjectCfg.InitialStateCfg(
                 pos=(-0.55, 0.0, object_z),

@@ -66,13 +66,15 @@ class TrajectoryManager:
         if cfg.push_t.enabled:
             self.total_duration = cfg.push_t.rolling_window
         else:
-            max_keypoints = cfg.hand_trajectory.keypoints.count[1]
             max_waypoints = cfg.waypoints.count[1]
+            settle_duration = getattr(traj.phases, 'settle', 0.0)
+            # Per-waypoint time = movement + pause
+            waypoint_duration = cfg.waypoints.movement_duration + cfg.waypoints.pause_duration
             self.total_duration = (
                 traj.phases.grasp
                 + traj.phases.manipulate_base
-                + traj.phases.manipulate_per_keypoint * max_keypoints
-                + cfg.waypoints.pause_duration * max_waypoints  # Pause at each waypoint
+                + waypoint_duration * max_waypoints  # Movement + pause per waypoint
+                + settle_duration  # Settle phase before retreat
                 + traj.phases.hand_release
             )
         
@@ -195,6 +197,12 @@ class TrajectoryManager:
         # Sample goal (use start_poses Z for stable placement)
         self._sample_goal(env_ids, env_origins, start_poses)
         
+        # Sample waypoint count early (needed for grasp keypoint hemisphere constraint)
+        wp_cfg = self.cfg.waypoints
+        self.num_waypoints[env_ids] = torch.randint(
+            wp_cfg.count[0], wp_cfg.count[1] + 1, (len(env_ids),), device=self.device
+        )
+        
         # === Hand trajectory generation (if enabled) ===
         if self.cfg.hand_trajectory.enabled:
             # Store starting palm pose (required when hand trajectory is enabled)
@@ -305,10 +313,6 @@ class TrajectoryManager:
         wp_cfg = cfg.waypoints
         ws_cfg = cfg.workspace
         
-        # Random number of waypoints
-        self.num_waypoints[env_ids] = torch.randint(
-            wp_cfg.count[0], wp_cfg.count[1] + 1, (n,), device=self.device
-        )
         
         # Convert start to local frame for clamping
         start_local = start_poses[:, :3] - env_origins
@@ -582,11 +586,15 @@ class TrajectoryManager:
         Each keypoint is perturbed from the previous one (not from initial).
         Stored as transforms relative to object.
         
+        When num_waypoints == 0 (object stays still), keypoints are constrained
+        to the top hemisphere (Z > 0 in object-local frame) to avoid table collision.
+        
         Args:
             env_ids: Environment indices.
         """
         n = len(env_ids)
         cfg = self.cfg.hand_trajectory.keypoints
+        grasp_cfg = self.cfg.hand_trajectory.grasp_sampling
         
         # Random number of keypoints per env
         self.num_grasp_keypoints[env_ids] = torch.randint(
@@ -596,6 +604,10 @@ class TrajectoryManager:
         max_kp = cfg.count[1]
         if max_kp == 0:
             return
+        
+        # Check which envs need hemisphere constraint (no waypoints = object stays on table)
+        num_wp = self.num_waypoints[env_ids]  # (n,)
+        needs_hemisphere_constraint = (num_wp == 0)  # (n,) bool
         
         # Start from initial grasp pose
         prev_pos = self.grasp_pose[env_ids, :3].clone()  # (n, 3) relative to object
@@ -607,7 +619,21 @@ class TrajectoryManager:
                 -cfg.pos_perturbation, cfg.pos_perturbation, (n, 3), self.device
             )
             pos_delta[:, 2] *= 0.5  # Less vertical perturbation
+            
+            # Apply hemisphere constraint: for envs with no waypoints,
+            # ensure keypoint stays in top hemisphere (Z > 0 in object-local frame)
+            # Similar to exclude_bottom_fraction for grasp sampling
             new_pos = prev_pos + pos_delta
+            
+            if needs_hemisphere_constraint.any():
+                # Clamp Z to stay above object center (top hemisphere)
+                # Use same fraction as grasp sampling for consistency
+                min_z = -grasp_cfg.exclude_bottom_fraction * 0.5  # Small margin below center
+                new_pos[:, 2] = torch.where(
+                    needs_hemisphere_constraint,
+                    new_pos[:, 2].clamp(min=min_z),
+                    new_pos[:, 2]
+                )
             
             # Rotation perturbation (small euler angles)
             euler_delta = sample_uniform(
@@ -692,10 +718,18 @@ class TrajectoryManager:
         max_wp = cfg.waypoints.count[1]
         
         # Manipulation duration matches object trajectory (fixed, not per-env)
+        # Duration scales with waypoints only, keypoints are spread within the fixed time
         manip_base = phases.manipulate_base
-        manip_per_kp = phases.manipulate_per_keypoint
+        movement_duration = cfg.waypoints.movement_duration
         pause_duration = cfg.waypoints.pause_duration
-        manip_duration = manip_base + manip_per_kp * max_kp + pause_duration * max_wp
+        waypoint_duration = movement_duration + pause_duration  # Per-waypoint time
+        manip_duration = manip_base + waypoint_duration * max_wp
+        
+        # Settle phase duration (hand stays still, fingers can open)
+        settle_duration = getattr(phases, 'settle', 0.0)
+        
+        # Release ease-in power (slow start, fast end)
+        release_ease_power = getattr(cfg.trajectory, 'release_ease_power', 2.0)
         
         # Time array
         times = torch.arange(T, device=self.device).float() * self.target_dt  # (T,)
@@ -704,7 +738,8 @@ class TrajectoryManager:
         # Phase boundaries (consistent across all envs)
         t_grasp_end = grasp_duration
         t_manip_end = t_grasp_end + manip_duration  # scalar, not per-env
-        t_release_end = t_manip_end + release_duration
+        t_settle_end = t_manip_end + settle_duration  # End of settle phase
+        t_release_end = t_settle_end + release_duration
         
         # Initialize trajectory
         positions = torch.zeros(n, T, 3, device=self.device)
@@ -757,20 +792,52 @@ class TrajectoryManager:
         manip_time = (times - t_grasp_end).clamp(min=0.0)  # (n, T)
         manip_progress = (manip_time / manip_duration).clamp(0.0, 1.0)  # (n, T)
         
-        # Build padded keypoint chain: [grasp_pose, kp_0, kp_1, ..., kp_{max-1}]
-        # Shape: (n, max_kp + 1, 7)
-        kp_chain = torch.zeros(n, max_kp + 1, 7, device=self.device)
+        # Build PALINDROME keypoint chain: [grasp, kp_0, ..., kp_N, ..., kp_0, grasp]
+        # For N keypoints: grasp → kp_0 → ... → kp_{N-1} → kp_{N-2} → ... → kp_0 → grasp
+        # Max chain length = 2 * max_kp + 1 (handles all cases including N=0)
+        # N=0: [grasp, grasp] (1 segment)
+        # N=1: [grasp, kp_0, grasp] (2 segments)
+        # N=2: [grasp, kp_0, kp_1, kp_0, grasp] (4 segments)
+        # N=3: [grasp, kp_0, kp_1, kp_2, kp_1, kp_0, grasp] (6 segments)
+        max_chain_len = max(2, 2 * max_kp + 1)
+        kp_chain = torch.zeros(n, max_chain_len, 7, device=self.device)
+        
+        # Position 0: grasp pose
         kp_chain[:, 0, :3] = grasp_pos
         kp_chain[:, 0, 3:7] = grasp_quat
-        if max_kp > 0:
-            kp_chain[:, 1:, :] = keypoints
         
-        # Number of segments per env (at least 1)
-        num_segments = (num_kp + 1).float().clamp(min=1.0)  # (n,)
+        if max_kp > 0:
+            # Forward pass: positions 1 to max_kp (kp_0 to kp_{max_kp-1})
+            kp_chain[:, 1:max_kp+1, :] = keypoints
+            
+            # Backward pass: positions max_kp+1 to 2*max_kp-1 (kp_{max_kp-2} to kp_0)
+            # Only needed if max_kp > 1
+            if max_kp > 1:
+                for i in range(max_kp - 1):
+                    # Position max_kp+1+i gets keypoint max_kp-2-i
+                    kp_chain[:, max_kp + 1 + i, :] = keypoints[:, max_kp - 2 - i, :]
+            
+            # Final position: grasp pose again
+            kp_chain[:, 2 * max_kp, :3] = grasp_pos
+            kp_chain[:, 2 * max_kp, 3:7] = grasp_quat
+        else:
+            # No keypoints: just [grasp, grasp]
+            kp_chain[:, 1, :3] = grasp_pos
+            kp_chain[:, 1, 3:7] = grasp_quat
+        
+        # Number of segments per env for palindrome traversal
+        # N=0: 1 segment (grasp → grasp)
+        # N>=1: 2*N segments
+        num_segments = torch.where(
+            num_kp == 0,
+            torch.ones_like(num_kp.float()),
+            (2 * num_kp).float()
+        )  # (n,)
         
         # Compute segment index for each timestep: (n, T)
         seg_idx = (manip_progress * num_segments.unsqueeze(1)).long()
-        seg_idx = seg_idx.clamp(0, max_kp)  # Clamp to valid range
+        max_seg_idx = max(1, 2 * max_kp - 1)  # Maximum valid segment index
+        seg_idx = seg_idx.clamp(0, max_seg_idx)
         
         # Local progress within segment
         seg_start = seg_idx.float() / num_segments.unsqueeze(1)  # (n, T)
@@ -778,19 +845,27 @@ class TrajectoryManager:
         seg_duration = seg_end - seg_start
         local_progress = ((manip_progress - seg_start) / seg_duration.clamp(min=1e-6)).clamp(0.0, 1.0)  # (n, T)
         
-        # Get "from" and "to" keypoints using advanced indexing
+        # Map segment index to chain index for "from" pose
+        # For env with num_kp keypoints, chain indices are:
+        # 0=grasp, 1=kp_0, ..., num_kp=kp_{num_kp-1}, num_kp+1=kp_{num_kp-2}, ..., 2*num_kp=grasp
+        # Segment 0: from idx 0, to idx 1
+        # Segment 1: from idx 1, to idx 2
+        # ...
         batch_idx = torch.arange(n, device=self.device).unsqueeze(1).expand(n, T)  # (n, T)
         
-        from_pos = kp_chain[batch_idx, seg_idx, :3]  # (n, T, 3)
-        from_quat = kp_chain[batch_idx, seg_idx, 3:7]  # (n, T, 4)
+        from_chain_idx = seg_idx  # Segment i starts at chain position i
+        to_chain_idx = seg_idx + 1  # Segment i ends at chain position i+1
         
-        # "to" is next keypoint, but clamped to last valid one
-        to_idx = (seg_idx + 1).clamp(max=max_kp)
-        # For envs with 0 keypoints, to_idx should point to grasp_pose (idx 0)
-        to_idx = torch.where(num_kp.unsqueeze(1) == 0, torch.zeros_like(to_idx), to_idx)
+        # Clamp to valid chain range per env
+        # For env with num_kp keypoints, max chain idx = 2*num_kp (or 1 if num_kp=0)
+        max_chain_idx_per_env = torch.where(num_kp == 0, torch.ones_like(num_kp), 2 * num_kp)  # (n,)
+        from_chain_idx = from_chain_idx.clamp(max=max_chain_idx_per_env.unsqueeze(1).expand(n, T))
+        to_chain_idx = to_chain_idx.clamp(max=max_chain_idx_per_env.unsqueeze(1).expand(n, T))
         
-        to_pos = kp_chain[batch_idx, to_idx, :3]  # (n, T, 3)
-        to_quat = kp_chain[batch_idx, to_idx, 3:7]  # (n, T, 4)
+        from_pos = kp_chain[batch_idx, from_chain_idx, :3]  # (n, T, 3)
+        from_quat = kp_chain[batch_idx, from_chain_idx, 3:7]  # (n, T, 4)
+        to_pos = kp_chain[batch_idx, to_chain_idx, :3]  # (n, T, 3)
+        to_quat = kp_chain[batch_idx, to_chain_idx, 3:7]  # (n, T, 4)
         
         # Interpolate position
         lp = local_progress.unsqueeze(-1)  # (n, T, 1)
@@ -812,19 +887,15 @@ class TrajectoryManager:
         positions = torch.where(manip_mask.unsqueeze(-1), manip_pos, positions)
         orientations = torch.where(manip_mask.unsqueeze(-1), manip_quat, orientations)
         
-        # === Phase 3: Release (interpolate to release pose) ===
-        release_mask = times >= t_manip_end
-        release_progress = ((times - t_manip_end) / release_duration).clamp(0.0, 1.0)
-        
-        # Get final manipulation pose (last keypoint or grasp_pose if no keypoints)
-        # Use kp_chain built above: index is num_kp (last keypoint) or 0 if no keypoints
-        final_kp_idx = num_kp.clamp(max=max_kp)  # (n,)
+        # === Phase 3: Settle (hand stays at final manipulation pose) ===
+        # With palindrome, final manipulation pose is always grasp_pose (we return to start)
+        # Final chain index = 2*num_kp for envs with keypoints, or 1 for envs with 0 keypoints
+        final_chain_idx = torch.where(num_kp == 0, torch.ones_like(num_kp), 2 * num_kp)  # (n,)
         batch_idx_1d = torch.arange(n, device=self.device)
-        final_rel_pos = kp_chain[batch_idx_1d, final_kp_idx, :3]  # (n, 3)
-        final_rel_quat = kp_chain[batch_idx_1d, final_kp_idx, 3:7]  # (n, 4)
+        final_rel_pos = kp_chain[batch_idx_1d, final_chain_idx, :3]  # (n, 3) = grasp_pos
+        final_rel_quat = kp_chain[batch_idx_1d, final_chain_idx, 3:7]  # (n, 4) = grasp_quat
         
         # Transform final relative pose using object position at END of manipulation
-        # (NOT goal_poses - the object is at this position when release starts)
         manip_end_idx = int(t_manip_end / self.target_dt)
         manip_end_idx = min(manip_end_idx, T - 1)
         obj_pos_at_release = obj_pos_t[:, manip_end_idx, :]  # (n, 3)
@@ -832,16 +903,29 @@ class TrajectoryManager:
         final_grasp_pos_w = quat_apply(obj_quat_at_release, final_rel_pos) + obj_pos_at_release
         final_grasp_quat_w = quat_mul(obj_quat_at_release, final_rel_quat)
         
-        # Vectorized linear interpolation for release
-        p_rel = release_progress.unsqueeze(-1)  # (n, T, 1)
-        release_lerp_pos = (1 - p_rel) * final_grasp_pos_w.unsqueeze(1) + p_rel * release_pos.unsqueeze(1)
-        release_lerp_quat = self._batched_slerp(
+        # Settle phase: hand stays at final manipulation pose (fingers can open)
+        settle_mask = (times >= t_manip_end) & (times < t_settle_end)
+        positions = torch.where(settle_mask.unsqueeze(-1), 
+                               final_grasp_pos_w.unsqueeze(1).expand(n, T, 3), positions)
+        orientations = torch.where(settle_mask.unsqueeze(-1), 
+                                  final_grasp_quat_w.unsqueeze(1).expand(n, T, 4), orientations)
+        
+        # === Phase 4: Retreat (interpolate to release pose with ease-in) ===
+        retreat_mask = times >= t_settle_end
+        retreat_linear = ((times - t_settle_end) / release_duration).clamp(0.0, 1.0)
+        # Apply ease-in: slow start, fast end (t^power)
+        retreat_progress = retreat_linear ** release_ease_power
+        
+        # Vectorized interpolation for retreat (eased)
+        p_ret = retreat_progress.unsqueeze(-1)  # (n, T, 1)
+        retreat_lerp_pos = (1 - p_ret) * final_grasp_pos_w.unsqueeze(1) + p_ret * release_pos.unsqueeze(1)
+        retreat_lerp_quat = self._batched_slerp(
             final_grasp_quat_w.unsqueeze(1).expand(n, T, 4),
             release_quat.unsqueeze(1).expand(n, T, 4),
-            release_progress
+            retreat_progress
         )
-        positions = torch.where(release_mask.unsqueeze(-1), release_lerp_pos, positions)
-        orientations = torch.where(release_mask.unsqueeze(-1), release_lerp_quat, orientations)
+        positions = torch.where(retreat_mask.unsqueeze(-1), retreat_lerp_pos, positions)
+        orientations = torch.where(retreat_mask.unsqueeze(-1), retreat_lerp_quat, orientations)
         
         # Store hand trajectory
         self.hand_trajectory[env_ids, :, :3] = positions
@@ -998,17 +1082,20 @@ class TrajectoryManager:
         n, T = times.shape
         
         # Compute manipulation duration components
-        max_kp = hand_cfg.keypoints.count[1]
+        # Duration scales with waypoints only, keypoints are spread within the fixed time
         max_wp = wp_cfg.count[1]
-        move_duration = cfg.phases.manipulate_base + cfg.phases.manipulate_per_keypoint * max_kp
+        base_move_duration = cfg.phases.manipulate_base
+        movement_duration = wp_cfg.movement_duration
         pause_duration = wp_cfg.pause_duration
-        total_pause_time = pause_duration * max_wp
-        manip_duration = move_duration + total_pause_time
+        # Total movement time = base + extra per waypoint
+        total_move_duration = base_move_duration + movement_duration * max_wp
+        waypoint_duration = movement_duration + pause_duration  # Per-waypoint time
+        manip_duration = base_move_duration + waypoint_duration * max_wp
         
         # Push-T mode: always manipulate phase, no grasp/release, no pauses
         if self.cfg.push_t.enabled:
             # Map time directly to progress with symmetric easing
-            local_t = (times / move_duration).clamp(0.0, 1.0)  # 0 to 1
+            local_t = (times / base_move_duration).clamp(0.0, 1.0)  # 0 to 1
             
             # Split into first half (ease-in) and second half (ease-out)
             first_half = local_t < 0.5
@@ -1045,7 +1132,7 @@ class TrajectoryManager:
             
             # Structure: move1 → pause1 → move2 → pause2 → ... → moveN (no pause after last)
             num_seg = max_wp + 1
-            move_per_seg = move_duration / num_seg
+            move_per_seg = total_move_duration / num_seg  # Equal movement time per segment
             block_duration = move_per_seg + pause_duration  # Time per block (move + pause)
             
             # Which block are we in?
@@ -1281,29 +1368,39 @@ class TrajectoryManager:
     # ---- Phase helpers ----
     
     def get_phase(self) -> torch.Tensor:
-        """Get current phase index for each environment (0=grasp, 1=manipulate, 2=release)."""
+        """Get current phase index for each environment.
+        
+        Returns:
+            0 = grasp (hand approaches object)
+            1 = manipulate (hand moves with object)
+            2 = release (settle + retreat - hand stays/retreats, fingers open)
+        
+        Note: Settle phase is included in release (phase 2) for reward purposes.
+        During settle, trajectory_success and finger_release are active,
+        manipulation rewards are disabled.
+        """
         cfg = self.cfg.trajectory
-        hand_cfg = self.cfg.hand_trajectory
         wp_cfg = self.cfg.waypoints
         t = self.phase_time
         
-        # Compute manipulation duration (including waypoint pauses)
-        max_kp = hand_cfg.keypoints.count[1]
+        # Compute manipulation duration (including waypoint movement + pauses)
+        # Duration scales with waypoints only, keypoints are spread within the fixed time
         max_wp = wp_cfg.count[1]
-        move_duration = cfg.phases.manipulate_base + cfg.phases.manipulate_per_keypoint * max_kp
-        manip_duration = move_duration + wp_cfg.pause_duration * max_wp
+        base_move_duration = cfg.phases.manipulate_base
+        waypoint_duration = wp_cfg.movement_duration + wp_cfg.pause_duration
+        manip_duration = base_move_duration + waypoint_duration * max_wp
         
         phase = torch.zeros_like(t, dtype=torch.long)
         t1 = cfg.phases.grasp
-        t2 = t1 + manip_duration
+        t2 = t1 + manip_duration  # Release starts at end of manipulation (includes settle)
         
         phase[t >= t1] = 1  # manipulate
-        phase[t >= t2] = 2  # release
+        phase[t >= t2] = 2  # release (settle + retreat)
         
         return phase
 
     def is_in_release_phase(self) -> torch.Tensor:
-        """Check if environments are in release phase."""
+        """Check if environments are in release phase (includes settle + retreat)."""
         return self.get_phase() == 2
     
     def is_in_grasp_phase(self) -> torch.Tensor:

@@ -5,34 +5,23 @@
 # Harder waypoints, max curriculum, basic visualization.
 # ==============================================================================
 
-# Harder waypoint settings for evaluation
-waypoints:
-  count: [0, 2]
-  max_rotation: 1.0
-
 # Start at max difficulty
 curriculum:
   difficulty:
-    initial: 5
+    initial: 1
 
 # Basic visualization
 visualization:
-  targets: false
-  current_object: false
+  targets: true
+  current_object: true
   pose_axes: false
   env_ids: null
   debug_print_rewards: true
   hand_pose_targets: true
 
-terminations:
-  trajectory_deviation:
-    point_cloud_threshold: [2.00, 2.00]
-    position_threshold: [2.00, 2.00]
-    rotation_threshold: [3.14, 3.14]
-
 # Fewer envs for visualization
 simulation:
-  num_envs: 4
+  num_envs: 32
 
 procedural_objects:
   generation:

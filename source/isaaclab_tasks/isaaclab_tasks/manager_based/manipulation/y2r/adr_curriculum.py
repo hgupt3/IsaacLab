@@ -47,14 +47,15 @@ def build_curriculum_cfg(cfg: Y2RConfig):
             },
         )
 
-        success_threshold_adr = CurrTerm(
+        # Sparse trajectory_success reward: curriculum for pos_threshold (tightens from initial to final)
+        success_pos_threshold_adr = CurrTerm(
             func=mdp.modify_term_cfg,
             params={
-                "address": "rewards.trajectory_success.params.error_threshold",
+                "address": "rewards.trajectory_success.params.pos_threshold",
                 "modify_fn": mdp.initial_final_interpolate_fn,
                 "modify_params": {
-                    "initial_value": cfg.rewards.trajectory_success.params["point_cloud_threshold"][0],
-                    "final_value": cfg.rewards.trajectory_success.params["point_cloud_threshold"][1],
+                    "initial_value": cfg.rewards.trajectory_success.params["pos_threshold"][0],
+                    "final_value": cfg.rewards.trajectory_success.params["pos_threshold"][1],
                     "difficulty_term_str": "adr",
                 },
             },
@@ -73,14 +74,15 @@ def build_curriculum_cfg(cfg: Y2RConfig):
             },
         )
 
+        # Sparse trajectory_success reward: curriculum for rot_threshold (tightens from initial to final)
         success_rot_threshold_adr = CurrTerm(
             func=mdp.modify_term_cfg,
             params={
                 "address": "rewards.trajectory_success.params.rot_threshold",
                 "modify_fn": mdp.initial_final_interpolate_fn,
                 "modify_params": {
-                    "initial_value": cfg.rewards.trajectory_success.params["rotation_threshold"][0],
-                    "final_value": cfg.rewards.trajectory_success.params["rotation_threshold"][1],
+                    "initial_value": cfg.rewards.trajectory_success.params["rot_threshold"][0],
+                    "final_value": cfg.rewards.trajectory_success.params["rot_threshold"][1],
                     "difficulty_term_str": "adr",
                 },
             },

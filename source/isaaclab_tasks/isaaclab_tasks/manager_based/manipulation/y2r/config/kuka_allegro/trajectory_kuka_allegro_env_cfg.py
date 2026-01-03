@@ -83,7 +83,10 @@ def _build_kuka_allegro_rewards_cfg(cfg: Y2RConfig, base_rewards):
     base_rewards.good_finger_contact = RewTerm(
         func=mdp.contacts,
         weight=cfg.rewards.good_finger_contact.weight,
-        params={"threshold": cfg.rewards.good_finger_contact.params["threshold"]},
+        params={
+            "threshold": cfg.rewards.good_finger_contact.params["threshold"],
+            "disable_in_release": cfg.rewards.good_finger_contact.disable_in_release,
+        },
     )
     base_rewards.distal_joint3_penalty = RewTerm(
         func=mdp.distal_joint3_penalty,

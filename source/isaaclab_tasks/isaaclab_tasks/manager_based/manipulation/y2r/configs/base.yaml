@@ -13,7 +13,7 @@ simulation:
   physics_dt: 0.01              # 1/100 seconds (100 Hz physics)
   decimation: 2                 # Control at 60 Hz (physics_dt * decimation)
   num_envs: 16384
-  env_spacing: 2.0
+  env_spacing: 3.0
   replicate_physics: false
 
 # ==============================================================================
@@ -43,19 +43,20 @@ observations:
 # ==============================================================================
 # TRAJECTORY TIMING
 # ==============================================================================
-# Episode duration = grasp + manipulate_base + (manipulate_per_keypoint * max_keypoints) + hand_release
+# Episode duration = grasp + manipulate_base + (waypoint_pause * max_waypoints) + settle + hand_release
 trajectory:
-  target_hz: 10                 # Target update rate (20/3 Hz = 150ms between targets)
+  target_hz: 5                 # Target update rate (20/3 Hz = 150ms between targets)
   window_size: 5                # Number of lookahead targets in observation
   
   # Phase durations (seconds)
   phases:
     grasp: 2.0                  # Hand approaches object
-    manipulate_base: 3.0        # Base manipulation time
-    manipulate_per_keypoint: 2.5  # Additional time per grasp keypoint
-    hand_release: 2.5           # Hand retreats from object
+    manipulate_base: 3.0        # Base manipulation time (keypoints interpolated within)
+    settle: 1.0                 # Hand pauses at goal before retreat (fingers can open)
+    hand_release: 2.0           # Hand retreats from object (eased: slow start, fast end)
   
-  easing_power: 1.0             # Quadratic ease curves (higher = sharper transitions)
+  easing_power: 1.5             # Quadratic ease curves (higher = sharper transitions)
+  release_ease_power: 1.5       # Ease-in power for retreat (2.0 = quadratic, slow start)
 
 # ==============================================================================
 # HAND TRAJECTORY (palm pose guidance)
@@ -68,24 +69,24 @@ hand_trajectory:
   # Grasp region sampling (surface normal based)
   # Palm approaches from surface normal direction, Z axis (blue) faces object
   grasp_sampling:
-    standoff_range: [0.01, 0.05]  # Palm distance from object surface (meters)
+    standoff_range: [0.02, 0.05]  # Palm distance from object surface (meters)
     exclude_bottom_fraction: 0.4  # Exclude bottom 30% of object surface (table side)
     exclude_toward_robot: true    # Flip grasps where fingers point toward robot
     toward_robot_threshold: 0.0  # Reject if finger_dir.x > this (0=strict, 1=permissive)
   
   # Grasp keypoints (perturbed transforms during manipulation for in-hand manipulation)
   keypoints:
-    count: [0, 3]               # Random number of additional grasp keypoints
-    pos_perturbation: 0.05      # Max position perturbation (meters)
-    rot_perturbation: 0.5       # Max rotation perturbation (radians, ~34°)
+    count: [0, 2]               # Random number of additional grasp keypoints
+    pos_perturbation: 0.04      # Max position perturbation (meters)
+    rot_perturbation: 0.3       # Max rotation perturbation (radians, ~34°)
   
   # Release phase - sample random position in region (like waypoints)
   release:
     position_range:
       x: null                   # null = use workspace.x bounds
       y: null                   # null = use workspace.y bounds  
-      z: [0.55, 0.7]           # Above table, safe height range
-    min_distance_from_object: 0.3  # Ensure palm doesn't overlap with goal object
+      z: [0.6, 0.8]           # Above table, safe height range
+    min_distance_from_object: 0.35  # Ensure palm doesn't overlap with goal object
 
 # ==============================================================================
 # WORKSPACE BOUNDS
@@ -102,8 +103,9 @@ workspace:
 # ==============================================================================
 # Intermediate points between start and goal (0-2 randomly sampled)
 waypoints:
-  count: [0, 1]                 # [min, max] waypoints per trajectory
-  pause_duration: 0.25           # Seconds to pause at each waypoint before continuing
+  count: [0, 2]                 # [min, max] waypoints per trajectory
+  movement_duration: 2.5        # Seconds of movement time per waypoint
+  pause_duration: 0.25          # Seconds to pause at each waypoint
   
   # Position sampling (null = use workspace bounds, else offset from start)
   position_range:
@@ -113,7 +115,7 @@ waypoints:
   
   # Orientation randomization
   vary_orientation: true
-  max_rotation: 1.0            # Max rotation in radians (~114 degrees)
+  max_rotation: 1.0            # Max rotation in radians (1.0 radions ~57 degrees)
 
 # ==============================================================================
 # GOAL SAMPLING
@@ -141,7 +143,8 @@ rewards:
       finger_scale: 0.15     
     
   fingers_to_object:
-    weight: 0.5
+    weight: 1.0
+    disable_in_release: true           # Disable during release phase
     params:
       std: 0.4
       error_gate_pos_threshold: 0.10   # meters (pose mode) / mean error (pc mode)
@@ -151,6 +154,7 @@ rewards:
     
   lookahead_tracking:
     weight: 5.0
+    disable_in_release: true           # Disable during release phase
     params:
       std: 0.03                   # Position/point cloud error std for positive reward
       rot_std: 0.3                # Rotation error std (pose mode only) 
@@ -169,10 +173,18 @@ rewards:
   trajectory_success:
     weight: 10.0
     params:
-      # Success thresholds [initial (lenient), final (strict)]
-      point_cloud_threshold: [0.05, 0.05]     # meters
-      position_threshold: [0.05, 0.05]        # meters (pose mode)
-      rotation_threshold: [0.5, 0.5]          # radians (pose mode) ~34° → ~11°
+      # Sparse binary thresholds [initial (lenient), final (strict)]
+      # Both pos AND rot must be within threshold for sparse bonus
+      pos_threshold: [0.06, 0.03]     # meters - position/point cloud threshold
+      rot_threshold: [0.6, 0.3]       # radians - rotation threshold ~29° → ~17°
+      # Dense shaping (fixed, provides gradient toward goal)
+      pos_std: 0.05                   # meters - exp kernel std for dense shaping
+      rot_std: 0.5                    # radians - exp kernel std for dense shaping
+      sparse_weight: 0.8              # 80% sparse bonus, 20% dense shaping
+      # Contact gating (sparse bonus requires table contact - must place, not hold)
+      contact_gate_threshold: 0.1    # Contact force to start gating (Newtons)
+      contact_gate_ramp: 2.0         # Range for smooth ramp to full gate (Newtons)
+      contact_gate_floor: 0.2        # Minimum gate when no contact (20% of sparse)
     
   early_termination:
     weight: -4.0
@@ -189,11 +201,13 @@ rewards:
   # Robot-specific (Kuka Allegro)
   good_finger_contact:
     weight: 0.5
+    disable_in_release: true           # Disable during release phase
     params:
       threshold: 1.0              # Contact force threshold (Newtons)
     
   finger_manipulation:
     weight: 4.0
+    disable_in_release: true           # Disable during release phase
     params:
       pos_std: 0.02               # Position change threshold (meters)
       rot_std: 0.2                # Rotation change threshold (radians)
@@ -229,6 +243,7 @@ rewards:
   # Rewards *reducing* current target error (helps recovery if policy freezes).
   tracking_progress:
     weight: 2.0
+    disable_in_release: true           # Disable during release phase
     params:
       pos_weight: 1.0
       rot_weight: 1.0
@@ -238,19 +253,28 @@ rewards:
   # Hand pose following reward (when hand_trajectory.enabled)
   # Guides hand to follow palm pose trajectory through grasp/manipulation/release
   hand_pose_following:
-    weight: 2.0                   # Medium weight - guiding signal, not strict
+    weight: 3.0                   # Medium weight - guiding signal, not strict
     params:
-      # Phase-varying tolerances: exp(-pos_error/tol) * exp(-rot_error/tol)
-      grasp_pos_tol: 0.04         # 6cm position tolerance during grasp
-      grasp_rot_tol: 0.4          # ~23° rotation tolerance during grasp
-      manipulation_pos_tol: 0.06  # 10cm (loose) during manipulation
-      manipulation_rot_tol: 0.6   # ~29° (loose) during manipulation
-      release_pos_tol: 0.04       # 6cm during release
-      release_rot_tol: 0.4        # ~23° during release
+      # Phase-varying tolerances: exp(-pos_error/tol) + exp(-rot_error/tol) / 2
+      grasp_pos_tol: 0.03         # 4cm position tolerance during grasp
+      grasp_rot_tol: 0.6          # ~34° rotation tolerance during grasp
+      manipulation_pos_tol: 0.03  # 6cm (loose) during manipulation
+      manipulation_rot_tol: 0.6   # ~68° (loose) during manipulation
+      release_pos_tol: 0.03       # 4cm during release
+      release_rot_tol: 0.6        # ~34° during release
       # Release phase gating - linearly gate other rewards if hand deviates
       gate_in_release: true
-      gate_start_threshold: 0.04  # Start dropping gate at 4cm
-      gate_end_threshold: 0.08    # Gate reaches 0 at 10cm
+      gate_start_threshold: 0.03      # Position: start dropping gate at 4cm
+      gate_end_threshold: 0.06        # Position: gate reaches minimum at 8cm
+      gate_rot_start_threshold: 0.6   # Rotation: start dropping gate at ~34°
+      gate_rot_end_threshold: 0.9     # Rotation: gate reaches minimum at ~68°
+      gate_floor: 0.02                # Minimum gate value (prevents complete reward collapse)
+  
+  # Finger release reward - incentivizes opening hand during release phase
+  finger_release:
+    weight: 1.0
+    params:
+      scale: 1.0                  # Gradient steepness (higher = stronger push toward open)
 
 # ==============================================================================
 # TERMINATIONS
@@ -280,17 +304,17 @@ curriculum:
     
   # Observation noise curriculum: [initial, final]
   noise:
-    joint_pos: [0.0, 0.1]
-    joint_vel: [0.0, 0.2]
-    hand_tips: [0.0, 0.01]
-    object_point_cloud: [0.0, 0.01]
-    object_pose: [0.0, 0.01]
-    target_point_clouds: [0.0, 0.01]
-    target_poses: [0.0, 0.01]
+    joint_pos: [0.0, 0.0]
+    joint_vel: [0.0, 0.0]
+    hand_tips: [0.0, 0.0]
+    object_point_cloud: [0.0, 0.0]
+    object_pose: [0.0, 0.0]
+    target_point_clouds: [0.0, 0.0]
+    target_poses: [0.0, 0.0]
     
   # Gravity scheduling (m/s²)
   gravity:
-    initial: [0.0, 0.0, -0.0]
+    initial: [0.0, 0.0, -0.981]
     final: [0.0, 0.0, -9.81]
 
 # ==============================================================================
@@ -402,7 +426,7 @@ wrist_camera:
 # Shapes are cached in asset_dir; regenerate only if regenerate=true or count changed
 procedural_objects:
   enabled: true
-  percentage: 0.7                 # 40% procedural, 60% built-in primitives
+  percentage: 0.5                 # 40% procedural, 60% built-in primitives
   asset_dir: "assets/procedural"  # Relative to y2r folder, auto-created
   regenerate: false               # Force regenerate even if shapes exist
   

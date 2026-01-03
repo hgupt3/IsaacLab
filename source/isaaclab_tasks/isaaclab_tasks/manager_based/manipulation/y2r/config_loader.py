@@ -125,8 +125,8 @@ class ObservationsConfig:
 class PhasesConfig:
     grasp: float
     manipulate_base: float
-    manipulate_per_keypoint: float
-    hand_release: float
+    settle: float = 0.0  # Pause at goal before retreat (fingers can open)
+    hand_release: float = 2.5
 
 
 @dataclass
@@ -135,6 +135,7 @@ class TrajectoryConfig:
     window_size: int
     phases: PhasesConfig
     easing_power: float
+    release_ease_power: float = 2.0  # Ease-in power for retreat (slow start)
 
 
 # ==============================================================================
@@ -195,7 +196,8 @@ class PositionRangeConfig:
 @dataclass
 class WaypointsConfig:
     count: tuple[int, int]
-    pause_duration: float
+    movement_duration: float  # Seconds of movement time per waypoint
+    pause_duration: float     # Seconds to pause at each waypoint
     position_range: PositionRangeConfig
     vary_orientation: bool
     max_rotation: float
@@ -212,6 +214,7 @@ class GoalConfig:
 class RewardConfig:
     weight: float
     params: dict = field(default_factory=dict)  # Empty if not specified
+    disable_in_release: bool = False  # If True, reward returns 0 during release phase
 
 
 @dataclass
@@ -231,6 +234,7 @@ class RewardsConfig:
     joint_limits_margin: RewardConfig
     tracking_progress: RewardConfig
     hand_pose_following: RewardConfig
+    finger_release: RewardConfig
 
 
 @dataclass
