@@ -55,8 +55,17 @@ def _recurse(iv_elem, fv_elem, data_elem, frac):
 class DifficultyScheduler(ManagerTermBase):
     """Adaptive difficulty scheduler for trajectory curriculum learning.
 
-    Tracks per-environment difficulty levels and adjusts them based on task performance.
-    Advances when object is at goal during release phase.
+    Tracks per-environment difficulty levels and adjusts them based on task performance
+    and/or a step-based schedule.
+    
+    Step-based scheduler (optional):
+    - If step_interval is set, difficulty floor increases every step_interval steps
+    - Floor guarantees minimum progress regardless of agent performance
+    - Performance-based logic can still push difficulty higher than floor
+    
+    Performance-based advancement:
+    - Advances when object is at goal during release phase
+    - Can be disabled by setting use_performance=False
 
     The normalized average difficulty is exposed as `difficulty_frac` for curriculum interpolation.
     
@@ -70,6 +79,9 @@ class DifficultyScheduler(ManagerTermBase):
         init_difficulty = self.cfg.params.get("init_difficulty", 0)
         self.current_adr_difficulties = torch.ones(env.num_envs, device=env.device) * init_difficulty
         self.difficulty_frac = 0
+        
+        # Step-based scheduler state
+        self.step_based_floor = init_difficulty
 
     def get_state(self):
         return self.current_adr_difficulties
@@ -89,42 +101,62 @@ class DifficultyScheduler(ManagerTermBase):
         pos_tol: float | None = None,  # None = use current success threshold
         rot_tol: float | None = None,  # None = use current success threshold
         pc_tol: float | None = None,   # None = use current success threshold
+        step_interval: int | None = None,  # Steps between floor increases (None = disabled)
+        use_performance: bool = True,  # Whether to use performance-based advancement
     ):
-        # Trajectory task: advance when object is at goal during release phase
-        trajectory_manager = env.trajectory_manager
-        use_point_cloud = trajectory_manager.cfg.mode.use_point_cloud
+        # Compute step-based difficulty floor using Isaac Lab's global step counter
+        if step_interval is not None and step_interval > 0:
+            self.step_based_floor = min(
+                max_difficulty,
+                init_difficulty + (env.common_step_counter // step_interval)
+            )
         
-        # Get current success thresholds from reward manager (already curriculum-adjusted)
-        success_cfg = env.reward_manager.get_term_cfg("trajectory_success")
-        current_pos_threshold = success_cfg.params.get("pos_threshold", 0.05)
-        current_rot_threshold = success_cfg.params.get("rot_threshold", 0.3)
-        
-        # Use provided tolerances or fall back to current success thresholds
-        effective_pos_tol = pos_tol if pos_tol is not None else current_pos_threshold
-        effective_rot_tol = rot_tol if rot_tol is not None else current_rot_threshold
-        effective_pc_tol = pc_tol if pc_tol is not None else current_pos_threshold
-        
-        # Check if in release phase
-        in_release = trajectory_manager.is_in_release_phase()[env_ids]
-        
-        if use_point_cloud:
-            # Point cloud mode: use cached mean errors
-            mean_errors = env._cached_mean_errors[env_ids, 0]  # Current target error
-            at_goal = mean_errors < effective_pc_tol
+        # Performance-based logic
+        if use_performance:
+            trajectory_manager = env.trajectory_manager
+            use_point_cloud = trajectory_manager.cfg.mode.use_point_cloud
+            
+            # Get current success thresholds from reward manager (already curriculum-adjusted)
+            success_cfg = env.reward_manager.get_term_cfg("trajectory_success")
+            current_pos_threshold = success_cfg.params.get("pos_threshold", 0.05)
+            current_rot_threshold = success_cfg.params.get("rot_threshold", 0.3)
+            
+            # Use provided tolerances or fall back to current success thresholds
+            effective_pos_tol = pos_tol if pos_tol is not None else current_pos_threshold
+            effective_rot_tol = rot_tol if rot_tol is not None else current_rot_threshold
+            effective_pc_tol = pc_tol if pc_tol is not None else current_pos_threshold
+            
+            # Check if in release phase
+            in_release = trajectory_manager.is_in_release_phase()[env_ids]
+            
+            if use_point_cloud:
+                # Point cloud mode: use cached mean errors
+                mean_errors = env._cached_mean_errors[env_ids, 0]  # Current target error
+                at_goal = mean_errors < effective_pc_tol
+            else:
+                # Pose mode: check both position AND rotation
+                pos_errors = env._cached_pose_errors['pos'][env_ids, 0]
+                rot_errors = env._cached_pose_errors['rot'][env_ids, 0]
+                at_goal = (pos_errors < effective_pos_tol) & (rot_errors < effective_rot_tol)
+            
+            # Promote if in release AND at goal
+            move_up = in_release & at_goal 
+            
+            demot = self.current_adr_difficulties[env_ids] if promotion_only else self.current_adr_difficulties[env_ids] - 1
+            perf_difficulties = torch.where(
+                move_up,
+                self.current_adr_difficulties[env_ids] + 1,
+                demot,
+            )
         else:
-            # Pose mode: check both position AND rotation
-            pos_errors = env._cached_pose_errors['pos'][env_ids, 0]
-            rot_errors = env._cached_pose_errors['rot'][env_ids, 0]
-            at_goal = (pos_errors < effective_pos_tol) & (rot_errors < effective_rot_tol)
+            # No performance-based logic, just use current difficulties
+            perf_difficulties = self.current_adr_difficulties[env_ids]
         
-        # Promote if in release AND at goal
-        move_up = in_release & at_goal 
-        
-        demot = self.current_adr_difficulties[env_ids] if promotion_only else self.current_adr_difficulties[env_ids] - 1
-        self.current_adr_difficulties[env_ids] = torch.where(
-            move_up,
-            self.current_adr_difficulties[env_ids] + 1,
-            demot,
+        # Combine: step-based floor is the minimum, performance can exceed it
+        floor_tensor = torch.tensor(self.step_based_floor, device=env.device, dtype=perf_difficulties.dtype)
+        self.current_adr_difficulties[env_ids] = torch.maximum(
+            perf_difficulties, floor_tensor
         ).clamp(min=min_difficulty, max=max_difficulty)
+        
         self.difficulty_frac = torch.mean(self.current_adr_difficulties) / max(max_difficulty, 1)
         return self.difficulty_frac

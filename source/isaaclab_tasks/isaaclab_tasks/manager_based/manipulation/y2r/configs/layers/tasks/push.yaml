@@ -6,6 +6,13 @@
 # Duration comes from push_t.rolling_window, not phases.
 # ==============================================================================
 
+trajectory:
+  phases:
+    grasp: 2.0                  # Hand approaches object
+    manipulate_base: 3.5        # Base manipulation time (keypoints interpolated within)
+    settle: 0.1                 # Hand pauses at goal before retreat (fingers can open)
+    hand_release: 2.0           # Hand retreats from object (eased: slow start, fast end)
+
 push_t:
   enabled: true
   object_usd: "assets/t-shape/t-shape.usd"
@@ -25,3 +32,8 @@ goal:
 randomization:
   object:
     scale: [1.0, 1.0]
+
+terminations:
+  trajectory_deviation:
+    position_threshold: [2.00, 2.00]
+    rotation_threshold: [3.0, 3.0]

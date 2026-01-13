@@ -1,10 +1,27 @@
 # ==============================================================================
-# Cup Task Layer
+# Cup Task Layer - Pour and Return
 # ==============================================================================
 # Task definition only - no play/mode settings.
-# Pour bottle into cup (bottle-to-cup trajectory).
-# Duration comes from push_t.rolling_window, not phases.
+# Bottle: start (upright) -> waypoint (pour above cup) -> goal (return to start)
 # ==============================================================================
+
+# Hand trajectory: side grasp from +Y (right side viewer POV / left side robot POV)
+hand_trajectory:
+  grasp_sampling:
+    # Fixed direction grasp: approach from +Y side of bottle
+    fixed_origin_offset: [0, 0, 0.0]  # Slightly above bottle center (Z offset)
+    fixed_direction: [0, -1, 0]         # Look from -Y direction to find surface point
+    fixed_hand_roll: 0.0               # 90° roll - fingers pointing up (+Z)
+    # Pre-grasp approach
+    approach_distance: 0.1   # 30cm pre-grasp distance
+    align_fraction: 0.7      # 70% of grasp phase to reach pre-grasp
+
+trajectory:
+  phases:
+    grasp: 3.0                  # Hand approaches object
+    manipulate_base: 5.0        # Increased for pour + return trajectory
+    settle: 0.1                 # Hand pauses at goal before retreat (fingers can open)
+    hand_release: 2.0           # Hand retreats from object (eased: slow start, fast end)
 
 push_t:
   enabled: true
@@ -14,17 +31,19 @@ push_t:
   outline_position: [-0.55, 0.15]
   object_rotation: [1.0, 0.0, 0.0, 0.0]
   outline_rotation: [1.0, 0.0, 0.0, 0.0]
-  goal_offset: [0.0, 0.0, 0.16]
-  goal_rotation: [0.707, -0.707, 0.0, 0.0]
   rolling_window: 3.0
   min_speed: 0.05
 
 waypoints:
-  count: [0, 0]
+  count: [1, 1]                 # Exactly 1 waypoint (pour position)
+  fixed_waypoints:
+    # Pour position: above cup, tilted 90 degrees
+    # Position: outline_position [-0.55, 0.15] + z offset (table 0.255 + 0.16 = 0.415)
+    # Rotation: tilted 90 degrees to pour [qw, qx, qy, qz]
+    - [-0.55, 0.15, 0.415, 0.707, -0.707, 0.0, 0.0]
 
 goal:
-  x_range: [-0.55, -0.55]
-  y_range: [0.0, 0.0]
+  return_to_start: true         # Return bottle to original position
 
 randomization:
   object:
@@ -33,3 +52,8 @@ randomization:
     object_x: [-0.1, 0.1]
     object_y: [-0.2, 0.1]
     object_yaw: [0.0, 0.0]
+
+terminations:
+  trajectory_deviation:
+    position_threshold: [1.00, 1.00]
+    rotation_threshold: [3.0, 3.0]

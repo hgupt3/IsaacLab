@@ -20,7 +20,7 @@ from isaaclab.utils.math import (
 )
 
 from .utils import sample_object_point_cloud_random, get_point_cloud_cache
-from .actions import ALLEGRO_PCA_MATRIX
+from .actions import ALLEGRO_PCA_MATRIX, ALLEGRO_HAND_JOINT_NAMES, get_allegro_hand_joint_ids
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -758,11 +758,12 @@ def allegro_hand_eigen_b(
         )
 
     robot: Articulation = env.scene[asset_cfg.name]
-    start = arm_joint_count
-    end = arm_joint_count + hand_joint_count
-    hand = robot.data.joint_pos[:, start:end]
+    
+    # Use explicit joint IDs to ensure correct order (not PhysX native order)
+    joint_ids = get_allegro_hand_joint_ids(env, robot)
+    hand = robot.data.joint_pos[:, joint_ids]  # (N, 16) in canonical order
     if use_default_delta:
-        hand = hand - robot.data.default_joint_pos[:, start:end]
+        hand = hand - robot.data.default_joint_pos[:, joint_ids]
 
     # Cache the right-inverse per eigen_dim on the env instance.
     cache_attr = f"_allegro_pca_right_pinv_{eigen_dim}"
@@ -835,6 +836,7 @@ class target_sequence_obs_b(ManagerTermBase):
         self.visualize_goal_region = y2r_cfg.visualization.goal_region
         self.visualize_pose_axes = y2r_cfg.visualization.pose_axes
         self.visualize_hand_pose_targets = y2r_cfg.visualization.hand_pose_targets
+        self.visualize_grasp_surface_point = y2r_cfg.visualization.grasp_surface_point
         self.visualize_env_ids = y2r_cfg.visualization.env_ids
         
         self.object: RigidObject = env.scene[self.object_cfg.name]
@@ -871,10 +873,13 @@ class target_sequence_obs_b(ManagerTermBase):
         
         # Visualizers
         self.markers = None
+        self.grasp_point_marker = None
         self._debug_draw = None
         self._visualizer_initialized = False
         if self.visualize or self.visualize_current:
             self._init_visualizer()
+        if self.visualize_grasp_surface_point:
+            self._init_grasp_point_visualizer()
         if self.visualize_waypoint_region or self.visualize_goal_region or self.visualize_pose_axes or self.visualize_hand_pose_targets:
             self._init_region_visualizer()
         
@@ -906,6 +911,26 @@ class target_sequence_obs_b(ManagerTermBase):
             VisualizationMarkersCfg(
                 prim_path="/Visuals/TargetSequencePointClouds",
                 markers=markers_dict,
+            )
+        )
+    
+    def _init_grasp_point_visualizer(self):
+        """Initialize visualization marker for grasp surface point (green, double size)."""
+        import isaaclab.sim as sim_utils
+        from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+        
+        # Green sphere, double the normal point radius
+        self.grasp_point_marker = VisualizationMarkers(
+            VisualizationMarkersCfg(
+                prim_path="/Visuals/GraspSurfacePoint",
+                markers={
+                    "grasp_point": sim_utils.SphereCfg(
+                        radius=self.POINT_RADIUS * 2.0,  # Double size
+                        visual_material=sim_utils.PreviewSurfaceCfg(
+                            diffuse_color=(0.0, 1.0, 0.0),  # Green
+                        ),
+                    ),
+                },
             )
         )
     
@@ -1331,6 +1356,10 @@ class target_sequence_obs_b(ManagerTermBase):
         if (self.visualize or self.visualize_current) and self.markers is not None:
             self._visualize(all_points_w, current_points_w, N)
         
+        # Grasp surface point visualization (green sphere)
+        if self.visualize_grasp_surface_point and self.grasp_point_marker is not None:
+            self._visualize_grasp_surface_point(N)
+        
         # Debug draw visualizations (lines) - must redraw every frame after clear
         if self._debug_draw is not None and (self.visualize_pose_axes or self.visualize_hand_pose_targets or self.visualize_waypoint_region or self.visualize_goal_region):
             # Clear previous frame's lines first
@@ -1406,6 +1435,44 @@ class target_sequence_obs_b(ManagerTermBase):
         self.markers.visualize(
             translations=all_positions,
             marker_indices=all_indices,
+        )
+    
+    def _visualize_grasp_surface_point(self, num_envs: int):
+        """Visualize selected grasp surface point (green sphere, double size).
+        
+        The point is stored in object-local frame and transformed to world
+        frame each frame so it moves with the object.
+        
+        Args:
+            num_envs: Number of environments.
+        """
+        # Determine which envs to visualize
+        if self.visualize_env_ids is None:
+            env_ids = list(range(num_envs))
+        else:
+            env_ids = [i for i in self.visualize_env_ids if i < num_envs]
+        
+        if not env_ids:
+            return
+        
+        env_ids_t = torch.tensor(env_ids, device=self.object.device)
+        
+        # Get surface points in LOCAL frame from trajectory manager
+        surface_points_local = self.trajectory_manager.debug_surface_point_local[env_ids_t]  # (E, 3)
+        
+        # Get current object pose
+        obj_pos = self.object.data.root_pos_w[env_ids_t]  # (E, 3)
+        obj_quat = self.object.data.root_quat_w[env_ids_t]  # (E, 4)
+        
+        # Transform to world frame
+        surface_points_w = quat_apply(obj_quat, surface_points_local) + obj_pos  # (E, 3)
+        
+        # All use marker index 0 (the single grasp_point marker)
+        marker_indices = torch.zeros(len(env_ids), dtype=torch.long, device=surface_points_w.device)
+        
+        self.grasp_point_marker.visualize(
+            translations=surface_points_w,
+            marker_indices=marker_indices,
         )
 
 

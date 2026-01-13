@@ -31,6 +31,8 @@ def build_curriculum_cfg(cfg: Y2RConfig):
                 "pos_tol": cfg.curriculum.advancement_tolerances.position,
                 "rot_tol": cfg.curriculum.advancement_tolerances.rotation,
                 "pc_tol": cfg.curriculum.advancement_tolerances.point_cloud,
+                "step_interval": cfg.curriculum.scheduler.step_interval,
+                "use_performance": cfg.curriculum.scheduler.use_performance,
             },
         )
 
@@ -69,6 +71,34 @@ def build_curriculum_cfg(cfg: Y2RConfig):
                 "modify_params": {
                     "initial_value": cfg.terminations.trajectory_deviation.rotation_threshold[0],
                     "final_value": cfg.terminations.trajectory_deviation.rotation_threshold[1],
+                    "difficulty_term_str": "adr",
+                },
+            },
+        )
+
+        # Hand pose deviation termination: curriculum for position threshold
+        hand_pose_term_pos_adr = CurrTerm(
+            func=mdp.modify_term_cfg,
+            params={
+                "address": "terminations.hand_pose_deviation.params.pos_threshold",
+                "modify_fn": mdp.initial_final_interpolate_fn,
+                "modify_params": {
+                    "initial_value": cfg.terminations.hand_pose_deviation.position_threshold[0],
+                    "final_value": cfg.terminations.hand_pose_deviation.position_threshold[1],
+                    "difficulty_term_str": "adr",
+                },
+            },
+        )
+
+        # Hand pose deviation termination: curriculum for rotation threshold
+        hand_pose_term_rot_adr = CurrTerm(
+            func=mdp.modify_term_cfg,
+            params={
+                "address": "terminations.hand_pose_deviation.params.rot_threshold",
+                "modify_fn": mdp.initial_final_interpolate_fn,
+                "modify_params": {
+                    "initial_value": cfg.terminations.hand_pose_deviation.rotation_threshold[0],
+                    "final_value": cfg.terminations.hand_pose_deviation.rotation_threshold[1],
                     "difficulty_term_str": "adr",
                 },
             },

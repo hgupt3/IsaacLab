@@ -104,3 +104,69 @@ def reset_object_on_table_stable(
     asset.write_root_pose_to_sim(torch.cat([positions, quaternions], dim=-1), env_ids=env_ids)
     asset.write_root_velocity_to_sim(velocities, env_ids=env_ids)
 
+
+def reset_push_t_object(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    pose_range: dict[str, tuple[float, float]],
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+):
+    """Reset push_t object with world-frame yaw randomization.
+
+    Unlike reset_root_state_uniform which applies yaw in local frame, this function
+    applies yaw in the WORLD frame (around world Z axis). This is necessary because
+    the push_t object has a non-identity default rotation to lay flat on the table,
+    and we want yaw to rotate it on the table surface.
+
+    Args:
+        env: The environment instance.
+        env_ids: Environment indices to reset.
+        pose_range: Dictionary with "x", "y", and "yaw" keys specifying
+            (min, max) ranges. x/y are offsets from default position.
+        asset_cfg: Configuration for the object asset.
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+
+    # Get default root state (includes configured object_rotation)
+    root_states = asset.data.default_root_state[env_ids].clone()
+
+    # Randomize x, y positions (offsets from default)
+    x_range = pose_range.get("x", (0.0, 0.0))
+    y_range = pose_range.get("y", (0.0, 0.0))
+
+    ranges = torch.tensor([x_range, y_range], device=asset.device)
+    rand_xy = math_utils.sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 2), device=asset.device)
+
+    # Build positions: default + env_origin + random offset
+    positions = torch.zeros(len(env_ids), 3, device=asset.device)
+    positions[:, 0] = root_states[:, 0] + env.scene.env_origins[env_ids, 0] + rand_xy[:, 0]
+    positions[:, 1] = root_states[:, 1] + env.scene.env_origins[env_ids, 1] + rand_xy[:, 1]
+    positions[:, 2] = root_states[:, 2] + env.scene.env_origins[env_ids, 2]  # Keep default z
+
+    # Get default orientation (the configured object_rotation)
+    quaternions = root_states[:, 3:7].clone()
+
+    # Apply yaw in WORLD frame (around world Z axis)
+    # This rotates the object on the table regardless of its default orientation
+    yaw_range = pose_range.get("yaw", (0.0, 0.0))
+    if yaw_range[0] != 0.0 or yaw_range[1] != 0.0:
+        yaw_rand = math_utils.sample_uniform(
+            yaw_range[0],
+            yaw_range[1],
+            (len(env_ids),),
+            device=asset.device,
+        )
+        yaw_quat = math_utils.quat_from_euler_xyz(
+            torch.zeros_like(yaw_rand),
+            torch.zeros_like(yaw_rand),
+            yaw_rand,
+        )
+        # yaw_quat * default_quat = apply yaw in world frame first
+        quaternions = math_utils.quat_mul(yaw_quat, quaternions)
+
+    # Zero velocities
+    velocities = torch.zeros(len(env_ids), 6, device=asset.device)
+
+    # Write to simulation
+    asset.write_root_pose_to_sim(torch.cat([positions, quaternions], dim=-1), env_ids=env_ids)
+    asset.write_root_velocity_to_sim(velocities, env_ids=env_ids)

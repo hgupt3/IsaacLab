@@ -222,12 +222,6 @@ class TrajectorySceneCfg(InteractiveSceneCfg):
 
     # Visual outline for push-T mode (set dynamically in TrajectoryEnvCfg_PUSH)
     outline: AssetBaseCfg | None = None
-    
-    # Object-table contact sensor (for detecting stable placement during release)
-    object_table_contact: ContactSensorCfg = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Object",
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/table"],
-    )
 
 
 @configclass
@@ -266,7 +260,6 @@ def _build_observations_cfg(cfg: Y2RConfig):
         hand_eigen = ObsTerm(
             func=mdp.allegro_hand_eigen_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),
-            clip=cfg.observations.clip_range,
             params={
                 "arm_joint_count": cfg.robot.arm_joint_count,
                 "hand_joint_count": cfg.robot.hand_joint_count,
@@ -277,7 +270,6 @@ def _build_observations_cfg(cfg: Y2RConfig):
         hand_tips_state_b = ObsTerm(
             func=mdp.body_state_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),
-            clip=cfg.observations.clip_range,
             params={
                 "body_asset_cfg": SceneEntityCfg("robot"),
                 "base_asset_cfg": SceneEntityCfg("robot"),
@@ -296,7 +288,6 @@ def _build_observations_cfg(cfg: Y2RConfig):
         object_point_cloud = ObsTerm(
             func=mdp.object_point_cloud_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),
-            clip=cfg.observations.clip_range,
             params={
                 "num_points": cfg.observations.num_points,
                 "flatten": True,
@@ -305,7 +296,6 @@ def _build_observations_cfg(cfg: Y2RConfig):
         object_pose = ObsTerm(
             func=mdp.object_pose_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),
-            clip=cfg.observations.clip_range,
         )
 
         def __post_init__(self):
@@ -321,18 +311,15 @@ def _build_observations_cfg(cfg: Y2RConfig):
         target_point_clouds = ObsTerm(
             func=mdp.target_sequence_obs_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),
-            clip=cfg.observations.clip_range,
             params={},
         )
         target_poses = ObsTerm(
             func=mdp.target_sequence_poses_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),
-            clip=cfg.observations.clip_range,
         )
         hand_pose_targets = ObsTerm(
             func=mdp.hand_pose_targets_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),
-            clip=cfg.observations.clip_range,
         )
 
         def __post_init__(self):
@@ -348,7 +335,6 @@ def _build_observations_cfg(cfg: Y2RConfig):
         visible_point_cloud = ObsTerm(
             func=mdp.visible_object_point_cloud_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),
-            clip=cfg.observations.clip_range,
             params={
                 "num_points": cfg.observations.student_num_points,
                 "flatten": True,
@@ -368,13 +354,11 @@ def _build_observations_cfg(cfg: Y2RConfig):
         visible_target_sequence = ObsTerm(
             func=mdp.visible_target_sequence_obs_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),
-            clip=cfg.observations.clip_range,
             params={},
         )
         hand_pose_targets = ObsTerm(
             func=mdp.hand_pose_targets_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),
-            clip=cfg.observations.clip_range,
         )
 
         def __post_init__(self):
@@ -582,11 +566,11 @@ def _build_rewards_cfg(cfg: Y2RConfig):
                 "manipulation_rot_tol": cfg.rewards.hand_pose_following.params["manipulation_rot_tol"],
                 "release_pos_tol": cfg.rewards.hand_pose_following.params["release_pos_tol"],
                 "release_rot_tol": cfg.rewards.hand_pose_following.params["release_rot_tol"],
+                "gate_in_grasp": cfg.rewards.hand_pose_following.params["gate_in_grasp"],
+                "gate_in_manipulation": cfg.rewards.hand_pose_following.params["gate_in_manipulation"],
                 "gate_in_release": cfg.rewards.hand_pose_following.params["gate_in_release"],
-                "gate_start_threshold": cfg.rewards.hand_pose_following.params["gate_start_threshold"],
-                "gate_end_threshold": cfg.rewards.hand_pose_following.params["gate_end_threshold"],
-                "gate_rot_start_threshold": cfg.rewards.hand_pose_following.params["gate_rot_start_threshold"],
-                "gate_rot_end_threshold": cfg.rewards.hand_pose_following.params["gate_rot_end_threshold"],
+                "gate_pos_threshold": cfg.rewards.hand_pose_following.params["gate_pos_threshold"],
+                "gate_rot_threshold": cfg.rewards.hand_pose_following.params["gate_rot_threshold"],
                 "gate_floor": cfg.rewards.hand_pose_following.params["gate_floor"],
                 "robot_cfg": SceneEntityCfg("robot"),
             },
@@ -614,12 +598,13 @@ def _build_rewards_cfg(cfg: Y2RConfig):
             func=mdp.object_ee_distance,
             weight=cfg.rewards.fingers_to_object.weight,
             params={
+                "phases": cfg.rewards.fingers_to_object.params.get("phases"),
+                "use_hand_pose_gate": cfg.rewards.fingers_to_object.params.get("use_hand_pose_gate"),
                 "std": cfg.rewards.fingers_to_object.params["std"],
                 "error_gate_pos_threshold": cfg.rewards.fingers_to_object.params["error_gate_pos_threshold"],
                 "error_gate_pos_slope": cfg.rewards.fingers_to_object.params["error_gate_pos_slope"],
                 "error_gate_rot_threshold": cfg.rewards.fingers_to_object.params["error_gate_rot_threshold"],
                 "error_gate_rot_slope": cfg.rewards.fingers_to_object.params["error_gate_rot_slope"],
-                "disable_in_release": cfg.rewards.fingers_to_object.disable_in_release,
             },
         )
 
@@ -627,6 +612,9 @@ def _build_rewards_cfg(cfg: Y2RConfig):
             func=mdp.lookahead_tracking,
             weight=cfg.rewards.lookahead_tracking.weight,
             params={
+                "phases": cfg.rewards.lookahead_tracking.params.get("phases"),
+                "use_hand_pose_gate": cfg.rewards.lookahead_tracking.params.get("use_hand_pose_gate"),
+                "use_contact_gating": cfg.rewards.lookahead_tracking.params.get("use_contact_gating"),
                 "std": cfg.rewards.lookahead_tracking.params["std"],
                 "decay": cfg.rewards.lookahead_tracking.params["decay"],
                 "contact_threshold": cfg.rewards.lookahead_tracking.params["contact_threshold"],
@@ -638,7 +626,6 @@ def _build_rewards_cfg(cfg: Y2RConfig):
                 "neg_scale": cfg.rewards.lookahead_tracking.params["neg_scale"],
                 "rot_neg_threshold": cfg.rewards.lookahead_tracking.params["rot_neg_threshold"],
                 "rot_neg_std": cfg.rewards.lookahead_tracking.params["rot_neg_std"],
-                "disable_in_release": cfg.rewards.lookahead_tracking.disable_in_release,
             },
         )
 
@@ -646,6 +633,9 @@ def _build_rewards_cfg(cfg: Y2RConfig):
             func=mdp.trajectory_success,
             weight=cfg.rewards.trajectory_success.weight,
             params={
+                "phases": cfg.rewards.trajectory_success.params.get("phases"),
+                "use_hand_pose_gate": cfg.rewards.trajectory_success.params.get("use_hand_pose_gate"),
+                "use_finger_release_gate": cfg.rewards.trajectory_success.params.get("use_finger_release_gate"),
                 "pos_threshold": cfg.rewards.trajectory_success.params["pos_threshold"][0],
                 "rot_threshold": cfg.rewards.trajectory_success.params["rot_threshold"][0],
                 "pos_std": cfg.rewards.trajectory_success.params["pos_std"],
@@ -678,9 +668,10 @@ def _build_rewards_cfg(cfg: Y2RConfig):
             func=mdp.finger_manipulation,
             weight=cfg.rewards.finger_manipulation.weight,
             params={
+                "phases": cfg.rewards.finger_manipulation.params.get("phases"),
+                "use_hand_pose_gate": cfg.rewards.finger_manipulation.params.get("use_hand_pose_gate"),
                 "pos_std": cfg.rewards.finger_manipulation.params["pos_std"],
                 "rot_std": cfg.rewards.finger_manipulation.params["rot_std"],
-                "disable_in_release": cfg.rewards.finger_manipulation.disable_in_release,
                 "robot_cfg": SceneEntityCfg("robot"),
                 "object_cfg": SceneEntityCfg("object"),
             },
@@ -720,11 +711,12 @@ def _build_rewards_cfg(cfg: Y2RConfig):
             func=mdp.tracking_progress,
             weight=cfg.rewards.tracking_progress.weight,
             params={
+                "phases": cfg.rewards.tracking_progress.params.get("phases"),
+                "use_hand_pose_gate": cfg.rewards.tracking_progress.params.get("use_hand_pose_gate"),
                 "pos_weight": cfg.rewards.tracking_progress.params["pos_weight"],
                 "rot_weight": cfg.rewards.tracking_progress.params["rot_weight"],
                 "positive_only": cfg.rewards.tracking_progress.params["positive_only"],
                 "clip": cfg.rewards.tracking_progress.params["clip"],
-                "disable_in_release": cfg.rewards.tracking_progress.disable_in_release,
             },
         )
 
@@ -732,10 +724,34 @@ def _build_rewards_cfg(cfg: Y2RConfig):
             func=mdp.finger_release,
             weight=cfg.rewards.finger_release.weight,
             params={
+                "phases": cfg.rewards.finger_release.params.get("phases"),
                 "scale": cfg.rewards.finger_release.params["scale"],
                 "arm_joint_count": cfg.robot.arm_joint_count,
                 "hand_joint_count": cfg.robot.hand_joint_count,
                 "robot_cfg": SceneEntityCfg("robot"),
+            },
+        )
+
+        finger_regularizer = RewTerm(
+            func=mdp.finger_regularizer,
+            weight=cfg.rewards.finger_regularizer.weight,
+            params={
+                "phases": cfg.rewards.finger_regularizer.params.get("phases"),
+                "default_joints": cfg.rewards.finger_regularizer.params["default_joints"],
+                "std": cfg.rewards.finger_regularizer.params["std"],
+                "arm_joint_count": cfg.robot.arm_joint_count,
+                "robot_cfg": SceneEntityCfg("robot"),
+            },
+        )
+
+        object_stillness = RewTerm(
+            func=mdp.object_stillness,
+            weight=cfg.rewards.object_stillness.weight,
+            params={
+                "phases": cfg.rewards.object_stillness.params.get("phases"),
+                "lin_std": cfg.rewards.object_stillness.params["lin_std"],
+                "ang_std": cfg.rewards.object_stillness.params["ang_std"],
+                "object_cfg": SceneEntityCfg("object"),
             },
         )
 
@@ -751,13 +767,19 @@ def _build_terminations_cfg(cfg: Y2RConfig):
 
         time_out = DoneTerm(func=mdp.time_out, time_out=True)
 
-        abnormal_robot = DoneTerm(func=mdp.abnormal_robot_state)
-
         trajectory_deviation = DoneTerm(
             func=mdp.trajectory_deviation,
             params={
                 "threshold": cfg.terminations.trajectory_deviation.point_cloud_threshold[0],
                 "rot_threshold": cfg.terminations.trajectory_deviation.rotation_threshold[0],
+            },
+        )
+
+        hand_pose_deviation = DoneTerm(
+            func=mdp.hand_pose_deviation,
+            params={
+                "pos_threshold": cfg.terminations.hand_pose_deviation.position_threshold[0],
+                "rot_threshold": cfg.terminations.hand_pose_deviation.rotation_threshold[0],
             },
         )
 
@@ -847,22 +869,19 @@ class TrajectoryEnvCfg(ManagerBasedEnvCfg):
         # Simulation parameters
         self.decimation = cfg.simulation.decimation
         
-        # Compute episode duration dynamically based on mode
+        # Compute episode duration (same for all modes - push_t uses phases too)
         phases = cfg.trajectory.phases
-        if cfg.push_t.enabled:
-            self.episode_length_s = cfg.push_t.rolling_window
-        else:
-            max_waypoints = cfg.waypoints.count[1]
-            settle_duration = getattr(phases, 'settle', 0.0)
-            # Per-waypoint time = movement + pause
-            waypoint_duration = cfg.waypoints.movement_duration + cfg.waypoints.pause_duration
-            self.episode_length_s = (
-                phases.grasp
-                + phases.manipulate_base
-                + waypoint_duration * max_waypoints  # Movement + pause per waypoint
-                + settle_duration  # Settle phase before retreat
-                + phases.hand_release
-            )
+        max_waypoints = cfg.waypoints.count[1]  # For push_t, this is [0,0] so 0
+        settle_duration = getattr(phases, 'settle', 0.0)
+        # Per-waypoint time = movement + pause
+        waypoint_duration = cfg.waypoints.movement_duration + cfg.waypoints.pause_duration
+        self.episode_length_s = (
+            phases.grasp
+            + phases.manipulate_base
+            + waypoint_duration * max_waypoints  # Movement + pause per waypoint
+            + settle_duration  # Settle phase before retreat
+            + phases.hand_release
+        )
         
         self.is_finite_horizon = True
         self.sim.dt = cfg.simulation.physics_dt
@@ -949,21 +968,21 @@ class TrajectoryEnvCfg(ManagerBasedEnvCfg):
             )
 
     def _setup_push_t_events(self, cfg: Y2RConfig):
-        """Override object reset for push_t mode (fixed rotation).
-        
-        The initial state already has the correct z computed from mesh geometry,
-        so we don't add any z offset during reset (z range is [0, 0]).
+        """Override object reset for push_t mode.
+
+        Uses reset_push_t_object which applies yaw in WORLD frame (around world Z axis).
+        This is necessary because the T-shape has a non-identity default rotation to lay
+        flat on the table, and we want yaw to rotate it on the table surface.
         """
         self.events.reset_object = EventTerm(
-            func=mdp.reset_root_state_uniform,
+            func=mdp.reset_push_t_object,
             mode="reset",
             params={
                 "pose_range": {
                     "x": list(cfg.randomization.reset.object_x),
                     "y": list(cfg.randomization.reset.object_y),
-                    "z": [0.0, 0.0],  # Z already correct from init_state
+                    "yaw": list(cfg.randomization.reset.object_yaw),
                 },
-                "velocity_range": {"x": [0.0, 0.0], "y": [0.0, 0.0], "z": [0.0, 0.0]},
                 "asset_cfg": SceneEntityCfg("object"),
             },
         )

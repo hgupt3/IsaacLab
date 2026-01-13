@@ -117,7 +117,6 @@ class ObservationsConfig:
     num_points: int
     student_num_points: int
     point_pool_size: int
-    clip_range: tuple[float, float]
     history: HistoryConfig
 
 
@@ -136,6 +135,7 @@ class TrajectoryConfig:
     phases: PhasesConfig
     easing_power: float
     release_ease_power: float = 2.0  # Ease-in power for retreat (slow start)
+    skip_manipulation_probability: float = 0.0  # Probability of grasp-only episodes
 
 
 # ==============================================================================
@@ -148,6 +148,11 @@ class GraspSamplingConfig:
     exclude_bottom_fraction: float
     exclude_toward_robot: bool
     toward_robot_threshold: float
+    approach_distance: float | None  # Pre-grasp distance (null = disabled)
+    align_fraction: float            # Fraction of grasp phase for alignment
+    fixed_origin_offset: list[float] | None  # [x,y,z] offset from object center (null = center)
+    fixed_direction: list[float] | None      # [x,y,z] look direction (null = random sampling)
+    fixed_hand_roll: float | None            # Rotation around approach axis (radians, null = auto)
 
 
 @dataclass
@@ -173,6 +178,7 @@ class ReleaseConfig:
 @dataclass
 class HandTrajectoryConfig:
     enabled: bool
+    grasp_rot_completion_fraction: float  # Rotation completes at this fraction of grasp duration
     grasp_sampling: GraspSamplingConfig
     keypoints: GraspKeypointsConfig
     release: ReleaseConfig
@@ -201,6 +207,7 @@ class WaypointsConfig:
     position_range: PositionRangeConfig
     vary_orientation: bool
     max_rotation: float
+    fixed_waypoints: list[list[float]] | None  # [[x,y,z,qw,qx,qy,qz], ...] overrides random
 
 
 @dataclass
@@ -208,13 +215,13 @@ class GoalConfig:
     x_range: tuple[float, float] | None
     y_range: tuple[float, float] | None
     table_margin: float
+    return_to_start: bool  # If true, goal = start position
 
 
 @dataclass
 class RewardConfig:
     weight: float
-    params: dict = field(default_factory=dict)  # Empty if not specified
-    disable_in_release: bool = False  # If True, reward returns 0 during release phase
+    params: dict = field(default_factory=dict)  # All reward-specific params go here
 
 
 @dataclass
@@ -235,6 +242,8 @@ class RewardsConfig:
     tracking_progress: RewardConfig
     hand_pose_following: RewardConfig
     finger_release: RewardConfig
+    finger_regularizer: RewardConfig
+    object_stillness: RewardConfig
 
 
 @dataclass
@@ -245,8 +254,15 @@ class TrajectoryDeviationConfig:
 
 
 @dataclass
+class HandPoseDeviationConfig:
+    position_threshold: tuple[float, float]
+    rotation_threshold: tuple[float, float]
+
+
+@dataclass
 class TerminationsConfig:
     trajectory_deviation: TrajectoryDeviationConfig
+    hand_pose_deviation: HandPoseDeviationConfig
 
 
 @dataclass
@@ -254,6 +270,12 @@ class DifficultyConfig:
     initial: int
     min: int
     max: int
+
+
+@dataclass
+class SchedulerConfig:
+    step_interval: int | None  # Steps between difficulty floor increases (null to disable)
+    use_performance: bool      # Whether performance can advance faster than floor
 
 
 @dataclass
@@ -283,6 +305,7 @@ class GravityConfig:
 @dataclass
 class CurriculumConfig:
     difficulty: DifficultyConfig
+    scheduler: SchedulerConfig
     advancement_tolerances: AdvancementTolerancesConfig
     noise: NoiseConfig
     gravity: GravityConfig
@@ -335,6 +358,7 @@ class VisualizationConfig:
     goal_region: bool
     pose_axes: bool
     hand_pose_targets: bool
+    grasp_surface_point: bool
     env_ids: list[int] | None
     debug_print_rewards: bool
 

@@ -62,21 +62,19 @@ class TrajectoryManager:
         
         # Timing
         self.target_dt = 1.0 / traj.target_hz
-        # For push-T, the trajectory horizon is the rolling window (e.g., 7s), not the full episode
-        if cfg.push_t.enabled:
-            self.total_duration = cfg.push_t.rolling_window
-        else:
-            max_waypoints = cfg.waypoints.count[1]
-            settle_duration = getattr(traj.phases, 'settle', 0.0)
-            # Per-waypoint time = movement + pause
-            waypoint_duration = cfg.waypoints.movement_duration + cfg.waypoints.pause_duration
-            self.total_duration = (
-                traj.phases.grasp
-                + traj.phases.manipulate_base
-                + waypoint_duration * max_waypoints  # Movement + pause per waypoint
-                + settle_duration  # Settle phase before retreat
-                + traj.phases.hand_release
-            )
+        # Total duration is the same for all modes (phases determine episode length)
+        # For push_t, rolling_window is the replanning horizon, not the episode duration
+        max_waypoints = cfg.waypoints.count[1]  # For push_t, this is [0,0] so 0
+        settle_duration = getattr(traj.phases, 'settle', 0.0)
+        # Per-waypoint time = movement + pause
+        waypoint_duration = cfg.waypoints.movement_duration + cfg.waypoints.pause_duration
+        self.total_duration = (
+            traj.phases.grasp
+            + traj.phases.manipulate_base
+            + waypoint_duration * max_waypoints  # Movement + pause per waypoint
+            + settle_duration  # Settle phase before retreat
+            + traj.phases.hand_release
+        )
         
         # Total number of targets for the trajectory buffer
         self.total_targets = int(self.total_duration / self.target_dt) + 1
@@ -109,6 +107,14 @@ class TrajectoryManager:
         self.last_replan_idx = torch.zeros(num_envs, dtype=torch.long, device=device)
         self.current_object_poses = torch.zeros(num_envs, 7, device=device)
         
+        # Skip manipulation flag per env (grasp-only episodes)
+        self.skip_manipulation = torch.zeros(num_envs, dtype=torch.bool, device=device)
+        
+        # Per-env phase boundaries (computed at reset based on actual waypoints + skip flag)
+        self.t_manip_end = torch.zeros(num_envs, device=device)    # End of manipulation phase
+        self.t_settle_end = torch.zeros(num_envs, device=device)   # End of settle phase
+        self.t_episode_end = torch.zeros(num_envs, device=device)  # End of episode (for termination)
+        
         # ========== Hand trajectory buffers ==========
         # Hand trajectory buffer: (num_envs, total_targets, 7) for palm pos(3) + quat(4)
         self.hand_trajectory = torch.zeros(num_envs, self.total_targets, 7, device=device)
@@ -128,6 +134,10 @@ class TrajectoryManager:
         
         # Starting palm pose (captured at reset for interpolation)
         self.start_palm_pose = torch.zeros(num_envs, 7, device=device)
+        
+        # Debug: selected surface point in OBJECT-LOCAL frame for visualization (num_envs, 3)
+        # Stored in local frame so it moves with the object
+        self.debug_surface_point_local = torch.zeros(num_envs, 3, device=device)
         
         # Object scales for variable scale support
         # Read from USD prims after prestartup scale randomization
@@ -185,6 +195,13 @@ class TrajectoryManager:
         self.phase_time[env_ids] = 0.0
         self.current_idx[env_ids] = 0
         
+        # Sample skip_manipulation per env (grasp-only episodes)
+        skip_prob = self.cfg.trajectory.skip_manipulation_probability
+        if skip_prob > 0:
+            self.skip_manipulation[env_ids] = torch.rand(n, device=self.device) < skip_prob
+        else:
+            self.skip_manipulation[env_ids] = False
+        
         # Store start poses and environment origins
         self.start_poses[env_ids] = start_poses
         self.env_origins[env_ids] = env_origins
@@ -202,6 +219,36 @@ class TrajectoryManager:
         self.num_waypoints[env_ids] = torch.randint(
             wp_cfg.count[0], wp_cfg.count[1] + 1, (len(env_ids),), device=self.device
         )
+        
+        # For skip envs: goal = start (object stays in place), no waypoints
+        skip_mask = self.skip_manipulation[env_ids]
+        if skip_mask.any():
+            self.goal_poses[env_ids[skip_mask]] = self.start_poses[env_ids[skip_mask]]
+            self.num_waypoints[env_ids[skip_mask]] = 0
+        
+        # Compute per-env phase boundaries based on actual waypoint count
+        # This matches _compute_progress() which also uses per-env waypoint count
+        phases = self.cfg.trajectory.phases
+        grasp_duration = phases.grasp
+        settle_duration = getattr(phases, 'settle', 0.0)
+        release_duration = phases.hand_release
+        manip_base = phases.manipulate_base
+        waypoint_duration = wp_cfg.movement_duration + wp_cfg.pause_duration
+        
+        # Per-env manipulation duration based on actual waypoint count
+        # Skip envs: 0 manipulation (grasp → release directly)
+        # Normal envs: base + per-waypoint time
+        actual_wp = self.num_waypoints[env_ids].float()
+        manip_dur = torch.where(
+            skip_mask,
+            torch.zeros(n, device=self.device),
+            manip_base + waypoint_duration * actual_wp
+        )
+        
+        # Store phase boundaries
+        self.t_manip_end[env_ids] = grasp_duration + manip_dur
+        self.t_settle_end[env_ids] = self.t_manip_end[env_ids] + settle_duration
+        self.t_episode_end[env_ids] = self.t_settle_end[env_ids] + release_duration
         
         # === Hand trajectory generation (if enabled) ===
         if self.cfg.hand_trajectory.enabled:
@@ -227,16 +274,14 @@ class TrajectoryManager:
             # Sample release pose
             self._sample_release_pose(env_ids, env_origins)
         
-        # Generate entire object trajectory
-        # For push-T mode, use adaptive speed from the start
+        # Generate entire object trajectory (same for all modes - uses phases)
+        # Push_t will replan during manipulation phase in step()
+        self._generate_full_trajectory(env_ids)
+        
+        # For push_t: initialize tracking for manipulation phase replanning
         if self.cfg.push_t.enabled:
-            # Initialize current_object_poses with start poses for initial trajectory
             self.current_object_poses[env_ids] = start_poses
-            self._replan_from_current(env_ids)
-            # Reset replan tracking so first replan happens at correct time
             self.last_replan_idx[env_ids] = 0
-        else:
-            self._generate_full_trajectory(env_ids)
         
         # Generate hand trajectory (after object trajectory, since it depends on it)
         if self.cfg.hand_trajectory.enabled:
@@ -246,7 +291,9 @@ class TrajectoryManager:
         """
         Advance trajectory by one timestep.
         
-        For push-T mode: replans trajectory from current object position every window_size timesteps.
+        For push-T mode: replans manipulation portion of trajectory from current object 
+        position every window_size timesteps, but ONLY during manipulation phase.
+        Grasp and release phases use fixed trajectories (no replanning).
         
         Args:
             dt: Simulation timestep.
@@ -257,30 +304,27 @@ class TrajectoryManager:
         # Compute current target index from time
         new_idx = (self.phase_time / self.target_dt).long()
         
-        # For push-T: don't clamp idx (need continuous replanning)
-        # For normal: clamp to trajectory length
-        if self.cfg.push_t.enabled:
-            self.current_idx = new_idx
-        else:
-            self.current_idx = torch.clamp(new_idx, max=self.total_targets - self.cfg.trajectory.window_size)
+        # Clamp to trajectory length (same for all modes now)
+        self.current_idx = torch.clamp(new_idx, max=self.total_targets - self.cfg.trajectory.window_size)
         
-        # Push-T replanning: regenerate trajectory from current position every window_size timesteps
+        # Push-T replanning: ONLY during manipulation phase
         if self.cfg.push_t.enabled and object_poses is not None:
             self.current_object_poses = object_poses
             replan_interval = self.cfg.trajectory.window_size
             
-            # Check which envs need replanning (every window_size steps, but not at idx 0)
+            # Only replan if in manipulation phase (phase == 1)
+            in_manipulation = self.get_phase() == 1
             steps_since_replan = self.current_idx - self.last_replan_idx
-            needs_replan = (steps_since_replan >= replan_interval) & (self.current_idx > 0)
+            needs_replan = in_manipulation & (steps_since_replan >= replan_interval)
             
             if needs_replan.any():
                 env_ids = torch.where(needs_replan)[0]
-                self._replan_from_current(env_ids)
-                # Reset to start of trajectory buffer after replanning
-                # This ensures current_idx stays within buffer bounds
-                self.current_idx[env_ids] = 0
-                self.last_replan_idx[env_ids] = 0
-                self.phase_time[env_ids] = 0.0
+                self._replan_manipulation_phase(env_ids)
+                self.last_replan_idx[env_ids] = self.current_idx[env_ids]
+                
+                # Regenerate hand trajectory for manipulation phase
+                if self.cfg.hand_trajectory.enabled:
+                    self._update_hand_trajectory_manipulation(env_ids)
 
     def get_window_targets(self) -> torch.Tensor:
         """
@@ -307,13 +351,27 @@ class TrajectoryManager:
         return self.trajectory[batch_idx, self.current_idx]
 
     def _sample_waypoints(self, env_ids: torch.Tensor, start_poses: torch.Tensor, env_origins: torch.Tensor):
-        """Sample 0-2 intermediate waypoints."""
+        """Sample waypoints - use fixed_waypoints if specified, else random."""
         n = len(env_ids)
         cfg = self.cfg
         wp_cfg = cfg.waypoints
         ws_cfg = cfg.workspace
         
+        # Check for fixed waypoints first (overrides random sampling)
+        if wp_cfg.fixed_waypoints is not None:
+            for wp_idx, wp_pose in enumerate(wp_cfg.fixed_waypoints):
+                if wp_idx >= wp_cfg.count[1]:
+                    break
+                # Position in local frame + env origin
+                pos_local = torch.tensor(wp_pose[:3], device=self.device)
+                pos_world = pos_local.unsqueeze(0).expand(n, 3) + env_origins
+                quat = torch.tensor(wp_pose[3:7], device=self.device).unsqueeze(0).expand(n, 4)
+                
+                self.waypoints[env_ids, wp_idx, :3] = pos_world
+                self.waypoints[env_ids, wp_idx, 3:7] = quat
+            return
         
+        # Random waypoint sampling (existing logic)
         # Convert start to local frame for clamping
         start_local = start_poses[:, :3] - env_origins
         
@@ -360,11 +418,17 @@ class TrajectoryManager:
         
         Uses stable poses from trimesh for goal placement (z-position + orientation).
         Different stable poses have different z-positions (e.g., cube on edge vs flat).
+        If return_to_start is True, goal = start position (for return tasks like cup pouring).
         """
         n = len(env_ids)
         cfg = self.cfg
         goal_cfg = cfg.goal
         ws_cfg = cfg.workspace
+        
+        # Return to start position if configured (e.g., cup pouring returns bottle)
+        if goal_cfg.return_to_start:
+            self.goal_poses[env_ids] = start_poses.clone()
+            return
         
         # Random XY (None = use workspace bounds)
         x_range = goal_cfg.x_range if goal_cfg.x_range is not None else ws_cfg.x
@@ -441,8 +505,14 @@ class TrajectoryManager:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Sample grasp pose from object surface normals.
         
-        Samples a surface point (excluding bottom hemisphere), then computes
-        palm pose such that palm Z axis faces toward the object.
+        Two modes:
+        1. fixed_direction specified: Find surface point in that direction from 
+           (object_center + fixed_origin_offset), use its surface normal.
+        2. fixed_direction is None: Randomly sample surface point (excluding bottom).
+        
+        In both cases, grasp pose is derived from the surface normal:
+        - grasp_pos = surface_point + standoff * surface_normal
+        - grasp_quat = palm Z points toward object (opposite of surface normal)
         
         Args:
             env_ids: Environment indices to sample for.
@@ -480,8 +550,6 @@ class TrajectoryManager:
         # Apply scale to points (normals don't need scaling)
         env_points = env_points * scales.unsqueeze(1)
         
-        # Transform normals to WORLD frame for filtering
-        # Objects are placed on table with only yaw variation, so world-Z is always "up"
         obj_pos = object_poses[:, :3]  # (n, 3)
         obj_quat = object_poses[:, 3:7]  # (n, 4)
         
@@ -490,25 +558,59 @@ class TrajectoryManager:
         obj_quat_exp = obj_quat.unsqueeze(1).expand(n, 256, 4).reshape(-1, 4)  # (n*pool_size, 4)
         env_normals_w = quat_apply(obj_quat_exp, env_normals_flat).reshape(n, 256, 3)
         
-        # Filter out bottom hemisphere in WORLD frame
-        # Exclude normals pointing too far downward (toward table)
-        exclude_z = -1.0 + cfg.exclude_bottom_fraction * 2  # e.g., 0.3 -> -0.4
-        valid_mask = env_normals_w[:, :, 2] > exclude_z  # (n, pool_size)
-        
-        # Randomly select one valid point per env
-        # Set invalid points to very low priority
-        rand_vals = torch.rand(n, 256, device=self.device)
-        rand_vals[~valid_mask] = -1.0  # Invalid points won't be selected
-        selected_idx = rand_vals.argmax(dim=1)  # (n,)
+        # Select surface point based on mode
+        if cfg.fixed_direction is not None:
+            # Fixed direction mode: find surface point in specified direction
+            
+            # Compute grasp origin in object-local frame (object center + offset)
+            if cfg.fixed_origin_offset is not None:
+                origin_offset = torch.tensor(cfg.fixed_origin_offset, dtype=torch.float32, device=self.device)
+            else:
+                origin_offset = torch.zeros(3, device=self.device)
+            
+            # Direction in object-local frame (normalized)
+            direction = torch.tensor(cfg.fixed_direction, dtype=torch.float32, device=self.device)
+            direction = direction / (direction.norm() + 1e-8)
+            
+            # Find surface point with maximum projection onto direction from origin
+            # For each point: score = (point - origin) · direction
+            # Higher score = further along the direction = on the surface facing that way
+            points_from_origin = env_points - origin_offset.unsqueeze(0).unsqueeze(0)  # (n, pool_size, 3)
+            projections = (points_from_origin * direction.unsqueeze(0).unsqueeze(0)).sum(dim=-1)  # (n, pool_size)
+            
+            # Select point with maximum projection (furthest in the direction)
+            selected_idx = projections.argmax(dim=1)  # (n,)
+        else:
+            # Random sampling mode: filter bottom hemisphere and randomly select
+            
+            # Filter out bottom hemisphere in WORLD frame
+            exclude_z = -1.0 + cfg.exclude_bottom_fraction * 2  # e.g., 0.3 -> -0.4
+            valid_mask = env_normals_w[:, :, 2] > exclude_z  # (n, pool_size)
+            
+            # Randomly select one valid point per env
+            rand_vals = torch.rand(n, 256, device=self.device)
+            rand_vals[~valid_mask] = -1.0  # Invalid points won't be selected
+            selected_idx = rand_vals.argmax(dim=1)  # (n,)
         
         batch_idx = torch.arange(n, device=self.device)
         surface_points = env_points[batch_idx, selected_idx]  # (n, 3) in object-local frame
         surface_normals = env_normals[batch_idx, selected_idx]  # (n, 3) in object-local frame
         
+        # Fix potentially inverted normals: if we selected a point in +Y direction,
+        # the outward normal should also point roughly +Y. If it points opposite, flip it.
+        if cfg.fixed_direction is not None:
+            # Check alignment: dot(normal, direction) should be positive for outward normal
+            alignment = (surface_normals * direction.unsqueeze(0)).sum(dim=-1)  # (n,)
+            flip_mask = alignment < 0  # Normal points wrong way
+            surface_normals[flip_mask] = -surface_normals[flip_mask]
+        
         # Rotate surface point and normal to world frame
         surface_points_w = quat_apply(obj_quat, surface_points) + obj_pos
         surface_normals_w = quat_apply(obj_quat, surface_normals)
         surface_normals_w = surface_normals_w / (surface_normals_w.norm(dim=-1, keepdim=True) + 1e-8)
+        
+        # Store surface point in LOCAL frame for debug visualization (moves with object)
+        self.debug_surface_point_local[env_ids] = surface_points
         
         # Sample standoff distance
         standoff = sample_uniform(
@@ -519,28 +621,31 @@ class TrajectoryManager:
         grasp_pos = surface_points_w + standoff.unsqueeze(-1) * surface_normals_w
         
         # Palm orientation: Z axis points toward object (opposite of normal)
-        # We need to construct a rotation where palm_z = -surface_normal
         grasp_quat = self._quat_from_z_axis(-surface_normals_w)
         
+        # Apply fixed hand roll (rotation around approach/Z axis)
+        if cfg.fixed_hand_roll is not None:
+            roll_quat = quat_from_euler_xyz(
+                torch.zeros(n, device=self.device),
+                torch.zeros(n, device=self.device),
+                torch.full((n,), cfg.fixed_hand_roll, device=self.device),
+            )
+            # Apply roll in local frame (around palm Z)
+            grasp_quat = quat_mul(grasp_quat, roll_quat)
+        
         # Filter: exclude grasps where fingers point toward robot (+X direction)
-        # If fingers point toward robot, flip 180° around palm's local Z axis
         if cfg.exclude_toward_robot:
-            # Get finger direction (palm X axis) in world frame
             x_axis = torch.tensor([1.0, 0.0, 0.0], device=self.device)
             finger_dir_w = quat_apply(grasp_quat, x_axis.expand(n, 3))  # (n, 3)
             
-            # Check if finger X component is too positive (pointing toward robot at origin)
             toward_robot = finger_dir_w[:, 0] > cfg.toward_robot_threshold
             
             if toward_robot.any():
-                # Rotate 180° around LOCAL Z axis (palm Z) to flip finger direction
-                # Order: quat_mul(grasp_quat, flip_quat) applies flip in local frame first
                 flip_quat = quat_from_euler_xyz(
                     torch.zeros(toward_robot.sum(), device=self.device),
                     torch.zeros(toward_robot.sum(), device=self.device),
                     torch.full((toward_robot.sum(),), math.pi, device=self.device),
                 )
-                # Apply flip in local frame: keeps palm facing object, flips finger direction
                 grasp_quat[toward_robot] = quat_mul(grasp_quat[toward_robot], flip_quat)
         
         return grasp_pos, grasp_quat
@@ -700,6 +805,9 @@ class TrajectoryManager:
     def _generate_hand_trajectory(self, env_ids: torch.Tensor):
         """Generate hand (palm) trajectory through grasp → manipulation → release.
         
+        Uses per-env phase boundaries (t_manip_end, t_settle_end) computed at reset
+        based on actual waypoint count and skip_manipulation flag.
+        
         Args:
             env_ids: Environment indices.
         """
@@ -708,25 +816,20 @@ class TrajectoryManager:
         cfg = self.cfg
         phases = cfg.trajectory.phases
         
-        # Phase timing - use CONSISTENT duration matching object trajectory
+        # Phase timing from config
         grasp_duration = phases.grasp
         release_duration = phases.hand_release
         
-        # Get actual num_kp per env (for interpolation) but use MAX for timing
+        # Get actual num_kp per env (for keypoint interpolation)
         num_kp = self.num_grasp_keypoints[env_ids]  # (n,)
         max_kp = cfg.hand_trajectory.keypoints.count[1]
-        max_wp = cfg.waypoints.count[1]
         
-        # Manipulation duration matches object trajectory (fixed, not per-env)
-        # Duration scales with waypoints only, keypoints are spread within the fixed time
-        manip_base = phases.manipulate_base
-        movement_duration = cfg.waypoints.movement_duration
-        pause_duration = cfg.waypoints.pause_duration
-        waypoint_duration = movement_duration + pause_duration  # Per-waypoint time
-        manip_duration = manip_base + waypoint_duration * max_wp
+        # Use per-env phase boundaries computed at reset
+        t_manip_end_per_env = self.t_manip_end[env_ids]    # (n,)
+        t_settle_end_per_env = self.t_settle_end[env_ids]  # (n,)
         
-        # Settle phase duration (hand stays still, fingers can open)
-        settle_duration = getattr(phases, 'settle', 0.0)
+        # Compute per-env manipulation duration from boundaries
+        manip_duration_per_env = t_manip_end_per_env - grasp_duration  # (n,)
         
         # Release ease-in power (slow start, fast end)
         release_ease_power = getattr(cfg.trajectory, 'release_ease_power', 2.0)
@@ -735,11 +838,7 @@ class TrajectoryManager:
         times = torch.arange(T, device=self.device).float() * self.target_dt  # (T,)
         times = times.unsqueeze(0).expand(n, T)  # (n, T)
         
-        # Phase boundaries (consistent across all envs)
-        t_grasp_end = grasp_duration
-        t_manip_end = t_grasp_end + manip_duration  # scalar, not per-env
-        t_settle_end = t_manip_end + settle_duration  # End of settle phase
-        t_release_end = t_settle_end + release_duration
+        t_grasp_end = grasp_duration  # scalar (same for all)
         
         # Initialize trajectory
         positions = torch.zeros(n, T, 3, device=self.device)
@@ -762,23 +861,70 @@ class TrajectoryManager:
         grasp_pos_w = quat_apply(obj_quat, grasp_pos) + obj_pos
         grasp_quat_w = quat_mul(obj_quat, grasp_quat)
         
-        # === Phase 1: Grasp (interpolate start → grasp) ===
+        # === Phase 1: Grasp ===
+        grasp_cfg = cfg.hand_trajectory.grasp_sampling
+        approach_dist = grasp_cfg.approach_distance
+        
         grasp_mask = times < t_grasp_end  # (n, T)
         grasp_progress = (times / grasp_duration).clamp(0.0, 1.0)  # (n, T)
         
-        # Vectorized linear interpolation for position
-        p = grasp_progress.unsqueeze(-1)  # (n, T, 1)
-        grasp_lerp_pos = (1 - p) * start_pos.unsqueeze(1) + p * grasp_pos_w.unsqueeze(1)  # (n, T, 3)
-        grasp_lerp_quat = self._batched_slerp(
-            start_quat.unsqueeze(1).expand(n, T, 4),
-            grasp_quat_w.unsqueeze(1).expand(n, T, 4),
-            grasp_progress
-        )  # (n, T, 4)
-        positions = torch.where(grasp_mask.unsqueeze(-1), grasp_lerp_pos, positions)
-        orientations = torch.where(grasp_mask.unsqueeze(-1), grasp_lerp_quat, orientations)
+        # Fast-track rotation: complete earlier than position
+        rot_fraction = cfg.hand_trajectory.grasp_rot_completion_fraction
+        rot_progress = (grasp_progress / rot_fraction).clamp(0.0, 1.0)  # (n, T)
+        
+        if approach_dist is not None:
+            # Pre-grasp approach enabled: start → pre-grasp → grasp
+            align_frac = grasp_cfg.align_fraction
+            
+            # Compute pre-grasp position (approach_dist behind grasp along palm Z)
+            # Palm Z axis points toward object (approach direction)
+            palm_z = quat_apply(grasp_quat_w, torch.tensor([0., 0., 1.], device=self.device).expand(n, 3))
+            pre_grasp_pos_w = grasp_pos_w - approach_dist * palm_z  # (n, 3)
+            pre_grasp_quat_w = grasp_quat_w  # Same orientation (already facing object)
+            
+            # Split grasp phase into align (0 to align_frac) and approach (align_frac to 1.0)
+            # Align phase: start → pre-grasp
+            align_mask = grasp_mask & (grasp_progress < align_frac)
+            align_progress = (grasp_progress / align_frac).clamp(0.0, 1.0)  # 0→1 within align phase
+            
+            # Approach phase: pre-grasp → grasp
+            approach_mask = grasp_mask & (grasp_progress >= align_frac)
+            approach_progress = ((grasp_progress - align_frac) / (1 - align_frac)).clamp(0.0, 1.0)  # 0→1 within approach phase
+            
+            # Interpolate align phase: start → pre-grasp
+            p_align = align_progress.unsqueeze(-1)  # (n, T, 1)
+            align_pos = (1 - p_align) * start_pos.unsqueeze(1) + p_align * pre_grasp_pos_w.unsqueeze(1)
+            align_quat = self._batched_slerp(
+                start_quat.unsqueeze(1).expand(n, T, 4),
+                pre_grasp_quat_w.unsqueeze(1).expand(n, T, 4),
+                (rot_progress / align_frac).clamp(0.0, 1.0)  # Fast-track rotation completes during align
+            )
+            positions = torch.where(align_mask.unsqueeze(-1), align_pos, positions)
+            orientations = torch.where(align_mask.unsqueeze(-1), align_quat, orientations)
+            
+            # Interpolate approach phase: pre-grasp → grasp
+            p_approach = approach_progress.unsqueeze(-1)  # (n, T, 1)
+            approach_pos = (1 - p_approach) * pre_grasp_pos_w.unsqueeze(1) + p_approach * grasp_pos_w.unsqueeze(1)
+            # Orientation stays at grasp orientation during approach (rotation already complete)
+            approach_quat = grasp_quat_w.unsqueeze(1).expand(n, T, 4)
+            positions = torch.where(approach_mask.unsqueeze(-1), approach_pos, positions)
+            orientations = torch.where(approach_mask.unsqueeze(-1), approach_quat, orientations)
+        else:
+            # Original behavior: direct start → grasp
+            p = grasp_progress.unsqueeze(-1)  # (n, T, 1)
+            grasp_lerp_pos = (1 - p) * start_pos.unsqueeze(1) + p * grasp_pos_w.unsqueeze(1)  # (n, T, 3)
+            # Rotation uses fast-tracked progress
+            grasp_lerp_quat = self._batched_slerp(
+                start_quat.unsqueeze(1).expand(n, T, 4),
+                grasp_quat_w.unsqueeze(1).expand(n, T, 4),
+                rot_progress  # Fast-tracked rotation
+            )  # (n, T, 4)
+            positions = torch.where(grasp_mask.unsqueeze(-1), grasp_lerp_pos, positions)
+            orientations = torch.where(grasp_mask.unsqueeze(-1), grasp_lerp_quat, orientations)
         
         # === Phase 2: Manipulation (interpolate through keypoints, relative to object) ===
-        manip_mask = (times >= t_grasp_end) & (times < t_manip_end)
+        # For skip envs: manip_mask is always False (skip directly to settle)
+        manip_mask = (times >= t_grasp_end) & (times < t_manip_end_per_env.unsqueeze(1))
         
         # Get object trajectory for transforming relative poses to world frame
         obj_trajectory = self.trajectory[env_ids]  # (n, T, 7)
@@ -789,8 +935,10 @@ class TrajectoryManager:
         keypoints = self.grasp_keypoints[env_ids]  # (n, max_kp, 7)
         
         # Compute manipulation progress (0 to 1) within manipulation phase
+        # Use per-env duration to avoid division by zero for skip envs
         manip_time = (times - t_grasp_end).clamp(min=0.0)  # (n, T)
-        manip_progress = (manip_time / manip_duration).clamp(0.0, 1.0)  # (n, T)
+        safe_manip_duration = manip_duration_per_env.clamp(min=1e-6)  # Avoid div by zero
+        manip_progress = (manip_time / safe_manip_duration.unsqueeze(1)).clamp(0.0, 1.0)  # (n, T)
         
         # Build PALINDROME keypoint chain: [grasp, kp_0, ..., kp_N, ..., kp_0, grasp]
         # For N keypoints: grasp → kp_0 → ... → kp_{N-1} → kp_{N-2} → ... → kp_0 → grasp
@@ -896,23 +1044,28 @@ class TrajectoryManager:
         final_rel_quat = kp_chain[batch_idx_1d, final_chain_idx, 3:7]  # (n, 4) = grasp_quat
         
         # Transform final relative pose using object position at END of manipulation
-        manip_end_idx = int(t_manip_end / self.target_dt)
-        manip_end_idx = min(manip_end_idx, T - 1)
-        obj_pos_at_release = obj_pos_t[:, manip_end_idx, :]  # (n, 3)
-        obj_quat_at_release = obj_quat_t[:, manip_end_idx, :]  # (n, 4)
+        # For skip envs: use grasp end time (object doesn't move during "manipulation")
+        manip_end_idx_per_env = (t_manip_end_per_env / self.target_dt).long().clamp(0, T - 1)  # (n,)
+        obj_pos_at_release = obj_pos_t[batch_idx_1d, manip_end_idx_per_env, :]  # (n, 3)
+        obj_quat_at_release = obj_quat_t[batch_idx_1d, manip_end_idx_per_env, :]  # (n, 4)
         final_grasp_pos_w = quat_apply(obj_quat_at_release, final_rel_pos) + obj_pos_at_release
         final_grasp_quat_w = quat_mul(obj_quat_at_release, final_rel_quat)
         
         # Settle phase: hand stays at final manipulation pose (fingers can open)
-        settle_mask = (times >= t_manip_end) & (times < t_settle_end)
+        # Use per-env boundaries for skip support
+        settle_mask = (times >= t_manip_end_per_env.unsqueeze(1)) & (times < t_settle_end_per_env.unsqueeze(1))
         positions = torch.where(settle_mask.unsqueeze(-1), 
                                final_grasp_pos_w.unsqueeze(1).expand(n, T, 3), positions)
         orientations = torch.where(settle_mask.unsqueeze(-1), 
                                   final_grasp_quat_w.unsqueeze(1).expand(n, T, 4), orientations)
         
         # === Phase 4: Retreat (interpolate to release pose with ease-in) ===
-        retreat_mask = times >= t_settle_end
-        retreat_linear = ((times - t_settle_end) / release_duration).clamp(0.0, 1.0)
+        retreat_mask = times >= t_settle_end_per_env.unsqueeze(1)
+        # Speed up retreat to complete before buffer ends, leaving room for hold at release
+        # This ensures the last window_size targets are all at release pose
+        window_buffer = self.cfg.trajectory.window_size * self.target_dt
+        effective_release_duration = max(release_duration - window_buffer, self.target_dt)
+        retreat_linear = ((times - t_settle_end_per_env.unsqueeze(1)) / effective_release_duration).clamp(0.0, 1.0)
         # Apply ease-in: slow start, fast end (t^power)
         retreat_progress = retreat_linear ** release_ease_power
         
@@ -965,7 +1118,7 @@ class TrajectoryManager:
         times = times.unsqueeze(0).expand(n, T)  # (n, T)
         
         # Compute progress (0 to 1) based on phase
-        progress = self._compute_progress(times)  # (n, T)
+        progress = self._compute_progress(env_ids, times)  # (n, T)
         
         # Interpolate positions through start -> waypoints -> goal
         positions = self._interpolate_positions(env_ids, progress)  # (n, T, 3)
@@ -980,66 +1133,173 @@ class TrajectoryManager:
         self.trajectory[env_ids, :, :3] = positions
         self.trajectory[env_ids, :, 3:7] = orientations
 
-    def _replan_from_current(self, env_ids: torch.Tensor):
-        """Regenerate trajectory from current object pose to goal (push-T mode).
+    def _replan_manipulation_phase(self, env_ids: torch.Tensor):
+        """Replan manipulation portion of trajectory to current segment target.
         
-        Generates a trajectory from current object position to goal with minimum speed
-        enforcement. Uses rolling_window as the base planning horizon, but adjusts it
-        if the distance is small to maintain at least min_speed.
+        Segment-aware replanning: determines which segment we're in based on
+        manipulation progress and replans to that segment's target:
+        - Segment 0: heading to waypoint_0
+        - Segment 1: heading to waypoint_1 (or goal if only 1 waypoint)
+        - ...
+        - Segment N: heading to goal
         
-        This prevents infinite slowdown when very close to goal while ensuring the
-        object stays at goal once reached.
+        This method:
+        - Only updates trajectory indices from current_idx to segment end
+        - Does not reset phase_time or current_idx (episode continues normally)
+        - Uses rolling_window as planning horizon
+        - Enforces minimum speed to prevent infinite slowdown near target
+        
+        Args:
+            env_ids: Environment indices to replan.
         """
-        # Update start poses to current actual object positions
-        self.start_poses[env_ids] = self.current_object_poses[env_ids]
+        n = len(env_ids)
+        if n == 0:
+            return
         
-        # Build trajectories per env (need per-env durations for min_speed enforcement)
-        for env_id in env_ids:
-            env_id = env_id.item()
+        # Get current object positions
+        current_pos = self.current_object_poses[env_ids, :3]  # (n, 3)
+        current_quat = self.current_object_poses[env_ids, 3:7]  # (n, 4)
+        
+        # Compute manipulation progress (0 to 1)
+        grasp_end = self.cfg.trajectory.phases.grasp
+        manip_duration = self.t_manip_end[env_ids] - grasp_end  # (n,)
+        manip_time = self.phase_time[env_ids] - grasp_end  # (n,)
+        progress = (manip_time / manip_duration.clamp(min=1e-6)).clamp(0.0, 1.0)  # (n,)
+        
+        # Determine segment index based on progress
+        # With N waypoints, there are N+1 segments
+        num_wp = self.num_waypoints[env_ids].float()  # (n,)
+        num_segments = num_wp + 1  # (n,)
+        segment_idx = (progress * num_segments).long()
+        segment_idx = segment_idx.clamp(max=(num_segments - 1).long())  # Clamp to last segment
+        
+        # Get per-env manipulation end index
+        manip_end_idx = (self.t_manip_end[env_ids] / self.target_dt).long()  # (n,)
+        current_idx = self.current_idx[env_ids]  # (n,)
+        
+        # Planning horizon from config
+        rolling_window_targets = int(self.cfg.push_t.rolling_window / self.target_dt)
+        
+        for i, env_id in enumerate(env_ids):
+            env_id_item = env_id.item()
+            start_idx = current_idx[i].item()
+            end_idx = manip_end_idx[i].item()
+            seg = segment_idx[i].item()
+            n_wp = int(num_wp[i].item())
             
-            # Calculate distance to goal
-            start_pos = self.start_poses[env_id:env_id+1, :3]  # (1, 3)
-            goal_pos = self.goal_poses[env_id:env_id+1, :3]    # (1, 3)
-            distance_to_goal = torch.norm(goal_pos - start_pos).item()
-            
-            # Enforce minimum speed: adjust duration if natural speed would be too slow
-            rolling_window = self.cfg.push_t.rolling_window
-            min_speed = self.cfg.push_t.min_speed
-            natural_speed = distance_to_goal / rolling_window if rolling_window > 0 else float('inf')
-            
-            if natural_speed < min_speed and distance_to_goal > 1e-4:
-                # Too slow - use min_speed to determine duration
-                duration = max(distance_to_goal / min_speed, self.target_dt)
+            # Get target for this segment (waypoint or goal)
+            if seg < n_wp:
+                # Heading to waypoint[seg]
+                target_pos = self.waypoints[env_id_item, seg, :3].unsqueeze(0)  # (1, 3)
+                target_quat = self.waypoints[env_id_item, seg, 3:7].unsqueeze(0)  # (1, 4)
             else:
-                # Normal speed or already at goal - use full rolling window
-                duration = rolling_window
+                # Heading to goal
+                target_pos = self.goal_poses[env_id_item, :3].unsqueeze(0)  # (1, 3)
+                target_quat = self.goal_poses[env_id_item, 3:7].unsqueeze(0)  # (1, 4)
             
-            # Generate targets for this duration
-            # Start from target_dt ahead (skip the "current position" target)
-            num_tgt = min(int(duration / self.target_dt) + 1, self.total_targets)
+            # Current position for this env
+            pos = current_pos[i:i+1]  # (1, 3)
+            quat = current_quat[i:i+1]  # (1, 4)
             
-            # Time array starting from target_dt (not 0)
-            times = (torch.arange(num_tgt, device=self.device).float() + 1) * self.target_dt
-            progress = (times / duration).clamp(0.0, 1.0) if duration > 0 else torch.ones(num_tgt, device=self.device)
+            # Remaining targets in manipulation phase
+            num_remaining = max(1, end_idx - start_idx)
             
-            # Interpolate positions (lerp)
-            positions = start_pos + progress.unsqueeze(-1) * (goal_pos - start_pos)
+            # Use rolling_window as planning horizon, but not exceeding remaining time
+            horizon = min(rolling_window_targets, num_remaining)
             
-            # Interpolate orientations (slerp)
-            start_quat = self.start_poses[env_id:env_id+1, 3:7][0]  # (4,)
-            goal_quat = self.goal_poses[env_id:env_id+1, 3:7][0]    # (4,)
-            orientations = torch.zeros(num_tgt, 4, device=self.device)
-            for t, t_val in enumerate(progress):
-                orientations[t] = self._slerp(start_quat, goal_quat, t_val.item())
+            # Calculate distance to segment target for speed adjustment
+            distance_to_target = torch.norm(target_pos - pos).item()
             
-            # Store in trajectory buffer (pad remaining with goal pose)
-            self.trajectory[env_id, :num_tgt, :3] = positions
-            self.trajectory[env_id, :num_tgt, 3:7] = orientations
-            if num_tgt < self.total_targets:
-                # Fill rest of trajectory with goal pose (stay at goal)
-                self.trajectory[env_id, num_tgt:, :3] = goal_pos
-                self.trajectory[env_id, num_tgt:, 3:7] = goal_quat
-    
+            # Enforce minimum speed
+            remaining_time = num_remaining * self.target_dt
+            min_speed = self.cfg.push_t.min_speed
+            natural_speed = distance_to_target / remaining_time if remaining_time > 0 else float('inf')
+            
+            if natural_speed < min_speed and distance_to_target > 1e-4:
+                # Object is close to target but has time left - move at min_speed
+                actual_duration = distance_to_target / min_speed
+                actual_targets = min(int(actual_duration / self.target_dt) + 1, horizon)
+            else:
+                # Normal case: spread movement over horizon
+                actual_targets = horizon
+            
+            # Generate trajectory from current to segment target
+            if actual_targets > 0:
+                interp_progress = torch.linspace(0, 1, actual_targets, device=self.device)
+                
+                # Interpolate positions
+                positions = pos + interp_progress.unsqueeze(-1) * (target_pos - pos)  # (actual_targets, 3)
+                
+                # Interpolate orientations
+                orientations = self._batched_slerp(
+                    quat.expand(actual_targets, 4),
+                    target_quat.expand(actual_targets, 4),
+                    interp_progress
+                )  # (actual_targets, 4)
+                
+                # Write to trajectory buffer starting from current_idx
+                write_end = min(start_idx + actual_targets, self.total_targets)
+                write_len = write_end - start_idx
+                self.trajectory[env_id_item, start_idx:write_end, :3] = positions[:write_len]
+                self.trajectory[env_id_item, start_idx:write_end, 3:7] = orientations[:write_len]
+            
+            # Fill remaining manipulation indices with segment target pose
+            if start_idx + actual_targets < end_idx:
+                fill_start = start_idx + actual_targets
+                fill_end = min(end_idx, self.total_targets)
+                self.trajectory[env_id_item, fill_start:fill_end, :3] = target_pos
+                self.trajectory[env_id_item, fill_start:fill_end, 3:7] = target_quat
+
+    def _update_hand_trajectory_manipulation(self, env_ids: torch.Tensor):
+        """Update hand trajectory for remaining manipulation phase after object replan.
+        
+        Hand maintains grasp_pose (fixed relative pose) to the object.
+        Transforms grasp_pose to world frame using updated object trajectory.
+        
+        Args:
+            env_ids: Environment indices to update.
+        """
+        from isaaclab.utils.math import quat_mul, quat_apply
+        
+        n = len(env_ids)
+        if n == 0:
+            return
+        
+        # Get per-env manipulation phase bounds
+        grasp_end_idx = int(self.cfg.trajectory.phases.grasp / self.target_dt)
+        manip_end_idx = (self.t_manip_end[env_ids] / self.target_dt).long()  # (n,)
+        current_idx = self.current_idx[env_ids]  # (n,)
+        
+        # Get grasp pose relative to object (stored at reset)
+        grasp_pos_rel = self.grasp_pose[env_ids, :3]  # (n, 3)
+        grasp_quat_rel = self.grasp_pose[env_ids, 3:7]  # (n, 4)
+        
+        # Update hand trajectory for each env from current_idx to manip_end
+        for i, env_id in enumerate(env_ids):
+            env_id = env_id.item()
+            start_idx = max(current_idx[i].item(), grasp_end_idx)
+            end_idx = min(manip_end_idx[i].item(), self.total_targets)
+            
+            if start_idx >= end_idx:
+                continue
+            
+            num_targets = end_idx - start_idx
+            
+            # Get updated object trajectory for this range
+            obj_pos = self.trajectory[env_id, start_idx:end_idx, :3]  # (num_targets, 3)
+            obj_quat = self.trajectory[env_id, start_idx:end_idx, 3:7]  # (num_targets, 4)
+            
+            # Transform grasp pose to world frame: hand_pos_w = obj_pos + R_obj * grasp_pos_rel
+            grasp_pos_local = grasp_pos_rel[i:i+1].expand(num_targets, 3)  # (num_targets, 3)
+            grasp_quat_local = grasp_quat_rel[i:i+1].expand(num_targets, 4)  # (num_targets, 4)
+            
+            hand_pos_w = quat_apply(obj_quat, grasp_pos_local) + obj_pos  # (num_targets, 3)
+            hand_quat_w = quat_mul(obj_quat, grasp_quat_local)  # (num_targets, 4)
+            
+            # Update hand trajectory
+            self.hand_trajectory[env_id, start_idx:end_idx, :3] = hand_pos_w
+            self.hand_trajectory[env_id, start_idx:end_idx, 3:7] = hand_quat_w
+
     def _slerp(self, q1: torch.Tensor, q2: torch.Tensor, t: float) -> torch.Tensor:
         """Spherical linear interpolation between two quaternions."""
         dot = (q1 * q2).sum()
@@ -1064,7 +1324,7 @@ class TrajectoryManager:
         
         return w1 * q1 + w2 * q2
 
-    def _compute_progress(self, times: torch.Tensor) -> torch.Tensor:
+    def _compute_progress(self, env_ids: torch.Tensor, times: torch.Tensor) -> torch.Tensor:
         """
         Compute progress (0 to 1) with phase-based easing and waypoint pauses.
         
@@ -1075,69 +1335,80 @@ class TrajectoryManager:
         - hand_release: stationary at goal (progress = 1) - object stays while hand retreats
         
         Waypoint pauses: Object pauses briefly at each waypoint before continuing.
+        
+        Uses per-env waypoint count for timing, so envs with fewer waypoints
+        reach goal faster.
+        
+        Args:
+            env_ids: Environment indices (n,)
+            times: Time array (n, T)
         """
         cfg = self.cfg.trajectory
-        hand_cfg = self.cfg.hand_trajectory
         wp_cfg = self.cfg.waypoints
         n, T = times.shape
         
-        # Compute manipulation duration components
-        # Duration scales with waypoints only, keypoints are spread within the fixed time
-        max_wp = wp_cfg.count[1]
+        # Per-env waypoint count and skip flag
+        num_wp = self.num_waypoints[env_ids].float()  # (n,)
+        skip_mask = self.skip_manipulation[env_ids]   # (n,)
+        
+        # Duration components
         base_move_duration = cfg.phases.manipulate_base
         movement_duration = wp_cfg.movement_duration
         pause_duration = wp_cfg.pause_duration
-        # Total movement time = base + extra per waypoint
-        total_move_duration = base_move_duration + movement_duration * max_wp
         waypoint_duration = movement_duration + pause_duration  # Per-waypoint time
-        manip_duration = base_move_duration + waypoint_duration * max_wp
         
-        # Push-T mode: always manipulate phase, no grasp/release, no pauses
-        if self.cfg.push_t.enabled:
-            # Map time directly to progress with symmetric easing
-            local_t = (times / base_move_duration).clamp(0.0, 1.0)  # 0 to 1
-            
-            # Split into first half (ease-in) and second half (ease-out)
-            first_half = local_t < 0.5
-            second_half = ~first_half
-            
-            progress = torch.zeros_like(local_t)
-            
-            # First half: ease-in (0 -> 0.5)
-            if first_half.any():
-                t_normalized = local_t[first_half] * 2.0  # Map [0, 0.5] -> [0, 1]
-                progress[first_half] = (t_normalized ** cfg.easing_power) * 0.5
-            
-            # Second half: ease-out (0.5 -> 1.0)
-            if second_half.any():
-                t_normalized = (local_t[second_half] - 0.5) * 2.0  # Map [0.5, 1] -> [0, 1]
-                progress[second_half] = 0.5 + (1.0 - (1.0 - t_normalized) ** cfg.easing_power) * 0.5
-            
-            return progress.clamp(0.0, 1.0)
+        # Per-env manipulation duration
+        # Skip envs: 0 manipulation (grasp → release directly)
+        # Normal envs: base + per-waypoint time
+        manip_duration = torch.where(
+            skip_mask,
+            torch.zeros(n, device=self.device),
+            base_move_duration + waypoint_duration * num_wp
+        )  # (n,)
         
-        # Normal mode: phases
-        # Phase boundaries  
-        t1 = cfg.phases.grasp  # End of grasp phase
-        t2 = t1 + manip_duration  # End of manipulate phase (including pauses)
+        # Per-env total movement time (excluding pauses)
+        # For skip envs, this is 0
+        total_move_duration = torch.where(
+            skip_mask,
+            torch.zeros(n, device=self.device),
+            base_move_duration + movement_duration * num_wp
+        )  # (n,)
+        
+        # All modes use phases (push_t included - grasp/manipulation/release)
+        t1 = cfg.phases.grasp  # End of grasp phase (same for all)
+        t2 = t1 + manip_duration  # Per-env end of manipulate phase (n,)
         
         progress = torch.zeros_like(times)
         
         # Grasp phase: progress = 0 (object stationary while hand approaches)
         # Already zeros
         
-        # Manipulate phase with waypoint pauses (vectorized)
-        mask = (times >= t1) & (times < t2)
+        # Per-env manipulation phase with waypoint pauses
+        # Expand t2 to (n, T) for comparison
+        t2_expanded = t2.unsqueeze(1).expand(n, T)
+        mask = (times >= t1) & (times < t2_expanded)
+        
         if mask.any():
-            manip_t = times[mask] - t1  # Time within manipulation phase
+            # For each (env, time) in mask, compute progress
+            # We need to handle this per-env since durations differ
             
-            # Structure: move1 → pause1 → move2 → pause2 → ... → moveN (no pause after last)
-            num_seg = max_wp + 1
-            move_per_seg = total_move_duration / num_seg  # Equal movement time per segment
-            block_duration = move_per_seg + pause_duration  # Time per block (move + pause)
+            manip_t = times - t1  # Time within manipulation phase (n, T)
+            
+            # Per-env number of segments: num_wp + 1
+            num_seg = (num_wp + 1).unsqueeze(1)  # (n, 1)
+            
+            # Per-env move time per segment
+            safe_total_move = total_move_duration.clamp(min=1e-6)  # Avoid div by zero
+            move_per_seg = (safe_total_move / num_seg.squeeze(1)).unsqueeze(1)  # (n, 1)
+            
+            # Per-env block duration (move + pause)
+            block_duration = move_per_seg + pause_duration  # (n, 1)
             
             # Which block are we in?
-            seg_idx = (manip_t / block_duration).long().clamp(0, num_seg - 1)
-            block_t = manip_t - seg_idx.float() * block_duration  # Time within block
+            max_seg = (num_seg - 1).long()  # (n, 1)
+            seg_idx = (manip_t / block_duration).long()  # (n, T)
+            seg_idx = torch.clamp(seg_idx, min=torch.zeros_like(max_seg), max=max_seg)  # (n, T)
+            block_t = manip_t - seg_idx.float() * block_duration  # (n, T)
             
             # Are we moving or pausing?
             in_move = block_t < move_per_seg
@@ -1156,10 +1427,11 @@ class TrajectoryManager:
                 0.5 + (1.0 - ((1.0 - raw_progress) * 2.0) ** cfg.easing_power) * 0.5
             )
             
-            progress[mask] = eased
+            # Only apply to masked positions
+            progress = torch.where(mask, eased, progress)
         
         # Release phase: progress = 1 (object stationary at goal)
-        mask_release = times >= t2
+        mask_release = times >= t2_expanded
         progress[mask_release] = 1.0
         
         return progress.clamp(0.0, 1.0)
@@ -1378,24 +1650,17 @@ class TrajectoryManager:
         Note: Settle phase is included in release (phase 2) for reward purposes.
         During settle, trajectory_success and finger_release are active,
         manipulation rewards are disabled.
+        
+        Uses per-env phase boundaries (t_manip_end) computed at reset based on
+        actual waypoint count and skip_manipulation flag.
         """
-        cfg = self.cfg.trajectory
-        wp_cfg = self.cfg.waypoints
         t = self.phase_time
+        t_grasp_end = self.cfg.trajectory.phases.grasp
         
-        # Compute manipulation duration (including waypoint movement + pauses)
-        # Duration scales with waypoints only, keypoints are spread within the fixed time
-        max_wp = wp_cfg.count[1]
-        base_move_duration = cfg.phases.manipulate_base
-        waypoint_duration = wp_cfg.movement_duration + wp_cfg.pause_duration
-        manip_duration = base_move_duration + waypoint_duration * max_wp
-        
+        # Use per-env boundaries computed at reset
         phase = torch.zeros_like(t, dtype=torch.long)
-        t1 = cfg.phases.grasp
-        t2 = t1 + manip_duration  # Release starts at end of manipulation (includes settle)
-        
-        phase[t >= t1] = 1  # manipulate
-        phase[t >= t2] = 2  # release (settle + retreat)
+        phase[t >= t_grasp_end] = 1       # manipulate
+        phase[t >= self.t_manip_end] = 2  # release (settle + retreat)
         
         return phase
 

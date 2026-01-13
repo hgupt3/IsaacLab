@@ -84,19 +84,21 @@ def _build_kuka_allegro_rewards_cfg(cfg: Y2RConfig, base_rewards):
         func=mdp.contacts,
         weight=cfg.rewards.good_finger_contact.weight,
         params={
+            "phases": cfg.rewards.good_finger_contact.params.get("phases"),
+            "use_hand_pose_gate": cfg.rewards.good_finger_contact.params.get("use_hand_pose_gate"),
+            "invert_in_release": cfg.rewards.good_finger_contact.params.get("invert_in_release"),
             "threshold": cfg.rewards.good_finger_contact.params["threshold"],
-            "disable_in_release": cfg.rewards.good_finger_contact.disable_in_release,
         },
     )
     base_rewards.distal_joint3_penalty = RewTerm(
         func=mdp.distal_joint3_penalty,
         weight=cfg.rewards.distal_joint3_penalty.weight,
         params={
+            "phases": cfg.rewards.distal_joint3_penalty.params.get("phases"),
             "std": cfg.rewards.distal_joint3_penalty.params["std"],
             "joint_name_regex": cfg.rewards.distal_joint3_penalty.params["joint_name_regex"],
             "only_when_contact": cfg.rewards.distal_joint3_penalty.params["only_when_contact"],
             "contact_threshold": cfg.rewards.distal_joint3_penalty.params["contact_threshold"],
-            "only_in_manipulation": cfg.rewards.distal_joint3_penalty.params["only_in_manipulation"],
         },
     )
     return base_rewards

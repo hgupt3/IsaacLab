@@ -23,3 +23,7 @@ visualization:
   env_ids: null
   debug_print_rewards: true
 
+procedural_objects:
+  generation:
+    num_shapes: 1
+

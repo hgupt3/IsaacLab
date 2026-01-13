@@ -19,8 +19,19 @@ import isaaclab.utils.string as string_utils
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
 
+# Canonical Allegro hand joint order - this is the order assumed by ALLEGRO_PCA_MATRIX columns
+# and must be used when indexing joint positions for eigengrasp computations.
+# NOTE: PhysX joint order from USD may differ! Always use find_joints() with this list.
+ALLEGRO_HAND_JOINT_NAMES = [
+    "index_joint_0", "index_joint_1", "index_joint_2", "index_joint_3",
+    "middle_joint_0", "middle_joint_1", "middle_joint_2", "middle_joint_3",
+    "ring_joint_0", "ring_joint_1", "ring_joint_2", "ring_joint_3",
+    "thumb_joint_0", "thumb_joint_1", "thumb_joint_2", "thumb_joint_3",
+]
+
 # PCA matrix for eigen grasp (5 eigen components -> 16 hand joints)
 # Each row is an eigen grasp basis vector
+# Column order matches ALLEGRO_HAND_JOINT_NAMES above
 ALLEGRO_PCA_MATRIX = torch.tensor([
     [-3.8872e-02, 3.7917e-01, 4.4703e-01, 7.1016e-03, 2.1159e-03, 3.2014e-01, 4.4660e-01, 5.2108e-02,
       5.6869e-05, 2.9845e-01, 3.8575e-01, 7.5774e-03, -1.4790e-02, 9.8163e-02, 4.3551e-02, 3.1699e-01],
@@ -33,6 +44,28 @@ ALLEGRO_PCA_MATRIX = torch.tensor([
     [-4.4911e-02, -4.7156e-01, 9.3124e-02, 2.3135e-01, -2.4607e-03, 9.5564e-02, 1.2470e-01, 3.6613e-02,
       1.3821e-04, 4.6072e-01, 9.9315e-02, -8.1080e-02, -4.7617e-01, -2.7734e-01, -2.3989e-01, -3.1222e-01]
 ])  # Shape: (5, 16)
+
+
+def get_allegro_hand_joint_ids(env, robot: Articulation) -> torch.Tensor:
+    """Get Allegro hand joint IDs in canonical order (cached on env).
+    
+    Uses find_joints to map joint names to PhysX indices, ensuring correct order
+    regardless of how joints are ordered in the USD file.
+    
+    Args:
+        env: The environment (used for caching).
+        robot: The robot articulation.
+        
+    Returns:
+        Tensor of joint indices in canonical order (16,).
+    """
+    cache_attr = "_allegro_hand_joint_ids"
+    joint_ids = getattr(env, cache_attr, None)
+    if joint_ids is None:
+        ids, _ = robot.find_joints(ALLEGRO_HAND_JOINT_NAMES, preserve_order=True)
+        joint_ids = torch.tensor(list(ids), device=env.device, dtype=torch.long)
+        setattr(env, cache_attr, joint_ids)
+    return joint_ids
 
 
 class EigenGraspRelativeJointPositionAction(ActionTerm):
@@ -62,9 +95,6 @@ class EigenGraspRelativeJointPositionAction(ActionTerm):
                 f"but found {self._num_joints} joints matching pattern."
             )
         
-        # Avoid indexing across all joints for efficiency
-        if self._num_joints == self._asset.num_joints:
-            self._joint_ids = slice(None)
         
         # Store dimensions
         self._arm_dim = cfg.arm_joint_count
@@ -186,5 +216,7 @@ class EigenGraspRelativeJointPositionActionCfg(ActionTermCfg):
 __all__ = [
     "EigenGraspRelativeJointPositionAction",
     "EigenGraspRelativeJointPositionActionCfg",
+    "ALLEGRO_HAND_JOINT_NAMES",
     "ALLEGRO_PCA_MATRIX",
+    "get_allegro_hand_joint_ids",
 ]
