@@ -118,26 +118,40 @@ class TrajectoryManager:
         # ========== Hand trajectory buffers ==========
         # Hand trajectory buffer: (num_envs, total_targets, 7) for palm pos(3) + quat(4)
         self.hand_trajectory = torch.zeros(num_envs, self.total_targets, 7, device=device)
-        
+
         # Grasp pose: initial grasp pose relative to object (num_envs, 7)
         # This is the transform from object frame to palm frame at grasp
         self.grasp_pose = torch.zeros(num_envs, 7, device=device)
-        
-        # Grasp keypoints: chain of perturbed grasp transforms (num_envs, max_keypoints, 7)
+
+        # ========== Surface-based grasp representation ==========
+        # Initial grasp defined by surface point, normal, roll, standoff
         hand_cfg = cfg.hand_trajectory
+        self.grasp_surface_point = torch.zeros(num_envs, 3, device=device)   # Point on object surface (local)
+        self.grasp_surface_normal = torch.zeros(num_envs, 3, device=device)  # Surface normal (local)
+        self.grasp_roll = torch.zeros(num_envs, device=device)               # Roll around approach axis
+        self.grasp_standoff = torch.zeros(num_envs, device=device)           # Distance from surface
+        self.grasp_surface_idx = torch.zeros(num_envs, dtype=torch.long, device=device)  # Index in point pool
+
+        # Keypoints: perturbed surface points during manipulation
         max_keypoints = hand_cfg.keypoints.count[1]
-        self.grasp_keypoints = torch.zeros(num_envs, max_keypoints, 7, device=device)
+        self.keypoint_surface_points = torch.zeros(num_envs, max_keypoints, 3, device=device)
+        self.keypoint_surface_normals = torch.zeros(num_envs, max_keypoints, 3, device=device)
+        self.keypoint_rolls = torch.zeros(num_envs, max_keypoints, device=device)
         self.num_grasp_keypoints = torch.zeros(num_envs, dtype=torch.long, device=device)
-        
+
+        # Legacy: keep grasp_keypoints for compatibility with _generate_hand_trajectory
+        self.grasp_keypoints = torch.zeros(num_envs, max_keypoints, 7, device=device)
+
         # Release pose: target palm position for release phase (num_envs, 7)
         self.release_pose = torch.zeros(num_envs, 7, device=device)
-        
+
         # Starting palm pose (captured at reset for interpolation)
         self.start_palm_pose = torch.zeros(num_envs, 7, device=device)
-        
-        # Debug: selected surface point in OBJECT-LOCAL frame for visualization (num_envs, 3)
+
+        # Debug: surface points in OBJECT-LOCAL frame for visualization (num_envs, 3)
         # Stored in local frame so it moves with the object
         self.debug_surface_point_local = torch.zeros(num_envs, 3, device=device)
+        self.debug_keypoint_points_local = torch.zeros(num_envs, max_keypoints, 3, device=device)
         
         # Object scales for variable scale support
         # Read from USD prims after prestartup scale randomization
@@ -267,16 +281,19 @@ class TrajectoryManager:
             
             self.grasp_pose[env_ids, :3] = grasp_pos_local
             self.grasp_pose[env_ids, 3:7] = grasp_quat_local
-            
-            # Sample grasp keypoints (perturbed from grasp pose)
-            self._sample_grasp_keypoints(env_ids)
-            
+
             # Sample release pose
             self._sample_release_pose(env_ids, env_origins)
-        
+
         # Generate entire object trajectory (same for all modes - uses phases)
         # Push_t will replan during manipulation phase in step()
+        # NOTE: Must be before _sample_grasp_keypoints since keypoints need object poses at future times
         self._generate_full_trajectory(env_ids)
+
+        # Sample grasp keypoints (perturbed from grasp pose)
+        # Must be AFTER trajectory generation so we can look up object poses at keypoint times
+        if self.cfg.hand_trajectory.enabled:
+            self._sample_grasp_keypoints(env_ids)
         
         # For push_t: initialize tracking for manipulation phase replanning
         if self.cfg.push_t.enabled:
@@ -633,21 +650,36 @@ class TrajectoryManager:
             # Apply roll in local frame (around palm Z)
             grasp_quat = quat_mul(grasp_quat, roll_quat)
         
-        # Filter: exclude grasps where fingers point toward robot (+X direction)
+        # Compute optimal roll to satisfy finger direction constraint
+        roll = torch.zeros(n, device=self.device)  # Track roll for surface representation
         if cfg.exclude_toward_robot:
-            x_axis = torch.tensor([1.0, 0.0, 0.0], device=self.device)
-            finger_dir_w = quat_apply(grasp_quat, x_axis.expand(n, 3))  # (n, 3)
-            
-            toward_robot = finger_dir_w[:, 0] > cfg.toward_robot_threshold
-            
-            if toward_robot.any():
-                flip_quat = quat_from_euler_xyz(
-                    torch.zeros(toward_robot.sum(), device=self.device),
-                    torch.zeros(toward_robot.sum(), device=self.device),
-                    torch.full((toward_robot.sum(),), math.pi, device=self.device),
-                )
-                grasp_quat[toward_robot] = quat_mul(grasp_quat[toward_robot], flip_quat)
-        
+            # grasp_quat is the base quaternion at roll=0
+            # Find the closest feasible roll that satisfies finger.x < threshold
+            roll = self._compute_closest_feasible_roll(
+                base_quat=grasp_quat,
+                desired_roll=torch.zeros(n, device=self.device),
+                threshold=cfg.toward_robot_threshold,
+            )
+
+            # Apply the computed roll
+            roll_quat = quat_from_euler_xyz(
+                torch.zeros(n, device=self.device),
+                torch.zeros(n, device=self.device),
+                roll,
+            )
+            grasp_quat = quat_mul(grasp_quat, roll_quat)
+
+        # Apply fixed hand roll if specified
+        if cfg.fixed_hand_roll is not None:
+            roll = roll + cfg.fixed_hand_roll
+
+        # Store surface-based grasp representation for keypoint sampling
+        self.grasp_surface_point[env_ids] = surface_points  # Local frame
+        self.grasp_surface_normal[env_ids] = surface_normals  # Local frame
+        self.grasp_roll[env_ids] = roll
+        self.grasp_standoff[env_ids] = standoff
+        self.grasp_surface_idx[env_ids] = selected_idx
+
         return grasp_pos, grasp_quat
     
     def _quat_from_z_axis(self, z_target: torch.Tensor) -> torch.Tensor:
@@ -684,76 +716,452 @@ class TrajectoryManager:
         rot_mat = torch.stack([x, y, z], dim=-1)  # (n, 3, 3)
         
         return quat_from_matrix(rot_mat)
-    
+
+    def _quat_from_z_and_roll(self, z_target: torch.Tensor, roll: torch.Tensor) -> torch.Tensor:
+        """Construct quaternion where Z axis points along z_target with given roll.
+
+        Args:
+            z_target: (n, 3) or (n, k, 3) target Z axis direction.
+            roll: (n,) or (n, k) roll angle around Z axis in radians.
+
+        Returns:
+            (n, 4) or (n, k, 4) quaternion (wxyz format).
+        """
+        original_shape = z_target.shape[:-1]
+        z_target_flat = z_target.reshape(-1, 3)
+        roll_flat = roll.reshape(-1)
+
+        # Get base quaternion (no roll)
+        base_quat = self._quat_from_z_axis(z_target_flat)
+
+        # Apply roll around Z axis
+        n = roll_flat.shape[0]
+        zeros = torch.zeros(n, device=self.device)
+        roll_quat = quat_from_euler_xyz(zeros, zeros, roll_flat)
+        result = quat_mul(base_quat, roll_quat)
+
+        return result.reshape(*original_shape, 4)
+
+    def _compute_closest_feasible_roll(
+        self,
+        base_quat: torch.Tensor,  # (n, 4) base quaternion at roll=0
+        desired_roll: torch.Tensor,  # (n,) desired roll value
+        threshold: float,
+    ) -> torch.Tensor:
+        """Find roll closest to desired_roll that satisfies finger.x < threshold.
+
+        As roll varies around the palm Z axis, finger direction rotates in the XY plane:
+            finger.x(roll) = A * cos(roll) + B * sin(roll) = R * cos(roll - φ)
+        where:
+            A = base_X.x (finger.x at roll=0)
+            B = base_Y.x (finger.x at roll=π/2)
+            R = sqrt(A² + B²)
+            φ = atan2(B, A)
+
+        The constraint finger.x < threshold defines a feasible region.
+        This function returns the roll closest to desired_roll within that region.
+
+        Args:
+            base_quat: Base quaternion with roll=0 (from _quat_from_z_axis).
+            desired_roll: The roll we'd like to use if feasible.
+            threshold: Maximum allowed finger.x value.
+
+        Returns:
+            Roll values that satisfy the constraint, as close to desired_roll as possible.
+        """
+        n = base_quat.shape[0]
+        device = base_quat.device
+
+        # Get X and Y axes of palm frame in world coordinates
+        x_axis = torch.tensor([1.0, 0.0, 0.0], device=device)
+        y_axis = torch.tensor([0.0, 1.0, 0.0], device=device)
+        base_X = quat_apply(base_quat, x_axis.expand(n, 3))  # (n, 3)
+        base_Y = quat_apply(base_quat, y_axis.expand(n, 3))  # (n, 3)
+
+        # Coefficients for finger.x = A*cos(roll) + B*sin(roll)
+        A = base_X[:, 0]
+        B = base_Y[:, 0]
+
+        # Convert to R*cos(roll - φ) form
+        R = torch.sqrt(A**2 + B**2)
+        phi = torch.atan2(B, A)
+
+        # Handle edge cases:
+        # - If R < threshold: all rolls feasible (finger.x max is R)
+        # - If R < -threshold: no rolls feasible (finger.x min is -R)
+        # For R < -threshold, we return desired_roll (nothing we can do)
+        always_feasible = R <= threshold
+        never_feasible = -R >= threshold  # i.e., threshold <= -R
+
+        # Compute feasible region boundaries
+        # Constraint: R * cos(roll - φ) < threshold
+        # => cos(roll - φ) < threshold / R
+        # Feasible when |roll - φ| > arccos(threshold / R)
+        ratio = (threshold / R).clamp(-1, 1)
+        half_width = torch.acos(ratio)
+
+        # Boundaries in absolute roll coordinates
+        boundary_lo = phi - half_width  # Lower boundary
+        boundary_hi = phi + half_width  # Upper boundary
+
+        # Check if desired_roll is feasible
+        # Normalize desired_roll relative to phi, wrap to [-π, π]
+        rel_desired = desired_roll - phi
+        rel_desired = (rel_desired + math.pi) % (2 * math.pi) - math.pi
+
+        # Desired is infeasible if |rel_desired| < half_width
+        desired_infeasible = torch.abs(rel_desired) < half_width
+
+        # Find closest boundary
+        # If rel_desired < 0, closer to lower boundary (-half_width)
+        # If rel_desired >= 0, closer to upper boundary (+half_width)
+        epsilon = 0.01  # Small margin to be strictly inside feasible region
+        closest_boundary = torch.where(
+            rel_desired < 0,
+            phi - half_width - epsilon,  # Just below lower boundary
+            phi + half_width + epsilon,  # Just above upper boundary
+        )
+
+        # Final result:
+        # - If always/never feasible: use desired_roll
+        # - If desired is feasible: use desired_roll
+        # - If desired is infeasible: use closest_boundary
+        result = torch.where(
+            always_feasible | never_feasible | ~desired_infeasible,
+            desired_roll,
+            closest_boundary,
+        )
+
+        return result
+
+    def _get_object_pose_at_keypoint_time(self, env_ids: torch.Tensor, kp_idx: int) -> torch.Tensor:
+        """Get object pose at the time when keypoint kp_idx is reached.
+
+        Keypoints are evenly distributed through the manipulation phase.
+
+        Args:
+            env_ids: Environment indices.
+            kp_idx: Keypoint index (0-based).
+
+        Returns:
+            (n, 7) object poses at keypoint time.
+        """
+        n = len(env_ids)
+        cfg = self.cfg
+        phases = cfg.trajectory.phases
+        max_kp = cfg.hand_trajectory.keypoints.count[1]
+
+        # Keypoints are distributed through manipulation phase
+        # kp_idx=0 is near start of manipulation, kp_idx=max_kp-1 is near end
+        grasp_duration = phases.grasp
+
+        # Get per-env manipulation duration
+        manip_duration = self.t_manip_end[env_ids] - grasp_duration  # (n,)
+
+        # Time within manipulation phase for this keypoint
+        # For forward-only traversal with N segments: grasp → kp_0 → ... → kp_{N-1}
+        # kp_k is reached at progress (k+1)/N, where N = max_kp
+        # Final keypoint (kp_{N-1}) is at progress 1.0 (goal pose)
+        kp_fraction = (kp_idx + 1) / max_kp
+        kp_time = grasp_duration + kp_fraction * manip_duration  # (n,)
+
+        # Convert to trajectory index
+        kp_traj_idx = (kp_time / self.target_dt).long()  # (n,)
+        kp_traj_idx = kp_traj_idx.clamp(max=self.total_targets - 1)
+
+        # Gather object poses from trajectory
+        batch_idx = torch.arange(n, device=self.device)
+        return self.trajectory[env_ids][batch_idx, kp_traj_idx]  # (n, 7)
+
+    def _compute_palm_world_batch(
+        self,
+        surface_points: torch.Tensor,
+        surface_normals: torch.Tensor,
+        rolls: torch.Tensor,
+        standoffs: torch.Tensor,
+        obj_poses: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute world-frame palm poses from surface-based representation.
+
+        Args:
+            surface_points: (n, 3) or (n, k, 3) surface points in object-local frame.
+            surface_normals: (n, 3) or (n, k, 3) surface normals in object-local frame.
+            rolls: (n,) or (n, k) roll angles around approach axis.
+            standoffs: (n,) standoff distances.
+            obj_poses: (n, 7) object poses (pos + quat).
+
+        Returns:
+            palm_pos_world: (n, 3) or (n, k, 3) palm positions in world frame.
+            palm_quat_world: (n, 4) or (n, k, 4) palm quaternions in world frame.
+        """
+        has_k_dim = surface_points.dim() == 3
+        if has_k_dim:
+            n, k, _ = surface_points.shape
+            # Expand standoffs and obj_poses for k dimension
+            standoffs_exp = standoffs.unsqueeze(1).expand(n, k)
+            obj_pos = obj_poses[:, :3].unsqueeze(1).expand(n, k, 3)
+            obj_quat = obj_poses[:, 3:7].unsqueeze(1).expand(n, k, 4)
+        else:
+            n = surface_points.shape[0]
+            standoffs_exp = standoffs
+            obj_pos = obj_poses[:, :3]
+            obj_quat = obj_poses[:, 3:7]
+
+        # Palm position in local frame: point + standoff * normal
+        palm_pos_local = surface_points + standoffs_exp.unsqueeze(-1) * surface_normals
+
+        # Palm orientation in local frame: Z axis points opposite to normal (toward object)
+        palm_quat_local = self._quat_from_z_and_roll(-surface_normals, rolls)
+
+        # Transform to world frame
+        if has_k_dim:
+            # Flatten for quat operations
+            palm_pos_local_flat = palm_pos_local.reshape(-1, 3)
+            palm_quat_local_flat = palm_quat_local.reshape(-1, 4)
+            obj_pos_flat = obj_pos.reshape(-1, 3)
+            obj_quat_flat = obj_quat.reshape(-1, 4)
+
+            palm_pos_world = quat_apply(obj_quat_flat, palm_pos_local_flat) + obj_pos_flat
+            palm_quat_world = quat_mul(obj_quat_flat, palm_quat_local_flat)
+
+            palm_pos_world = palm_pos_world.reshape(n, k, 3)
+            palm_quat_world = palm_quat_world.reshape(n, k, 4)
+        else:
+            palm_pos_world = quat_apply(obj_quat, palm_pos_local) + obj_pos
+            palm_quat_world = quat_mul(obj_quat, palm_quat_local)
+
+        return palm_pos_world, palm_quat_world
+
     def _sample_grasp_keypoints(self, env_ids: torch.Tensor):
-        """Sample chain of perturbed grasp transforms for in-hand manipulation.
-        
-        Each keypoint is perturbed from the previous one (not from initial).
-        Stored as transforms relative to object.
-        
-        When num_waypoints == 0 (object stays still), keypoints are constrained
-        to the top hemisphere (Z > 0 in object-local frame) to avoid table collision.
-        
+        """Sample feasibility-checked keypoints from nearby surface points.
+
+        Each keypoint is a perturbed surface point with perturbed roll that results
+        in a feasible world-frame palm pose. Applies filter chain:
+        1. Distance: nearby previous point
+        2. Normal similarity: prevent flipping to opposite face
+        3. Height: palm above table
+        4. Finger direction: fingers not toward robot (same as grasp sampling)
+        5. (Final only) Exclude bottom fraction: surface normal points up
+
         Args:
             env_ids: Environment indices.
         """
+        from .mdp.utils import get_point_cloud_cache
+
         n = len(env_ids)
         cfg = self.cfg.hand_trajectory.keypoints
-        grasp_cfg = self.cfg.hand_trajectory.grasp_sampling
-        
+        max_kp = cfg.count[1]
+
         # Random number of keypoints per env
         self.num_grasp_keypoints[env_ids] = torch.randint(
             cfg.count[0], cfg.count[1] + 1, (n,), device=self.device
         )
-        
-        max_kp = cfg.count[1]
+
         if max_kp == 0:
             return
-        
-        # Check which envs need hemisphere constraint (no waypoints = object stays on table)
-        num_wp = self.num_waypoints[env_ids]  # (n,)
-        needs_hemisphere_constraint = (num_wp == 0)  # (n,) bool
-        
-        # Start from initial grasp pose
-        prev_pos = self.grasp_pose[env_ids, :3].clone()  # (n, 3) relative to object
-        prev_quat = self.grasp_pose[env_ids, 3:7].clone()  # (n, 4)
-        
+
+        # Get point cloud pool for these envs
+        cache = get_point_cloud_cache(
+            env_ids=env_ids.tolist(),
+            prim_path=self.object_prim_path,
+            pool_size=256,
+        )
+        env_ids_cpu = env_ids.cpu()
+        geo_indices = cache.geo_indices[env_ids_cpu].to(self.device)
+        scales = cache.scales[env_ids_cpu].to(self.device)
+        pool_points = cache.all_base_points.to(self.device)[geo_indices]  # (n, pool_size, 3)
+        pool_normals = cache.all_base_normals.to(self.device)[geo_indices]  # (n, pool_size, 3)
+
+        # Apply object scale to points (scales is (n, 3) for per-axis scaling)
+        pool_points = pool_points * scales.unsqueeze(1)  # (n, 1, 3) * (n, 256, 3) -> (n, 256, 3)
+        pool_size = pool_points.shape[1]
+
+        # Start from initial grasp surface representation
+        prev_points = self.grasp_surface_point[env_ids].clone()  # (n, 3)
+        prev_normals = self.grasp_surface_normal[env_ids].clone()  # (n, 3)
+        prev_rolls = self.grasp_roll[env_ids].clone()  # (n,)
+        standoffs = self.grasp_standoff[env_ids]  # (n,)
+
+        # Get goal poses for final keypoint (at progress 1.0)
+        goal_poses = self.goal_poses[env_ids]  # (n, 7)
+
+        feas_cfg = self.cfg.hand_trajectory.feasibility
+
+        # Config for finger direction check (same as grasp sampling)
+        grasp_cfg = self.cfg.hand_trajectory.grasp_sampling
+        toward_robot_threshold = grasp_cfg.toward_robot_threshold
+        exclude_bottom_frac = grasp_cfg.exclude_bottom_fraction
+        exclude_z = -1.0 + exclude_bottom_frac * 2
+
         for kp_idx in range(max_kp):
-            # Position perturbation
-            pos_delta = sample_uniform(
-                -cfg.pos_perturbation, cfg.pos_perturbation, (n, 3), self.device
+            is_final = (kp_idx == max_kp - 1)
+
+            # Final keypoint is at progress 1.0 (goal pose), others at (k+1)/max_kp
+            if is_final:
+                obj_pose_at_kp = goal_poses
+            else:
+                obj_pose_at_kp = self._get_object_pose_at_keypoint_time(env_ids, kp_idx)  # (n, 7)
+
+            # ===== FILTER 1: Distance =====
+            distances = (pool_points - prev_points.unsqueeze(1)).norm(dim=-1)  # (n, pool_size)
+            dist_ok = distances < cfg.max_surface_perturbation
+
+            # ===== FILTER 2: Normal similarity =====
+            normal_sim = (pool_normals * prev_normals.unsqueeze(1)).sum(dim=-1)  # (n, pool_size)
+            normal_ok = normal_sim > cfg.normal_similarity_threshold
+
+            # ===== Compute palm poses EXACTLY like grasp: from WORLD normal =====
+            obj_quat_at_kp = obj_pose_at_kp[:, 3:7]
+            obj_pos_at_kp = obj_pose_at_kp[:, :3]
+            obj_quat_exp = obj_quat_at_kp.unsqueeze(1).expand(n, pool_size, 4)
+            obj_pos_exp = obj_pos_at_kp.unsqueeze(1).expand(n, pool_size, 3)
+
+            # Step 1: Transform normals to WORLD frame (like grasp line 623)
+            pool_normals_world = quat_apply(
+                obj_quat_exp.reshape(-1, 4),
+                pool_normals.reshape(-1, 3)
+            ).reshape(n, pool_size, 3)
+
+            # Step 2: Compute base quaternion from WORLD normal (like grasp line 638)
+            base_quat_world = self._quat_from_z_axis(
+                -pool_normals_world.reshape(-1, 3)
+            ).reshape(n, pool_size, 4)
+
+            # Step 3: Compute closest feasible roll for each candidate point
+            # Desired roll = prev_roll + small perturbation (for variation)
+            desired_rolls = prev_rolls.unsqueeze(1) + (
+                (torch.rand(n, pool_size, device=self.device) * 2 - 1) * cfg.roll_perturbation
+            )  # (n, pool_size)
+
+            # Compute closest feasible roll for each point (guarantees finger constraint if possible)
+            candidate_rolls = self._compute_closest_feasible_roll(
+                base_quat=base_quat_world.reshape(-1, 4),
+                desired_roll=desired_rolls.reshape(-1),
+                threshold=toward_robot_threshold,
+            ).reshape(n, pool_size)
+
+            # Step 4: Apply the computed rolls
+            roll_quat = quat_from_euler_xyz(
+                torch.zeros(n * pool_size, device=self.device),
+                torch.zeros(n * pool_size, device=self.device),
+                candidate_rolls.reshape(-1)
+            ).reshape(n, pool_size, 4)
+            palm_quat_world = quat_mul(
+                base_quat_world.reshape(-1, 4),
+                roll_quat.reshape(-1, 4)
+            ).reshape(n, pool_size, 4)
+
+            # Palm position in world frame
+            standoffs_exp = standoffs.unsqueeze(1).expand(n, pool_size)
+            pool_points_world = quat_apply(
+                obj_quat_exp.reshape(-1, 4),
+                pool_points.reshape(-1, 3)
+            ).reshape(n, pool_size, 3) + obj_pos_exp
+            palm_pos_world = pool_points_world + standoffs_exp.unsqueeze(-1) * pool_normals_world
+
+            # ===== FILTER 3: Height check =====
+            height_ok = palm_pos_world[..., 2] > (self.table_height + feas_cfg.min_height)
+
+            # ===== FILTER 4: Finger direction - verify the computed roll is actually feasible =====
+            # (It might not be if no feasible roll exists for this surface normal)
+            x_axis = torch.tensor([1.0, 0.0, 0.0], device=self.device)
+            finger_dir_world = quat_apply(
+                palm_quat_world.reshape(-1, 4),
+                x_axis.expand(n * pool_size, 3)
+            ).reshape(n, pool_size, 3)
+            finger_ok = finger_dir_world[..., 0] < toward_robot_threshold
+
+            # ===== FILTER 5: Exclude bottom fraction (final keypoint only) =====
+            if is_final:
+                bottom_ok = pool_normals_world[..., 2] > exclude_z
+                valid_mask = dist_ok & normal_ok & height_ok & finger_ok & bottom_ok
+            else:
+                valid_mask = dist_ok & normal_ok & height_ok & finger_ok
+
+            # ===== Debug stats =====
+            if n > 0:
+                dist_pass = dist_ok.sum(dim=1).float().mean().item()
+                normal_pass = (dist_ok & normal_ok).sum(dim=1).float().mean().item()
+                height_pass = (dist_ok & normal_ok & height_ok).sum(dim=1).float().mean().item()
+                finger_pass = (dist_ok & normal_ok & height_ok & finger_ok).sum(dim=1).float().mean().item()
+                final_pass = valid_mask.sum(dim=1).float().mean().item()
+
+                if is_final:
+                    print(f"[Keypoint {kp_idx}] dist: {dist_pass:.1f}, +normal: {normal_pass:.1f}, "
+                          f"+height: {height_pass:.1f}, +finger: {finger_pass:.1f}, +bottom: {final_pass:.1f} (of {pool_size})")
+                else:
+                    print(f"[Keypoint {kp_idx}] dist: {dist_pass:.1f}, +normal: {normal_pass:.1f}, "
+                          f"+height: {height_pass:.1f}, +finger: {finger_pass:.1f} (of {pool_size})")
+
+            # ===== Sample from valid candidates =====
+            scores = torch.rand(n, pool_size, device=self.device)
+            scores[~valid_mask] = -float('inf')
+            selected_idx = scores.argmax(dim=1)  # (n,)
+
+            has_valid = valid_mask.any(dim=1)  # (n,)
+            success_rate = has_valid.float().mean().item() * 100
+            print(f"  -> Success rate: {success_rate:.1f}% ({has_valid.sum().item()}/{n} envs found valid keypoint)")
+
+            # Gather results - select directly from already-computed values
+            batch_idx = torch.arange(n, device=self.device)
+
+            # Select from valid candidates
+            selected_palm_quat_world = palm_quat_world[batch_idx, selected_idx]  # (n, 4)
+            selected_points = pool_points[batch_idx, selected_idx]  # (n, 3)
+            selected_normals = pool_normals[batch_idx, selected_idx]  # (n, 3)
+            selected_rolls = candidate_rolls[batch_idx, selected_idx]  # (n,)
+
+            # For fallback, compute palm_quat_world for prev values (might be invalid!)
+            prev_normals_world = quat_apply(obj_quat_at_kp, prev_normals)
+            prev_base_quat_world = self._quat_from_z_axis(-prev_normals_world)
+            prev_roll_quat = quat_from_euler_xyz(
+                torch.zeros(n, device=self.device),
+                torch.zeros(n, device=self.device),
+                prev_rolls
             )
-            pos_delta[:, 2] *= 0.5  # Less vertical perturbation
-            
-            # Apply hemisphere constraint: for envs with no waypoints,
-            # ensure keypoint stays in top hemisphere (Z > 0 in object-local frame)
-            # Similar to exclude_bottom_fraction for grasp sampling
-            new_pos = prev_pos + pos_delta
-            
-            if needs_hemisphere_constraint.any():
-                # Clamp Z to stay above object center (top hemisphere)
-                # Use same fraction as grasp sampling for consistency
-                min_z = -grasp_cfg.exclude_bottom_fraction * 0.5  # Small margin below center
-                new_pos[:, 2] = torch.where(
-                    needs_hemisphere_constraint,
-                    new_pos[:, 2].clamp(min=min_z),
-                    new_pos[:, 2]
-                )
-            
-            # Rotation perturbation (small euler angles)
-            euler_delta = sample_uniform(
-                -cfg.rot_perturbation, cfg.rot_perturbation, (n, 3), self.device
+            prev_palm_quat_world = quat_mul(prev_base_quat_world, prev_roll_quat)
+
+            # Apply fallback where no valid candidate
+            new_palm_quat_world = torch.where(
+                has_valid.unsqueeze(-1),
+                selected_palm_quat_world,
+                prev_palm_quat_world,
             )
-            rot_delta = quat_from_euler_xyz(euler_delta[:, 0], euler_delta[:, 1], euler_delta[:, 2])
-            new_quat = quat_mul(rot_delta, prev_quat)
-            
-            # Store keypoint
-            self.grasp_keypoints[env_ids, kp_idx, :3] = new_pos
-            self.grasp_keypoints[env_ids, kp_idx, 3:7] = new_quat
-            
+            new_points = torch.where(has_valid.unsqueeze(-1), selected_points, prev_points)
+            new_normals = torch.where(has_valid.unsqueeze(-1), selected_normals, prev_normals)
+            new_rolls = torch.where(has_valid, selected_rolls, prev_rolls)
+
+            # DEBUG: Verify finger direction
+            selected_finger_dir = quat_apply(new_palm_quat_world, x_axis.expand(n, 3))
+            bad_finger = selected_finger_dir[:, 0] >= toward_robot_threshold
+            fallback_used = (~has_valid).sum().item()
+            if bad_finger.any() or fallback_used > 0:
+                num_bad = bad_finger.sum().item()
+                print(f"  WARNING: {num_bad}/{n} keypoints have finger.x >= {toward_robot_threshold}, "
+                      f"fallback={fallback_used}")
+                print(f"    finger.x: min={selected_finger_dir[:, 0].min():.3f}, "
+                      f"max={selected_finger_dir[:, 0].max():.3f}")
+
+            # Convert to local frame for storage (like grasp line 280)
+            palm_quat_local = quat_mul(quat_inv(obj_quat_at_kp), new_palm_quat_world)
+            palm_pos_local = new_points + standoffs.unsqueeze(-1) * new_normals
+
+            # Store keypoint surface representation
+            self.keypoint_surface_points[env_ids, kp_idx] = new_points
+            self.keypoint_surface_normals[env_ids, kp_idx] = new_normals
+            self.keypoint_rolls[env_ids, kp_idx] = new_rolls
+
+            # Store pose representation for trajectory generation
+            self.grasp_keypoints[env_ids, kp_idx, :3] = palm_pos_local
+            self.grasp_keypoints[env_ids, kp_idx, 3:7] = palm_quat_local
+
+            # Store for visualization
+            self.debug_keypoint_points_local[env_ids, kp_idx] = new_points
+
             # Chain: next keypoint perturbs from this one
-            prev_pos = new_pos
-            prev_quat = new_quat
+            prev_points = new_points
+            prev_normals = new_normals
+            prev_rolls = new_rolls
 
     def _sample_release_pose(self, env_ids: torch.Tensor, env_origins: torch.Tensor):
         """Sample release pose in workspace region.
@@ -940,14 +1348,14 @@ class TrajectoryManager:
         safe_manip_duration = manip_duration_per_env.clamp(min=1e-6)  # Avoid div by zero
         manip_progress = (manip_time / safe_manip_duration.unsqueeze(1)).clamp(0.0, 1.0)  # (n, T)
         
-        # Build PALINDROME keypoint chain: [grasp, kp_0, ..., kp_N, ..., kp_0, grasp]
-        # For N keypoints: grasp → kp_0 → ... → kp_{N-1} → kp_{N-2} → ... → kp_0 → grasp
-        # Max chain length = 2 * max_kp + 1 (handles all cases including N=0)
-        # N=0: [grasp, grasp] (1 segment)
-        # N=1: [grasp, kp_0, grasp] (2 segments)
-        # N=2: [grasp, kp_0, kp_1, kp_0, grasp] (4 segments)
-        # N=3: [grasp, kp_0, kp_1, kp_2, kp_1, kp_0, grasp] (6 segments)
-        max_chain_len = max(2, 2 * max_kp + 1)
+        # Build FORWARD-ONLY keypoint chain: [grasp, kp_0, kp_1, ..., kp_{N-1}]
+        # For N keypoints: grasp → kp_0 → ... → kp_{N-1} (END at final keypoint)
+        # Max chain length = max_kp + 1 (grasp at start, keypoints after)
+        # N=0: [grasp] (stay at grasp)
+        # N=1: [grasp, kp_0] (1 segment, kp_0 at progress 1.0)
+        # N=2: [grasp, kp_0, kp_1] (2 segments, kp_0 at 0.5, kp_1 at 1.0)
+        # N=3: [grasp, kp_0, kp_1, kp_2] (3 segments, kp_k at (k+1)/3)
+        max_chain_len = max(2, max_kp + 1)
         kp_chain = torch.zeros(n, max_chain_len, 7, device=self.device)
         
         # Position 0: grasp pose
@@ -957,34 +1365,23 @@ class TrajectoryManager:
         if max_kp > 0:
             # Forward pass: positions 1 to max_kp (kp_0 to kp_{max_kp-1})
             kp_chain[:, 1:max_kp+1, :] = keypoints
-            
-            # Backward pass: positions max_kp+1 to 2*max_kp-1 (kp_{max_kp-2} to kp_0)
-            # Only needed if max_kp > 1
-            if max_kp > 1:
-                for i in range(max_kp - 1):
-                    # Position max_kp+1+i gets keypoint max_kp-2-i
-                    kp_chain[:, max_kp + 1 + i, :] = keypoints[:, max_kp - 2 - i, :]
-            
-            # Final position: grasp pose again
-            kp_chain[:, 2 * max_kp, :3] = grasp_pos
-            kp_chain[:, 2 * max_kp, 3:7] = grasp_quat
         else:
-            # No keypoints: just [grasp, grasp]
+            # No keypoints: just stay at grasp (duplicate for interpolation)
             kp_chain[:, 1, :3] = grasp_pos
             kp_chain[:, 1, 3:7] = grasp_quat
         
-        # Number of segments per env for palindrome traversal
+        # Number of segments per env for forward-only traversal
         # N=0: 1 segment (grasp → grasp)
-        # N>=1: 2*N segments
+        # N>=1: N segments (grasp → kp_0 → ... → kp_{N-1})
         num_segments = torch.where(
             num_kp == 0,
             torch.ones_like(num_kp.float()),
-            (2 * num_kp).float()
+            num_kp.float()
         )  # (n,)
         
         # Compute segment index for each timestep: (n, T)
         seg_idx = (manip_progress * num_segments.unsqueeze(1)).long()
-        max_seg_idx = max(1, 2 * max_kp - 1)  # Maximum valid segment index
+        max_seg_idx = max(1, max_kp - 1)  # Maximum valid segment index
         seg_idx = seg_idx.clamp(0, max_seg_idx)
         
         # Local progress within segment
@@ -995,9 +1392,11 @@ class TrajectoryManager:
         
         # Map segment index to chain index for "from" pose
         # For env with num_kp keypoints, chain indices are:
-        # 0=grasp, 1=kp_0, ..., num_kp=kp_{num_kp-1}, num_kp+1=kp_{num_kp-2}, ..., 2*num_kp=grasp
-        # Segment 0: from idx 0, to idx 1
-        # Segment 1: from idx 1, to idx 2
+        # 0=grasp, 1=kp_0, 2=kp_1, ..., num_kp=kp_{num_kp-1}
+        # Segment 0: from idx 0 (grasp), to idx 1 (kp_0)
+        # Segment 1: from idx 1 (kp_0), to idx 2 (kp_1)
+        # ...
+        # Segment N-1: from idx N-1 (kp_{N-2}), to idx N (kp_{N-1})
         # ...
         batch_idx = torch.arange(n, device=self.device).unsqueeze(1).expand(n, T)  # (n, T)
         
@@ -1005,8 +1404,8 @@ class TrajectoryManager:
         to_chain_idx = seg_idx + 1  # Segment i ends at chain position i+1
         
         # Clamp to valid chain range per env
-        # For env with num_kp keypoints, max chain idx = 2*num_kp (or 1 if num_kp=0)
-        max_chain_idx_per_env = torch.where(num_kp == 0, torch.ones_like(num_kp), 2 * num_kp)  # (n,)
+        # For env with num_kp keypoints, max chain idx = num_kp (final keypoint)
+        max_chain_idx_per_env = torch.where(num_kp == 0, torch.ones_like(num_kp), num_kp)  # (n,)
         from_chain_idx = from_chain_idx.clamp(max=max_chain_idx_per_env.unsqueeze(1).expand(n, T))
         to_chain_idx = to_chain_idx.clamp(max=max_chain_idx_per_env.unsqueeze(1).expand(n, T))
         
@@ -1036,9 +1435,9 @@ class TrajectoryManager:
         orientations = torch.where(manip_mask.unsqueeze(-1), manip_quat, orientations)
         
         # === Phase 3: Settle (hand stays at final manipulation pose) ===
-        # With palindrome, final manipulation pose is always grasp_pose (we return to start)
-        # Final chain index = 2*num_kp for envs with keypoints, or 1 for envs with 0 keypoints
-        final_chain_idx = torch.where(num_kp == 0, torch.ones_like(num_kp), 2 * num_kp)  # (n,)
+        # Final manipulation pose is the last keypoint (kp_{N-1}) at goal
+        # Final chain index = num_kp (last keypoint in chain)
+        final_chain_idx = torch.where(num_kp == 0, torch.ones_like(num_kp), num_kp)  # (n,)
         batch_idx_1d = torch.arange(n, device=self.device)
         final_rel_pos = kp_chain[batch_idx_1d, final_chain_idx, :3]  # (n, 3) = grasp_pos
         final_rel_quat = kp_chain[batch_idx_1d, final_chain_idx, 3:7]  # (n, 4) = grasp_quat

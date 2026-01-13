@@ -915,22 +915,38 @@ class target_sequence_obs_b(ManagerTermBase):
         )
     
     def _init_grasp_point_visualizer(self):
-        """Initialize visualization marker for grasp surface point (green, double size)."""
+        """Initialize visualization markers for grasp and keypoint surface points."""
         import isaaclab.sim as sim_utils
         from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
-        
-        # Green sphere, double the normal point radius
+
+        # Colors: green for initial grasp, yellow/orange for keypoints
+        keypoint_colors = [
+            (1.0, 0.8, 0.0),  # Yellow - keypoint 0
+            (1.0, 0.5, 0.0),  # Orange - keypoint 1
+        ]
+
+        markers_dict = {
+            "grasp_point": sim_utils.SphereCfg(
+                radius=self.POINT_RADIUS * 2.0,  # Double size
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=(0.0, 1.0, 0.0),  # Green
+                ),
+            ),
+        }
+
+        # Add keypoint markers
+        for i, color in enumerate(keypoint_colors):
+            markers_dict[f"keypoint_{i}"] = sim_utils.SphereCfg(
+                radius=self.POINT_RADIUS * 1.5,  # Slightly smaller than grasp
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=color,
+                ),
+            )
+
         self.grasp_point_marker = VisualizationMarkers(
             VisualizationMarkersCfg(
                 prim_path="/Visuals/GraspSurfacePoint",
-                markers={
-                    "grasp_point": sim_utils.SphereCfg(
-                        radius=self.POINT_RADIUS * 2.0,  # Double size
-                        visual_material=sim_utils.PreviewSurfaceCfg(
-                            diffuse_color=(0.0, 1.0, 0.0),  # Green
-                        ),
-                    ),
-                },
+                markers=markers_dict,
             )
         )
     
@@ -1438,11 +1454,14 @@ class target_sequence_obs_b(ManagerTermBase):
         )
     
     def _visualize_grasp_surface_point(self, num_envs: int):
-        """Visualize selected grasp surface point (green sphere, double size).
-        
-        The point is stored in object-local frame and transformed to world
-        frame each frame so it moves with the object.
-        
+        """Visualize grasp and keypoint surface points.
+
+        - Green sphere: initial grasp surface point
+        - Yellow/Orange spheres: keypoint surface points
+
+        Points are stored in object-local frame and transformed to world
+        frame each frame so they move with the object.
+
         Args:
             num_envs: Number of environments.
         """
@@ -1451,27 +1470,49 @@ class target_sequence_obs_b(ManagerTermBase):
             env_ids = list(range(num_envs))
         else:
             env_ids = [i for i in self.visualize_env_ids if i < num_envs]
-        
+
         if not env_ids:
             return
-        
+
         env_ids_t = torch.tensor(env_ids, device=self.object.device)
-        
-        # Get surface points in LOCAL frame from trajectory manager
-        surface_points_local = self.trajectory_manager.debug_surface_point_local[env_ids_t]  # (E, 3)
-        
+        E = len(env_ids)
+
         # Get current object pose
         obj_pos = self.object.data.root_pos_w[env_ids_t]  # (E, 3)
         obj_quat = self.object.data.root_quat_w[env_ids_t]  # (E, 4)
-        
-        # Transform to world frame
-        surface_points_w = quat_apply(obj_quat, surface_points_local) + obj_pos  # (E, 3)
-        
-        # All use marker index 0 (the single grasp_point marker)
-        marker_indices = torch.zeros(len(env_ids), dtype=torch.long, device=surface_points_w.device)
-        
+
+        # Get grasp surface point in LOCAL frame
+        grasp_points_local = self.trajectory_manager.debug_surface_point_local[env_ids_t]  # (E, 3)
+        grasp_points_w = quat_apply(obj_quat, grasp_points_local) + obj_pos  # (E, 3)
+
+        # Get keypoint surface points in LOCAL frame
+        keypoint_points_local = self.trajectory_manager.debug_keypoint_points_local[env_ids_t]  # (E, max_kp, 3)
+        num_kp = self.trajectory_manager.num_grasp_keypoints[env_ids_t]  # (E,)
+        max_kp = keypoint_points_local.shape[1]
+
+        # Collect all points to visualize
+        all_points = [grasp_points_w]
+        all_indices = [torch.zeros(E, dtype=torch.long, device=self.object.device)]  # marker index 0 = grasp_point
+
+        for kp_idx in range(max_kp):
+            # Only include keypoints that exist for each env
+            kp_mask = num_kp > kp_idx  # (E,)
+            if kp_mask.any():
+                kp_local = keypoint_points_local[:, kp_idx]  # (E, 3)
+                kp_world = quat_apply(obj_quat, kp_local) + obj_pos  # (E, 3)
+
+                # Only add points for envs that have this keypoint
+                valid_envs = kp_mask.nonzero(as_tuple=True)[0]
+                all_points.append(kp_world[valid_envs])
+                # Marker index 1 = keypoint_0, index 2 = keypoint_1, etc.
+                all_indices.append(torch.full((len(valid_envs),), kp_idx + 1, dtype=torch.long, device=self.object.device))
+
+        # Concatenate all points and indices
+        translations = torch.cat(all_points, dim=0)
+        marker_indices = torch.cat(all_indices, dim=0)
+
         self.grasp_point_marker.visualize(
-            translations=surface_points_w,
+            translations=translations,
             marker_indices=marker_indices,
         )
 

@@ -158,8 +158,15 @@ class GraspSamplingConfig:
 @dataclass
 class GraspKeypointsConfig:
     count: tuple[int, int]
-    pos_perturbation: float
-    rot_perturbation: float
+    max_surface_perturbation: float  # Max distance to search for nearby surface points (meters)
+    roll_perturbation: float         # Max roll perturbation around approach axis (radians)
+    normal_similarity_threshold: float  # Min dot product of normals (prevents flipping to opposite face)
+
+
+@dataclass
+class FeasibilityConfig:
+    toward_robot_threshold: float    # Palm must face front hemisphere (palm_z_world.x < this)
+    min_height: float                # Palm must be above table surface + this margin (meters)
 
 
 @dataclass
@@ -181,6 +188,7 @@ class HandTrajectoryConfig:
     grasp_rot_completion_fraction: float  # Rotation completes at this fraction of grasp duration
     grasp_sampling: GraspSamplingConfig
     keypoints: GraspKeypointsConfig
+    feasibility: FeasibilityConfig
     release: ReleaseConfig
 
 
