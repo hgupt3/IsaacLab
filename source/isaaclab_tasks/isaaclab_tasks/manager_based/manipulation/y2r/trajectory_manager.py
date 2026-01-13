@@ -1078,29 +1078,12 @@ class TrajectoryManager:
             else:
                 valid_mask = dist_ok & normal_ok & height_ok & finger_ok
 
-            # ===== Debug stats =====
-            if n > 0:
-                dist_pass = dist_ok.sum(dim=1).float().mean().item()
-                normal_pass = (dist_ok & normal_ok).sum(dim=1).float().mean().item()
-                height_pass = (dist_ok & normal_ok & height_ok).sum(dim=1).float().mean().item()
-                finger_pass = (dist_ok & normal_ok & height_ok & finger_ok).sum(dim=1).float().mean().item()
-                final_pass = valid_mask.sum(dim=1).float().mean().item()
-
-                if is_final:
-                    print(f"[Keypoint {kp_idx}] dist: {dist_pass:.1f}, +normal: {normal_pass:.1f}, "
-                          f"+height: {height_pass:.1f}, +finger: {finger_pass:.1f}, +bottom: {final_pass:.1f} (of {pool_size})")
-                else:
-                    print(f"[Keypoint {kp_idx}] dist: {dist_pass:.1f}, +normal: {normal_pass:.1f}, "
-                          f"+height: {height_pass:.1f}, +finger: {finger_pass:.1f} (of {pool_size})")
-
             # ===== Sample from valid candidates =====
             scores = torch.rand(n, pool_size, device=self.device)
             scores[~valid_mask] = -float('inf')
             selected_idx = scores.argmax(dim=1)  # (n,)
 
             has_valid = valid_mask.any(dim=1)  # (n,)
-            success_rate = has_valid.float().mean().item() * 100
-            print(f"  -> Success rate: {success_rate:.1f}% ({has_valid.sum().item()}/{n} envs found valid keypoint)")
 
             # Gather results - select directly from already-computed values
             batch_idx = torch.arange(n, device=self.device)
@@ -1130,17 +1113,6 @@ class TrajectoryManager:
             new_points = torch.where(has_valid.unsqueeze(-1), selected_points, prev_points)
             new_normals = torch.where(has_valid.unsqueeze(-1), selected_normals, prev_normals)
             new_rolls = torch.where(has_valid, selected_rolls, prev_rolls)
-
-            # DEBUG: Verify finger direction
-            selected_finger_dir = quat_apply(new_palm_quat_world, x_axis.expand(n, 3))
-            bad_finger = selected_finger_dir[:, 0] >= toward_robot_threshold
-            fallback_used = (~has_valid).sum().item()
-            if bad_finger.any() or fallback_used > 0:
-                num_bad = bad_finger.sum().item()
-                print(f"  WARNING: {num_bad}/{n} keypoints have finger.x >= {toward_robot_threshold}, "
-                      f"fallback={fallback_used}")
-                print(f"    finger.x: min={selected_finger_dir[:, 0].min():.3f}, "
-                      f"max={selected_finger_dir[:, 0].max():.3f}")
 
             # Convert to local frame for storage (like grasp line 280)
             palm_quat_local = quat_mul(quat_inv(obj_quat_at_kp), new_palm_quat_world)

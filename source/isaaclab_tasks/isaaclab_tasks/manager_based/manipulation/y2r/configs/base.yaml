@@ -227,7 +227,7 @@ rewards:
   good_finger_contact:
     weight: 1.0
     params:
-      phases: [grasp, manipulation, release]  # Active in all phases
+      phases: [manipulation, release]  # Active in all phases
       use_hand_pose_gate: false         # Apply hand pose gate from hand_pose_following
       invert_in_release: true          # Invert reward in release (reward NO contact)
       threshold: 1.0                   # Contact force threshold (Newtons)
@@ -235,7 +235,7 @@ rewards:
   finger_manipulation:
     weight: 4.0
     params:
-      phases: [grasp, manipulation]    # Active in grasp and manipulation phases
+      phases: [manipulation]    # Active in grasp and manipulation phases
       use_hand_pose_gate: false         # Apply hand pose gate from hand_pose_following
       pos_std: 0.02               # Position change threshold (meters)
       rot_std: 0.2                # Rotation change threshold (radians)
@@ -250,7 +250,7 @@ rewards:
       contact_threshold: 1.0
     
   palm_velocity_penalty:
-    weight: 0.0
+    weight: 0.5
     params:
       angular_std: 0.7            # Angular velocity threshold (rad/s) - stricter
       linear_std: 1.0             # Linear velocity threshold (m/s)
@@ -282,7 +282,7 @@ rewards:
   # Hand pose following reward (when hand_trajectory.enabled)
   # Guides hand to follow palm pose trajectory through grasp/manipulation/release
   hand_pose_following:
-    weight: 2.5                   # Medium weight - guiding signal, not strict
+    weight: 3.0                   # Medium weight - guiding signal, not strict
     params:
       # Phase-varying tolerances: exp(-pos_error/tol) + exp(-rot_error/tol) / 2
       grasp_pos_tol: 0.04         # 4cm position tolerance during grasp
@@ -295,8 +295,8 @@ rewards:
       gate_in_grasp: true         # Gate during grasp phase
       gate_in_manipulation: true  # Gate during manipulation phase
       gate_in_release: true       # Gate during release phase
-      gate_pos_threshold: [0.1, 0.2]        # Position: [start dropping, reach minimum]
-      gate_rot_threshold: [2.0, 3.0]          # Rotation: [start dropping, reach minimum]
+      gate_pos_threshold: [0.12, 0.24]        # Position: [start dropping, reach minimum]
+      gate_rot_threshold: [1.5, 3.00]          # Rotation: [start dropping, reach minimum]
       gate_floor: 0.05                        # Minimum gate value (prevents complete reward collapse)
   
   # Finger release reward - incentivizes opening hand during release phase
@@ -308,7 +308,7 @@ rewards:
   
   # Finger regularizer - penalizes deviation from neutral/default finger pose
   finger_regularizer:
-    weight: -1.0                  # Negative = penalty
+    weight: -1.5                  # Negative = penalty
     params:
       phases: [grasp, release]    # Active in grasp and release phases
       # Default finger joint positions (Allegro hand - 16 joints)
@@ -317,7 +317,7 @@ rewards:
   
   # Object stillness - penalizes object movement during grasp/release
   object_stillness:
-    weight: -0.5                  # Negative = penalty
+    weight: -1.0                  # Negative = penalty
     params:
       phases: [release]    # Active in grasp and release phases
       lin_std: 0.02               # Scaling for linear velocity penalty (m/s)
@@ -334,7 +334,7 @@ terminations:
     rotation_threshold: [3.0, 1.2] #[2.5, 0.5]          # radians (pose mode) ~143° → ~29°
   
   hand_pose_deviation:
-    position_threshold: [0.4, 0.4]        # meters (lenient → strict)
+    position_threshold: [0.4, 0.3]        # meters (lenient → strict)
     rotation_threshold: [3.14, 3.14]          # radians ~180° → ~180°
 
 # ==============================================================================
@@ -342,13 +342,13 @@ terminations:
 # ==============================================================================
 curriculum:
   difficulty:
-    initial: 0                  # Starting difficulty
-    min: 0
+    initial: 5                  # Starting difficulty
+    min: 5
     max: 10
     
   # Step-based scheduler (set step_interval to null to disable)
   scheduler:
-    step_interval: 100000       # Floor increases every 100k steps → max difficulty at 1M steps
+    step_interval: 75000       # Floor increases every 100k steps → max difficulty at 1M steps
     use_performance: true       # Performance can still advance faster than floor
     
   # Tolerances to advance difficulty level
