@@ -571,6 +571,8 @@ def _build_rewards_cfg(cfg: Y2RConfig):
                 "gate_in_release": cfg.rewards.hand_pose_following.params["gate_in_release"],
                 "gate_pos_threshold": cfg.rewards.hand_pose_following.params["gate_pos_threshold"],
                 "gate_rot_threshold": cfg.rewards.hand_pose_following.params["gate_rot_threshold"],
+                "manipulation_gate_pos_threshold": cfg.rewards.hand_pose_following.params.get("manipulation_gate_pos_threshold"),
+                "manipulation_gate_rot_threshold": cfg.rewards.hand_pose_following.params.get("manipulation_gate_rot_threshold"),
                 "gate_floor": cfg.rewards.hand_pose_following.params["gate_floor"],
                 "robot_cfg": SceneEntityCfg("robot"),
             },

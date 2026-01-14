@@ -1109,6 +1109,8 @@ def hand_pose_following(
     gate_in_release: bool = True,
     gate_pos_threshold: tuple[float, float] = (0.03, 0.06),
     gate_rot_threshold: tuple[float, float] = (0.6, 0.9),
+    manipulation_gate_pos_threshold: tuple[float, float] | None = None,
+    manipulation_gate_rot_threshold: tuple[float, float] | None = None,
     gate_floor: float = 0.0,
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
@@ -1136,7 +1138,13 @@ def hand_pose_following(
         gate_in_manipulation: If True, apply gate during manipulation phase.
         gate_in_release: If True, apply gate during release phase.
         gate_pos_threshold: Position gate thresholds [start_dropping, reach_minimum] (meters).
+            Used for grasp and release phases.
         gate_rot_threshold: Rotation gate thresholds [start_dropping, reach_minimum] (radians).
+            Used for grasp and release phases.
+        manipulation_gate_pos_threshold: Position gate thresholds for manipulation phase (meters).
+            If None, uses gate_pos_threshold.
+        manipulation_gate_rot_threshold: Rotation gate thresholds for manipulation phase (radians).
+            If None, uses gate_rot_threshold.
         gate_floor: Minimum gate value (0.0-1.0). Prevents complete reward collapse.
         robot_cfg: Scene entity config for robot.
     
@@ -1223,14 +1231,32 @@ def hand_pose_following(
             in_gated_phase = in_gated_phase | in_release
         
         # Unpack threshold tuples: [start_dropping, reach_minimum]
-        pos_start, pos_end = gate_pos_threshold
-        rot_start, rot_end = gate_rot_threshold
-        
+        # Default thresholds (used for grasp and release phases)
+        default_pos_start, default_pos_end = gate_pos_threshold
+        default_rot_start, default_rot_end = gate_rot_threshold
+
+        # Manipulation-specific thresholds (fall back to default if not provided)
+        if manipulation_gate_pos_threshold is not None:
+            manip_pos_start, manip_pos_end = manipulation_gate_pos_threshold
+        else:
+            manip_pos_start, manip_pos_end = default_pos_start, default_pos_end
+
+        if manipulation_gate_rot_threshold is not None:
+            manip_rot_start, manip_rot_end = manipulation_gate_rot_threshold
+        else:
+            manip_rot_start, manip_rot_end = default_rot_start, default_rot_end
+
+        # Select thresholds per-env based on phase (manipulation vs grasp/release)
+        pos_start = torch.where(in_manipulation, manip_pos_start, default_pos_start)
+        pos_end = torch.where(in_manipulation, manip_pos_end, default_pos_end)
+        rot_start = torch.where(in_manipulation, manip_rot_start, default_rot_start)
+        rot_end = torch.where(in_manipulation, manip_rot_end, default_rot_end)
+
         # Position gate: linear ramp 1.0 → 0.0 as error exceeds threshold
         pos_gate_range = pos_end - pos_start
         pos_gate = 1.0 - (pos_error - pos_start) / pos_gate_range
         pos_gate = pos_gate.clamp(0.0, 1.0)
-        
+
         # Rotation gate: linear ramp 1.0 → 0.0 as error exceeds threshold
         rot_gate_range = rot_end - rot_start
         rot_gate = 1.0 - (rot_error - rot_start) / rot_gate_range
