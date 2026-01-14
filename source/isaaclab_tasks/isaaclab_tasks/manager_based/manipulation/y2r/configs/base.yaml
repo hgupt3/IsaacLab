@@ -70,7 +70,7 @@ hand_trajectory:
   # Grasp region sampling (surface normal based)
   # Palm approaches from surface normal direction, Z axis (blue) faces object
   grasp_sampling:
-    standoff_range: [0.02, 0.05]  # Palm distance from object surface (meters)
+    standoff_range: [0.02, 0.04]  # Palm distance from object surface (meters)
     exclude_bottom_fraction: 0.4  # Exclude bottom 30% of object surface (table side)
     exclude_toward_robot: true    # Flip grasps where fingers point toward robot
     toward_robot_threshold: -0.05   # Reject if finger_dir.x > this (0=strict, 1=permissive)
@@ -89,11 +89,10 @@ hand_trajectory:
     count: [2, 2]               # Random number of additional grasp keypoints
     max_surface_perturbation: 0.04  # Max distance to search for nearby surface points (meters)
     roll_perturbation: 0.4      # Max roll perturbation around approach axis (radians, ~23°)
-    normal_similarity_threshold: -0.01  # Min dot product of normals (0.5 = ~60°, prevents flipping to opposite face)
+    normal_similarity_threshold: -0.05  # Min dot product of normals (0.5 = ~60°, prevents flipping to opposite face)
 
   # Feasibility constraints for hand poses (checked at each keypoint)
   feasibility:
-    toward_robot_threshold: 0.0   # Palm must face front hemisphere (palm_z_world.x < this)
     min_height: 0.02              # Palm must be above table surface + this margin (meters)
   
   # Release phase - sample random position in region (like waypoints)

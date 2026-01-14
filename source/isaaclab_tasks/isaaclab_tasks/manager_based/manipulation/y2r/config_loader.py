@@ -165,7 +165,6 @@ class GraspKeypointsConfig:
 
 @dataclass
 class FeasibilityConfig:
-    toward_robot_threshold: float    # Palm must face front hemisphere (palm_z_world.x < this)
     min_height: float                # Palm must be above table surface + this margin (meters)
 
 
