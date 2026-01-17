@@ -621,6 +621,10 @@ class TrajectoryManager:
             flip_mask = alignment < 0  # Normal points wrong way
             surface_normals[flip_mask] = -surface_normals[flip_mask]
         
+        # Apply origin offset to surface points (in object-local frame)
+        if cfg.fixed_origin_offset is not None:
+            surface_points = surface_points + origin_offset.unsqueeze(0)
+
         # Rotate surface point and normal to world frame
         surface_points_w = quat_apply(obj_quat, surface_points) + obj_pos
         surface_normals_w = quat_apply(obj_quat, surface_normals)
@@ -639,39 +643,30 @@ class TrajectoryManager:
         
         # Palm orientation: Z axis points toward object (opposite of normal)
         grasp_quat = self._quat_from_z_axis(-surface_normals_w)
-        
-        # Apply fixed hand roll (rotation around approach/Z axis)
-        if cfg.fixed_hand_roll is not None:
-            roll_quat = quat_from_euler_xyz(
-                torch.zeros(n, device=self.device),
-                torch.zeros(n, device=self.device),
-                torch.full((n,), cfg.fixed_hand_roll, device=self.device),
-            )
-            # Apply roll in local frame (around palm Z)
-            grasp_quat = quat_mul(grasp_quat, roll_quat)
-        
+
+        # Determine desired roll (either fixed or zero)
+        desired_roll = torch.full((n,), cfg.fixed_hand_roll, device=self.device) if cfg.fixed_hand_roll is not None else torch.zeros(n, device=self.device)
+
         # Compute optimal roll to satisfy finger direction constraint
-        roll = torch.zeros(n, device=self.device)  # Track roll for surface representation
         if cfg.exclude_toward_robot:
-            # grasp_quat is the base quaternion at roll=0
             # Find the closest feasible roll that satisfies finger.x < threshold
+            # Uses desired_roll as starting point (respects fixed_hand_roll if set)
             roll = self._compute_closest_feasible_roll(
                 base_quat=grasp_quat,
-                desired_roll=torch.zeros(n, device=self.device),
+                desired_roll=desired_roll,
                 threshold=cfg.toward_robot_threshold,
             )
+        else:
+            # No constraint - use desired roll directly
+            roll = desired_roll
 
-            # Apply the computed roll
-            roll_quat = quat_from_euler_xyz(
-                torch.zeros(n, device=self.device),
-                torch.zeros(n, device=self.device),
-                roll,
-            )
-            grasp_quat = quat_mul(grasp_quat, roll_quat)
-
-        # Apply fixed hand roll if specified
-        if cfg.fixed_hand_roll is not None:
-            roll = roll + cfg.fixed_hand_roll
+        # Apply the final roll to grasp quaternion
+        roll_quat = quat_from_euler_xyz(
+            torch.zeros(n, device=self.device),
+            torch.zeros(n, device=self.device),
+            roll,
+        )
+        grasp_quat = quat_mul(grasp_quat, roll_quat)
 
         # Store surface-based grasp representation for keypoint sampling
         self.grasp_surface_point[env_ids] = surface_points  # Local frame

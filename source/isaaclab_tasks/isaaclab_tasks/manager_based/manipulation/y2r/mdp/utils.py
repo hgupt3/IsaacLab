@@ -399,10 +399,11 @@ def sample_object_point_cloud_random(
     prim_path: str,
     device: str = "cpu",
     pool_size: int | None = None,
+    filter_config: dict | None = None,
 ) -> torch.Tensor:
     """
     Sample random points on object surfaces for specified environments.
-    
+
     OPTIMIZED: Pure tensor indexing, NO LOOPS. Cache built once on first call.
 
     Args:
@@ -411,6 +412,8 @@ def sample_object_point_cloud_random(
         prim_path: USD prim path pattern with ".*" placeholder for env index.
         device: Device to place the output tensor on.
         pool_size: Size of point pool to sample from. If None, uses 4x num_points.
+        filter_config: Optional dict with keys: "enabled" (bool), "axis" ("x"/"y"/"z"),
+                      "min" (float|None), "max" (float|None) to filter points in region.
 
     Returns:
         torch.Tensor: Shape (len(env_ids), num_points, 3) on `device`.
@@ -439,19 +442,38 @@ def sample_object_point_cloud_random(
     # Get base points for each env by geo_idx indexing: (n, pool_size, 3)
     all_points = cache.all_base_points.to(device)  # (num_geos, pool_size, 3)
     env_base_points = all_points[geo_indices]  # (n, pool_size, 3)
-    
-    # Random subsample: vectorized random indices for all envs at once
-    # argsort of random values gives us random permutations
-    rand_vals = torch.rand(n_envs, pool_size, device=device)
-    rand_indices = rand_vals.argsort(dim=1)[:, :num_points]  # (n, num_points)
-    
+
+    # Apply per-env scale BEFORE filtering: (n, pool_size, 3)
+    env_scaled_points = scales.unsqueeze(1) * env_base_points  # (n, pool_size, 3)
+
+    # Apply regional filter if specified
+    if filter_config and filter_config.get("enabled", False):
+        axis_map = {"x": 0, "y": 1, "z": 2}
+        axis = axis_map.get(filter_config.get("axis", "z"), 2)
+        axis_min = filter_config.get("min")
+        axis_max = filter_config.get("max")
+
+        # Create mask for valid points: (n, pool_size)
+        valid_mask = torch.ones(n_envs, pool_size, dtype=torch.bool, device=device)
+        if axis_min is not None:
+            valid_mask &= env_scaled_points[:, :, axis] >= axis_min
+        if axis_max is not None:
+            valid_mask &= env_scaled_points[:, :, axis] <= axis_max
+
+        # Use valid mask to bias random sampling (invalid points get -inf random value)
+        rand_vals = torch.rand(n_envs, pool_size, device=device)
+        rand_vals[~valid_mask] = -1.0  # Invalid points won't be selected
+    else:
+        # No filter - standard random sampling
+        rand_vals = torch.rand(n_envs, pool_size, device=device)
+
+    # Random subsample: argsort gives us random permutations (valid points first)
+    rand_indices = rand_vals.argsort(dim=1, descending=True)[:, :num_points]  # (n, num_points)
+
     # Gather random points: (n, num_points, 3)
     batch_idx = torch.arange(n_envs, device=device).unsqueeze(1).expand(-1, num_points)
-    sampled_points = env_base_points[batch_idx, rand_indices]  # (n, num_points, 3)
-    
-    # Apply per-env scale: (n, 1, 3) * (n, num_points, 3)
-    points = scales.unsqueeze(1) * sampled_points
-    
+    points = env_scaled_points[batch_idx, rand_indices]  # (n, num_points, 3)
+
     return points
 
 

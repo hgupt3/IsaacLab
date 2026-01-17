@@ -70,15 +70,15 @@ def _auto_parse(cls, data: dict) -> Any:
     """Recursively parse dict into dataclass. All values must come from data."""
     hints = get_type_hints(cls)
     kwargs = {}
-    
+
     for field_name, field_type in hints.items():
         if field_name.startswith("_"):
             kwargs[field_name] = data.get(field_name, {})
             continue
-            
+
         value = data.get(field_name)
         origin = get_origin(field_type)
-        
+
         if is_dataclass(field_type):
             kwargs[field_name] = _auto_parse(field_type, value or {})
         elif value is None:
@@ -89,7 +89,7 @@ def _auto_parse(cls, data: dict) -> Any:
             kwargs[field_name] = list(value)
         else:
             kwargs[field_name] = value
-    
+
     return cls(**kwargs)
 
 
@@ -118,6 +118,7 @@ class ObservationsConfig:
     student_num_points: int
     point_pool_size: int
     history: HistoryConfig
+    point_cloud_filter: dict | None = None  # Dict with keys: enabled, axis, min, max
 
 
 @dataclass

@@ -1,0 +1,75 @@
+# ==============================================================================
+# Pan Task Layer - Pick Up, Lift 10cm, Place Down
+# ==============================================================================
+# Task definition only - no play/mode settings.
+# Pan: start (on table) -> waypoint (10cm higher) -> goal (return to start)
+# ==============================================================================
+
+# Observations: Filter out pan handle from point cloud observations
+# This prevents the policy from tracking handle points (only track the pan body)
+observations:
+  point_cloud_filter:
+    enabled: true               # Set true to enable handle filtering
+    axis: "x"                   # Filter along Z-axis (height in object-local frame)
+    min: -0.13                   # No minimum (keep all points below max)
+    max: null                   # Exclude points above 5cm (pan handle region)
+
+# Hand trajectory: grasp from handle side (approach from +Y)
+hand_trajectory:
+  grasp_sampling:
+    # Fixed direction grasp: approach from handle side
+    fixed_origin_offset: [0.0, 0, 0]           # Grasp at pan center
+    fixed_direction: [0, 0, 1]          # Approach from +Y (handle side)
+    fixed_hand_roll: 0.0               # 90° roll for handle grasp
+    exclude_toward_robot: false         # Allow full range of motion
+    # Pre-grasp approach
+    approach_distance: 0.0             # 25cm pre-grasp distance
+    align_fraction: 1.0                 # 70% of grasp phase to reach pre-grasp
+
+  keypoints:
+    count: [0, 0]                       # No in-hand manipulation keypoints
+
+trajectory:
+  phases:
+    grasp: 2.5                          # Hand approaches and grasps pan
+    manipulate_base: 4.0                # Lift + lower duration
+    settle: 0.1                         # Pause at goal before release
+    hand_release: 2.0                   # Hand retreats from pan
+
+push_t:
+  enabled: true
+  object_usd: "assets/pan/pan.usd"
+  outline_usd: "assets/pan/pan_outline.usd"  # Black cylinder outline (4cm radius, 1mm height)
+  object_scale: 2.5
+  outline_position: [-0.75, -0.1]       # Goal position for pan
+  object_rotation: [1.0, 0.0, 0.0, 0.0] # Pan flat on table
+  outline_rotation: [1.0, 0.0, 0.0, 0.0]
+  rolling_window: 2.5
+  min_speed: 0.05
+
+waypoints:
+  count: [1, 1]                         # Exactly 1 waypoint (lifted position)
+  pause_duration: 0.01                   # Brief pause at lifted position
+  fixed_waypoints:
+    - [-0.55, -0.1, 0.375, 1.0, 0.0, 0.0, 0.0]
+
+goal:
+  x_range: [-0.55, -0.55]
+  y_range: [-0.1, -0.1]
+
+randomization:
+  object:
+    scale: [0.9, 0.9]                   # Fixed scale
+    mass_scale: [2.0, 2.0]
+  reset:
+    object_x: [-0.1, -0.1]               # Small X variation
+    object_y: [0.15, 0.25]               # Small Y variation
+    object_yaw: [1.0, 0.0]             # Small yaw variation
+
+terminations:
+  trajectory_deviation:
+    position_threshold: [1.0, 1.0]      # Lenient position threshold
+    rotation_threshold: [3.14, 3.14]      # Lenient rotation threshold
+  hand_pose_deviation:
+    position_threshold: [1.0, 1.0]      # Lenient hand deviation
+    rotation_threshold: [3.14, 3.14]

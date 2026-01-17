@@ -9,12 +9,16 @@
 hand_trajectory:
   grasp_sampling:
     # Fixed direction grasp: approach from +Y side of bottle
-    fixed_origin_offset: [0, 0, 0.0]  # Slightly above bottle center (Z offset)
-    fixed_direction: [0, -1, 0]         # Look from -Y direction to find surface point
-    fixed_hand_roll: 0.0               # 90° roll - fingers pointing up (+Z)
+    fixed_origin_offset: [0, 0, -0.05]  # Slightly above bottle center (Z offset)
+    fixed_direction: [-1, 0, 0]         # Look from -Y direction to find surface point
+    fixed_hand_roll: 0.0               # 180° roll - fingers pointing up (+Z)
+    exclude_toward_robot: false         # Disable constraint to allow full 180° roll
     # Pre-grasp approach
-    approach_distance: 0.1   # 30cm pre-grasp distance
+    approach_distance: 0.2   # 30cm pre-grasp distance
     align_fraction: 0.7      # 70% of grasp phase to reach pre-grasp
+
+  keypoints:
+    count: [0, 0]               # Random number of additional grasp keypoints
 
 trajectory:
   phases:
@@ -28,10 +32,10 @@ push_t:
   object_usd: "assets/bottle/bottle.usd"
   outline_usd: "assets/cup/cup.usd"
   object_scale: 0.8
-  outline_position: [-0.55, 0.15]
+  outline_position: [-0.55, 0.23]
   object_rotation: [1.0, 0.0, 0.0, 0.0]
   outline_rotation: [1.0, 0.0, 0.0, 0.0]
-  rolling_window: 3.0
+  rolling_window: 2.5
   min_speed: 0.05
 
 waypoints:
@@ -40,7 +44,7 @@ waypoints:
     # Pour position: above cup, tilted 90 degrees
     # Position: outline_position [-0.55, 0.15] + z offset (table 0.255 + 0.16 = 0.415)
     # Rotation: tilted 90 degrees to pour [qw, qx, qy, qz]
-    - [-0.55, 0.15, 0.415, 0.707, -0.707, 0.0, 0.0]
+    - [-0.55, 0.12, 0.423, 0.707, -0.707, 0.0, 0.0]
 
 goal:
   return_to_start: true         # Return bottle to original position
@@ -55,5 +59,8 @@ randomization:
 
 terminations:
   trajectory_deviation:
-    position_threshold: [1.00, 1.00]
-    rotation_threshold: [3.0, 3.0]
+    position_threshold: [1.0, 1.0]
+    rotation_threshold: [3.14, 3.14]
+  hand_pose_deviation:
+    position_threshold: [1.0, 1.0]         # meters (lenient → strict)
+    rotation_threshold: [3.14, 3.14]          # radians ~180° → ~180°

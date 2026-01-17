@@ -31,7 +31,15 @@ observations:
   num_points: 64                # Points sampled per object surface (privileged)
   student_num_points: 32        # Points for student observations (visible point cloud)
   point_pool_size: 256          # Pool size for surface sampling (must be > num_points)
-  
+
+  # Point cloud regional filter (null = disabled, filters out specific regions)
+  point_cloud_filter: null      # Set to filter config in task yaml to exclude regions
+  # Example: exclude pan handle (points with Z > 0.05)
+  #   enabled: true
+  #   axis: "z"                 # Filter along z-axis
+  #   min: null                 # No minimum (include all below max)
+  #   max: 0.05                 # Exclude points above 0.05m in local frame
+
   # History lengths for observation groups
   history:
     policy: 5                   # Action history
@@ -344,8 +352,8 @@ terminations:
 # ==============================================================================
 curriculum:
   difficulty:
-    initial: 5                  # Starting difficulty
-    min: 5
+    initial: 0                  # Starting difficulty
+    min: 0
     max: 10
     
   # Step-based scheduler (set step_interval to null to disable)

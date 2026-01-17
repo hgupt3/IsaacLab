@@ -184,8 +184,16 @@ class object_point_cloud_b(ManagerTermBase):
 
         # Sample points using RANDOM sampling (not FPS) for consistency with targets
         all_env_ids = list(range(env.num_envs))
+
+        # Get filter config from Y2R config (already a dict)
+        filter_config = None
+        if hasattr(env, 'cfg') and hasattr(env.cfg, 'y2r_cfg'):
+            y2r_cfg = env.cfg.y2r_cfg
+            filter_config = y2r_cfg.observations.point_cloud_filter
+
         self.points_local = sample_object_point_cloud_random(
-            all_env_ids, self.num_points, self.object.cfg.prim_path, device=env.device
+            all_env_ids, self.num_points, self.object.cfg.prim_path,
+            device=env.device, filter_config=filter_config
         )
         self.points_w = torch.zeros_like(self.points_local)
 
@@ -863,8 +871,13 @@ class target_sequence_obs_b(ManagerTermBase):
         else:
             # Fallback if object_point_cloud_b not initialized yet
             all_env_ids = list(range(env.num_envs))
+
+            # Get filter config from Y2R config (already a dict)
+            filter_config = y2r_cfg.observations.point_cloud_filter
+
             self.points_local = sample_object_point_cloud_random(
-                all_env_ids, self.num_points, self.object.cfg.prim_path, device=env.device
+                all_env_ids, self.num_points, self.object.cfg.prim_path,
+                device=env.device, filter_config=filter_config
             )
             env._object_points_local = self.points_local
         
