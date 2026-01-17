@@ -1,0 +1,4 @@
+# Ignore all procedurally generated USD files (1000+ shapes)
+shape_*.usd
+shape_*.usda
+shape_*.usdc
