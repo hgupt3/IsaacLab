@@ -42,8 +42,8 @@ def build_curriculum_cfg(cfg: Y2RConfig):
                 "address": "terminations.trajectory_deviation.params.threshold",
                 "modify_fn": mdp.initial_final_interpolate_fn,
                 "modify_params": {
-                    "initial_value": cfg.terminations.trajectory_deviation.point_cloud_threshold[0],
-                    "final_value": cfg.terminations.trajectory_deviation.point_cloud_threshold[1],
+                    "initial_value": cfg.terminations.trajectory_deviation.position_threshold[0],
+                    "final_value": cfg.terminations.trajectory_deviation.position_threshold[1],
                     "difficulty_term_str": "adr",
                 },
             },

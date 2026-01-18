@@ -10,7 +10,6 @@ simulation:
 
 terminations:
   trajectory_deviation:
-    point_cloud_threshold: [2.00, 2.00]
     position_threshold: [2.00, 2.00]
     rotation_threshold: [3.14, 3.14]
 

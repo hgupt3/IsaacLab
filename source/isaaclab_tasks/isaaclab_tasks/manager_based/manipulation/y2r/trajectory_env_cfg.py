@@ -772,7 +772,7 @@ def _build_terminations_cfg(cfg: Y2RConfig):
         trajectory_deviation = DoneTerm(
             func=mdp.trajectory_deviation,
             params={
-                "threshold": cfg.terminations.trajectory_deviation.point_cloud_threshold[0],
+                "threshold": cfg.terminations.trajectory_deviation.position_threshold[0],
                 "rot_threshold": cfg.terminations.trajectory_deviation.rotation_threshold[0],
             },
         )

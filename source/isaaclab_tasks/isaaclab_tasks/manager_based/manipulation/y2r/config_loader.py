@@ -256,7 +256,6 @@ class RewardsConfig:
 
 @dataclass
 class TrajectoryDeviationConfig:
-    point_cloud_threshold: tuple[float, float]
     position_threshold: tuple[float, float]
     rotation_threshold: tuple[float, float]
 

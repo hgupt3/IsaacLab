@@ -302,11 +302,11 @@ rewards:
       gate_in_grasp: true         # Gate during grasp phase
       gate_in_manipulation: true  # Gate during manipulation phase
       gate_in_release: true       # Gate during release phase
-      gate_pos_threshold: [0.06, 0.12]        # Position: [start dropping, reach minimum]
-      gate_rot_threshold: [0.8, 1.6]          # Rotation: [start dropping, reach minimum]
+      gate_pos_threshold: [0.04, 0.08]        # Position: [start dropping, reach minimum]
+      gate_rot_threshold: [0.6, 1.2]          # Rotation: [start dropping, reach minimum]
       # Manipulation-specific overrides (null = use default thresholds above)
-      manipulation_gate_pos_threshold: [0.12, 0.24]  # Looser position thresholds for manipulation
-      manipulation_gate_rot_threshold: [1.6, 3.2]    # Looser rotation thresholds for manipulation
+      manipulation_gate_pos_threshold: [0.06, 0.12]  # Looser position thresholds for manipulation
+      manipulation_gate_rot_threshold: [1.0, 2.0]    # Looser rotation thresholds for manipulation
       gate_floor: 0.05                        # Minimum gate value (prevents complete reward collapse)
   
   # Finger release reward - incentivizes opening hand during release phase
@@ -339,13 +339,12 @@ rewards:
 # Thresholds use [initial, final] format - curriculum interpolates between
 terminations:
   trajectory_deviation:
-    point_cloud_threshold: [0.18, 0.06]     # meters
-    position_threshold: [0.4, 0.1] #[0.25, 0.05]        # meters (pose mode)
-    rotation_threshold: [3.0, 1.2] #[2.5, 0.5]          # radians (pose mode) ~143° → ~29°
+    position_threshold: [0.4, 0.1] #[0.25, 0.05]        # meters - spatial error (pos in pose mode, mean PC distance in PC mode)
+    rotation_threshold: [3.0, 1.2] #[2.5, 0.5]          # radians (pose mode only) ~143° → ~29°
   
   hand_pose_deviation:
-    position_threshold: [0.4, 0.25]        # meters (lenient → strict)
-    rotation_threshold: [3.14, 2.5]          # radians ~180° → ~180°
+    position_threshold: [0.4, 0.2]        # meters (lenient → strict)
+    rotation_threshold: [3.14, 2.0]          # radians ~180° → ~180°
 
 # ==============================================================================
 # CURRICULUM (Adaptive Domain Randomization)
@@ -358,7 +357,7 @@ curriculum:
     
   # Step-based scheduler (set step_interval to null to disable)
   scheduler:
-    step_interval: 80000       # Floor increases every 100k steps → max difficulty at 1M steps
+    step_interval: 90000       # Floor increases every 100k steps → max difficulty at 1M steps
     use_performance: true       # Performance can still advance faster than floor
     
   # Tolerances to advance difficulty level
