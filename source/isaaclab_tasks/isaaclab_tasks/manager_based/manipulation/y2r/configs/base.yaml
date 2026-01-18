@@ -34,11 +34,18 @@ observations:
 
   # Point cloud regional filter (null = disabled, filters out specific regions)
   point_cloud_filter: null      # Set to filter config in task yaml to exclude regions
-  # Example: exclude pan handle (points with Z > 0.05)
+  # Axis-based filter example (exclude pan handle - points with Z > 0.05):
   #   enabled: true
-  #   axis: "z"                 # Filter along z-axis
+  #   type: "axis"              # Filter along single axis
+  #   axis: "z"                 # Filter along z-axis (x/y/z)
   #   min: null                 # No minimum (include all below max)
   #   max: 0.05                 # Exclude points above 0.05m in local frame
+  # Radial filter example (exclude inner 3cm sphere around origin):
+  #   enabled: true
+  #   type: "radial"            # Radial distance filter
+  #   origin: [0, 0, 0]         # Center point in object-local frame
+  #   min_radius: 0.03          # Exclude points within 3cm radius
+  #   max_radius: null          # No outer limit
 
   # History lengths for observation groups
   history:
@@ -456,6 +463,9 @@ push_t:
   include_in_primitives: true   # Include T-shape in random object selection pool
   object_z_offset: null         # Center-to-bottom distance (null = auto-compute from mesh)
   outline_z_offset: null        # Center-to-bottom distance (null = auto-compute from mesh)
+  outline_has_contacts: false   # Enable collision on outline
+  outline_is_kinematic: false   # Make outline fixed/unmovable
+  outline_has_gravity: false    # Enable gravity on outline
 
 # ==============================================================================
 # PSEUDO CAMERA (for visible point cloud filtering)

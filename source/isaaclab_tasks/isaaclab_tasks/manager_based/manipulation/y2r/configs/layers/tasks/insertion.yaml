@@ -1,0 +1,74 @@
+# ==============================================================================
+# Insertion Task Layer - Nut/Bolt Assembly
+# ==============================================================================
+# Task definition only - no play/mode settings.
+# Phase 1: Grasp nut from above, hover over fixed bolt (basic setup).
+# Uses push-T infrastructure: nut=object, bolt=outline (kinematic + contacts).
+# ==============================================================================
+
+trajectory:
+  phases:
+    grasp: 2.5                  # Hand approaches nut from above
+    manipulate_base: 10.0        # Move nut to hover position over bolt
+    settle: 0.1                 # Hand pauses at hover position
+    hand_release: 2.0           # Hand retreats upward
+
+hand_trajectory:
+  enabled: true
+  grasp_sampling:
+    fixed_origin_offset: [0.01, 0, 0]
+    fixed_direction: [0, 0, 1]  # Grasp from above
+    fixed_hand_roll: 0.0
+    standoff_range: [0.05, 0.05]
+    approach_distance: 0.15
+    align_fraction: 0.7
+  keypoints:
+    count: [0, 0]
+
+# Use push-T config for nut/bolt setup
+push_t:
+  enabled: true
+  object_usd: "assets/nut/nut.usd"       # Nut = object (manipulated)
+  outline_usd: "{ISAACLAB_NUCLEUS_DIR}/Factory/factory_bolt_m16.usd"     # Bolt = outline (fixed target)
+  object_scale: 2.5                                      # Scale factor (1.5x = ~36mm diameter)
+  outline_position: [-0.65, 0.0]                         # Bolt fixed position on table
+  object_rotation: [1.0, 0.0, 0.0, 0.0]                  # Nut orientation (identity)
+  outline_rotation: [1.0, 0.0, 0.0, 0.0]                 # Bolt orientation (identity)
+  outline_has_contacts: true      # Enable collisions on bolt
+  outline_is_kinematic: true      # Bolt is fixed/unmovable
+  outline_has_gravity: false      # No gravity on bolt
+
+  rolling_window: 3.0
+  min_speed: 0.04
+
+# Fixed waypoint: hover 3cm above bolt
+waypoints:
+  count: [2, 2]
+  fixed_waypoints:
+    # Hover position: 3cm above bolt at [-0.65, 0.0]
+    - [-0.65, 0.0, 0.41, 1.0, 0.0, 0.0, 0.0]
+    - [-0.65, 0.0, 0.33, 1.0, 0.0, 0.0, 0.0]
+
+goal:
+  x_range: [-0.65, -0.65]
+  y_range: [0.0, 0.0]
+
+randomization:
+  object:
+    scale: [2.5, 2.5]           # Fixed scale for nut
+    mass_scale: [0.08, 0.08]
+    static_friction: [1.0, 1.0]
+    dynamic_friction: [1.0, 1.0]
+  reset:
+    object_x: [0.05, 0.1]       # Nut spawns with X randomization
+    object_y: [0.1, 0.2]     # Nut spawns with Y randomization
+    object_yaw: [0.0, 0.0]     # Full rotation randomization
+
+terminations:
+  trajectory_deviation:
+    position_threshold: [1.0, 1.0]     # Generous thresholds for Phase 1
+    rotation_threshold: [3.0, 3.0]
+
+  hand_pose_deviation:
+    position_threshold: [0.25, 0.25]        # meters (lenient → strict)
+    rotation_threshold: [2.5, 2.5]          # radians ~180° → ~180°

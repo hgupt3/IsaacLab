@@ -412,8 +412,11 @@ def sample_object_point_cloud_random(
         prim_path: USD prim path pattern with ".*" placeholder for env index.
         device: Device to place the output tensor on.
         pool_size: Size of point pool to sample from. If None, uses 4x num_points.
-        filter_config: Optional dict with keys: "enabled" (bool), "axis" ("x"/"y"/"z"),
-                      "min" (float|None), "max" (float|None) to filter points in region.
+        filter_config: Optional dict with keys:
+                      - "enabled" (bool): Enable filtering
+                      - "type" (str): "axis" or "radial" (default: "axis")
+                      For axis type: "axis" ("x"/"y"/"z"), "min" (float|None), "max" (float|None)
+                      For radial type: "origin" ([x,y,z]), "min_radius" (float|None), "max_radius" (float|None)
 
     Returns:
         torch.Tensor: Shape (len(env_ids), num_points, 3) on `device`.
@@ -448,17 +451,38 @@ def sample_object_point_cloud_random(
 
     # Apply regional filter if specified
     if filter_config and filter_config.get("enabled", False):
-        axis_map = {"x": 0, "y": 1, "z": 2}
-        axis = axis_map.get(filter_config.get("axis", "z"), 2)
-        axis_min = filter_config.get("min")
-        axis_max = filter_config.get("max")
+        filter_type = filter_config.get("type", "axis")  # Default to axis for backward compat
 
-        # Create mask for valid points: (n, pool_size)
-        valid_mask = torch.ones(n_envs, pool_size, dtype=torch.bool, device=device)
-        if axis_min is not None:
-            valid_mask &= env_scaled_points[:, :, axis] >= axis_min
-        if axis_max is not None:
-            valid_mask &= env_scaled_points[:, :, axis] <= axis_max
+        if filter_type == "radial":
+            # Radial distance filter from origin point
+            origin = filter_config.get("origin", [0, 0, 0])
+            origin_t = torch.tensor(origin, dtype=torch.float32, device=device)  # (3,)
+
+            # Compute distance from origin for all points: (n, pool_size)
+            distances = torch.norm(env_scaled_points - origin_t, dim=2)
+
+            # Create mask for valid points based on radius bounds
+            valid_mask = torch.ones(n_envs, pool_size, dtype=torch.bool, device=device)
+            min_radius = filter_config.get("min_radius")
+            max_radius = filter_config.get("max_radius")
+
+            if min_radius is not None:
+                valid_mask &= distances >= min_radius
+            if max_radius is not None:
+                valid_mask &= distances <= max_radius
+
+        else:  # axis filter (existing logic)
+            axis_map = {"x": 0, "y": 1, "z": 2}
+            axis = axis_map.get(filter_config.get("axis", "z"), 2)
+            axis_min = filter_config.get("min")
+            axis_max = filter_config.get("max")
+
+            # Create mask for valid points: (n, pool_size)
+            valid_mask = torch.ones(n_envs, pool_size, dtype=torch.bool, device=device)
+            if axis_min is not None:
+                valid_mask &= env_scaled_points[:, :, axis] >= axis_min
+            if axis_max is not None:
+                valid_mask &= env_scaled_points[:, :, axis] <= axis_max
 
         # Use valid mask to bias random sampling (invalid points get -inf random value)
         rand_vals = torch.rand(n_envs, pool_size, device=device)

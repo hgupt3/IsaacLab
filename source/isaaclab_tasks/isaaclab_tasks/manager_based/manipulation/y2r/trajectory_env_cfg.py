@@ -29,7 +29,7 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg
 from isaaclab.sim import CapsuleCfg, ConeCfg, CuboidCfg, CylinderCfg, RigidBodyMaterialCfg, SphereCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from . import mdp
@@ -37,6 +37,21 @@ from .adr_curriculum import build_curriculum_cfg
 from .config_loader import get_config, Y2RConfig
 from .mdp.utils import compute_z_offset_from_usd
 from .procedural_shapes import get_procedural_shape_paths
+
+
+# ==============================================================================
+# HELPER FUNCTIONS
+# ==============================================================================
+
+def _expand_path_variables(path: str) -> str:
+    """Expand Nucleus directory variables in USD paths.
+
+    Supports: {ISAACLAB_NUCLEUS_DIR}, {ISAAC_NUCLEUS_DIR}
+    """
+    return path.format(
+        ISAACLAB_NUCLEUS_DIR=ISAACLAB_NUCLEUS_DIR,
+        ISAAC_NUCLEUS_DIR=ISAAC_NUCLEUS_DIR,
+    )
 
 
 # ==============================================================================
@@ -901,9 +916,13 @@ class TrajectoryEnvCfg(ManagerBasedEnvCfg):
         """
         config_dir = Path(__file__).parent
         safety_margin = cfg.randomization.reset.z_offset  # 5mm default
-        
-        # Compute object z-offset: use config value or auto-compute from mesh
-        usd_path = str(config_dir / cfg.push_t.object_usd)
+
+        # Resolve object USD path: expand variables, then handle absolute/Nucleus paths
+        object_usd_expanded = _expand_path_variables(cfg.push_t.object_usd)
+        if object_usd_expanded.startswith(("omniverse://", "http://", "https://")) or Path(object_usd_expanded).is_absolute():
+            usd_path = object_usd_expanded
+        else:
+            usd_path = str(config_dir / object_usd_expanded)
         # Use max of scale_range for init_state z to ensure no penetration at largest scale
         # Smaller scales will spawn slightly higher, but physics will settle them
         scale_range = cfg.randomization.object.scale
@@ -932,6 +951,7 @@ class TrajectoryEnvCfg(ManagerBasedEnvCfg):
                 ),
                 collision_props=sim_utils.CollisionPropertiesCfg(),
                 mass_props=sim_utils.MassPropertiesCfg(mass=0.2),
+                articulation_props=sim_utils.ArticulationRootPropertiesCfg(articulation_enabled=False),
                 activate_contact_sensors=True,  # Required for object_table_contact sensor
             ),
             init_state=RigidObjectCfg.InitialStateCfg(
@@ -942,7 +962,12 @@ class TrajectoryEnvCfg(ManagerBasedEnvCfg):
         
         # Visual outline at goal position
         if cfg.push_t.outline_usd:
-            outline_path = str(config_dir / cfg.push_t.outline_usd)
+            # Resolve outline USD path: expand variables, then handle absolute/Nucleus paths
+            outline_usd_expanded = _expand_path_variables(cfg.push_t.outline_usd)
+            if outline_usd_expanded.startswith(("omniverse://", "http://", "https://")) or Path(outline_usd_expanded).is_absolute():
+                outline_path = outline_usd_expanded
+            else:
+                outline_path = str(config_dir / outline_usd_expanded)
             
             # Compute outline z-offset: use config value or auto-compute from mesh
             if cfg.push_t.outline_z_offset is not None:
@@ -960,8 +985,14 @@ class TrajectoryEnvCfg(ManagerBasedEnvCfg):
                 spawn=sim_utils.UsdFileCfg(
                     usd_path=outline_path,
                     scale=(cfg.push_t.object_scale,) * 3,
-                    rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=True),
-                    collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+                    rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                        disable_gravity=not cfg.push_t.outline_has_gravity,
+                        kinematic_enabled=cfg.push_t.outline_is_kinematic,
+                    ),
+                    collision_props=sim_utils.CollisionPropertiesCfg(
+                        collision_enabled=cfg.push_t.outline_has_contacts,
+                    ),
+                    articulation_props=sim_utils.ArticulationRootPropertiesCfg(articulation_enabled=False),
                 ),
                 init_state=AssetBaseCfg.InitialStateCfg(
                     pos=(*cfg.push_t.outline_position, outline_z),

@@ -16,6 +16,7 @@ import torch
 from typing import TYPE_CHECKING
 
 from isaaclab.utils.math import quat_mul, quat_from_euler_xyz, quat_apply, quat_apply_inverse, quat_inv, sample_uniform, quat_from_matrix
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 
 from .mdp.utils import get_stable_object_placement, compute_z_offset_from_usd, read_object_scales_from_usd
 
@@ -167,8 +168,17 @@ class TrajectoryManager:
         if cfg.push_t.enabled and cfg.push_t.object_usd:
             from pathlib import Path
             config_dir = Path(__file__).parent
-            usd_path = str(config_dir / cfg.push_t.object_usd)
-            
+
+            # Resolve USD path: expand variables, then handle absolute/Nucleus paths
+            object_usd_expanded = cfg.push_t.object_usd.format(
+                ISAACLAB_NUCLEUS_DIR=ISAACLAB_NUCLEUS_DIR,
+                ISAAC_NUCLEUS_DIR=ISAAC_NUCLEUS_DIR,
+            )
+            if object_usd_expanded.startswith(("omniverse://", "http://", "https://")) or Path(object_usd_expanded).is_absolute():
+                usd_path = object_usd_expanded
+            else:
+                usd_path = str(config_dir / object_usd_expanded)
+
             if cfg.push_t.object_z_offset is not None:
                 # Config specifies exact z_offset, use as-is (no scaling)
                 self._push_t_base_z_offset = cfg.push_t.object_z_offset

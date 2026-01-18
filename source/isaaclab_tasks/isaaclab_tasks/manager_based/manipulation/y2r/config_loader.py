@@ -403,6 +403,9 @@ class PushTConfig:
     include_in_primitives: bool
     object_z_offset: float | None  # null = auto-compute from mesh geometry
     outline_z_offset: float | None  # null = auto-compute from mesh geometry
+    outline_has_contacts: bool = False  # Enable collision on outline
+    outline_is_kinematic: bool = False  # Make outline fixed/unmovable
+    outline_has_gravity: bool = False   # Enable gravity on outline
 
 
 @dataclass
