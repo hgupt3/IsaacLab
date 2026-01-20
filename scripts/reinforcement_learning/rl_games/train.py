@@ -67,7 +67,9 @@ import logging
 import math
 import os
 import random
+import subprocess
 from datetime import datetime
+from pathlib import Path
 
 from rl_games.common import env_configurations, vecenv
 from rl_games.common.algo_observer import IsaacAlgoObserver
@@ -96,6 +98,51 @@ import isaaclab_tasks.manager_based.manipulation.y2r.networks  # noqa: F401
 logger = logging.getLogger(__name__)
 
 # PLACEHOLDER: Extension template (do not remove this comment)
+
+
+def get_git_info():
+    """Get git repository metadata for reproducibility."""
+    repo_root = Path(__file__).parent.parent.parent
+    commit = subprocess.check_output(
+        ['git', 'rev-parse', 'HEAD'],
+        cwd=repo_root
+    ).decode('ascii').strip()
+    dirty_files = subprocess.check_output(
+        ['git', 'status', '--porcelain'],
+        cwd=repo_root
+    ).decode('ascii').strip()
+    branch = subprocess.check_output(
+        ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+        cwd=repo_root
+    ).decode('ascii').strip()
+    return {
+        "git_commit": commit,
+        "git_dirty": bool(dirty_files),
+        "git_branch": branch,
+    }
+
+
+def log_y2r_config_files(mode: str, task: str):
+    """Log Y2R YAML config files to wandb for full reproducibility.
+
+    Uses get_config_file_paths() to ensure logged files match actual config composition.
+
+    Args:
+        mode: Y2R_MODE value (train, distill, play, play_student, keyboard)
+        task: Y2R_TASK value (base, cup, push, pan, insertion)
+    """
+    import wandb
+    from isaaclab_tasks.manager_based.manipulation.y2r.config_loader import get_config_file_paths
+
+    # Get list of files that will actually be loaded (single source of truth)
+    config_files = get_config_file_paths(mode, task)
+
+    # Base path for relative paths in wandb
+    isaaclab_tasks_root = Path(__file__).parent.parent.parent / "isaaclab_tasks"
+
+    # Upload all config files that are part of this run
+    for yaml_path in config_files:
+        wandb.save(str(yaml_path), base_path=str(isaaclab_tasks_root), policy="now")
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -245,8 +292,46 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             save_code=True,
         )
         if not wandb.run.resumed:
-            wandb.config.update({"env_cfg": env_cfg.to_dict()})
-            wandb.config.update({"agent_cfg": agent_cfg})
+            # Get environment variables for Y2R config
+            y2r_mode = os.environ.get("Y2R_MODE", "train")
+            y2r_task = os.environ.get("Y2R_TASK", "base")
+
+            # Log source YAML files
+            log_y2r_config_files(y2r_mode, y2r_task)
+
+            # Structured config logging - maximizes signal, minimizes noise
+            wandb.config.update({
+                "run_metadata": {
+                    "y2r_mode": y2r_mode,
+                    "y2r_task": y2r_task,
+                    "config_layers": [
+                        "base.yaml",
+                        *([] if y2r_mode == "train" else [f"layers/{y2r_mode}.yaml"]),
+                        *([] if y2r_task == "base" else [f"layers/tasks/{y2r_task}.yaml"])
+                    ],
+                    "num_envs": env_cfg.scene.num_envs,
+                    "device": str(env_cfg.sim.device),
+                    "seed": agent_cfg["params"]["seed"],
+                    "command_line": " ".join(sys.argv),
+                    **get_git_info(),
+                },
+                "simulation": {
+                    "physics_dt": env_cfg.sim.dt,
+                    "decimation": getattr(env_cfg.sim, 'render_interval', 2),
+                    "replicate_physics": getattr(env_cfg.sim, 'replicate_physics', False),
+                },
+                "training": {
+                    "max_epochs": agent_cfg["params"]["config"]["max_epochs"],
+                    "learning_rate": agent_cfg["params"]["config"].get("learning_rate"),
+                    "batch_size": agent_cfg["params"]["config"].get("minibatch_size"),
+                    "horizon_length": agent_cfg["params"]["config"].get("horizon_length"),
+                    "gamma": agent_cfg["params"]["config"].get("gamma"),
+                    "tau": agent_cfg["params"]["config"].get("tau"),
+                },
+                # Full configs as reference (secondary to structured data above)
+                "env_cfg_full": env_cfg.to_dict(),
+                "agent_cfg_full": agent_cfg,
+            }, allow_val_change=True)
 
     if args_cli.checkpoint is not None:
         runner.run({"train": True, "play": False, "sigma": train_sigma, "checkpoint": resume_path})

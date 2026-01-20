@@ -7,30 +7,63 @@
 # ==============================================================================
 
 trajectory:
-  phases:
-    grasp: 2.5                  # Hand approaches nut from above
-    manipulate_base: 10.0        # Move nut to hover position over bolt
-    settle: 0.1                 # Hand pauses at hover position
-    hand_release: 2.0           # Hand retreats upward
+  segments:
+    - name: "grasp"
+      type: "waypoint"
+      pose: null              # Computed: start_poses
+      duration: 2.5
+
+    - name: "hover_high"
+      type: "waypoint"
+      # First hover position: higher above bolt
+      pose: [-0.65, 0.0, 0.41, 1.0, 0.0, 0.0, 0.0]
+      duration: 5.0
+
+    - name: "hover_low"
+      type: "waypoint"
+      # First hover position: higher above bolt
+      pose: [-0.65, 0.0, 0.36, 1.0, 0.0, 0.0, 0.0]
+      duration: 2.0
+
+    - name: "insert"
+      type: "waypoint"
+      # Second hover position: closer to bolt, ready for threading
+      pose: [-0.65, 0.0, 0.325, 1.0, 0.0, 0.0, 0.0]
+      duration: 7.0
+
+    - name: "thread"
+      type: "helical"
+      axis: [0, 0, -1]           # Rotate around Z-axis (vertical)
+      rotation: 18.85           # 3 full rotations (2π * 3 ≈ 18.85 radians)
+      translation: [0, 0, -0.015]  # Descend 7.5cm onto bolt
+      duration: 30.0
+      hand_coupling: "position_only"  # Palm descends with nut, wrist orientation FROZEN
+      # hand_orientation: null will use orientation from previous segment (hover_low)
+
+    - name: "release"
+      type: "waypoint"
+      pose: [-0.65, 0.0, 0.31, 1.0, 0.0, 0.0, 0.0]              # Object stays at threaded position
+      duration: 2.0
+      hand_coupling: "none"   # Hand decouples and retreats
 
 hand_trajectory:
   enabled: true
   grasp_sampling:
-    fixed_origin_offset: [0.01, 0, 0]
+    fixed_origin_offset: [0.0, -0.025, 0]
     fixed_direction: [0, 0, 1]  # Grasp from above
     fixed_hand_roll: 0.0
-    standoff_range: [0.05, 0.05]
+    standoff_range: [0.03, 0.06]
     approach_distance: 0.15
     align_fraction: 0.7
   keypoints:
-    count: [0, 0]
+    count: [0, 0]               # No keypoints for threading task
 
 # Use push-T config for nut/bolt setup
 push_t:
   enabled: true
   object_usd: "assets/nut/nut.usd"       # Nut = object (manipulated)
   outline_usd: "{ISAACLAB_NUCLEUS_DIR}/Factory/factory_bolt_m16.usd"     # Bolt = outline (fixed target)
-  object_scale: 2.5                                      # Scale factor (1.5x = ~36mm diameter)
+  object_scale: 2.5                                      # 2.5x scaled (M16: 2mm pitch → 5mm/rotation)
   outline_position: [-0.65, 0.0]                         # Bolt fixed position on table
   object_rotation: [1.0, 0.0, 0.0, 0.0]                  # Nut orientation (identity)
   outline_rotation: [1.0, 0.0, 0.0, 0.0]                 # Bolt orientation (identity)
@@ -40,14 +73,7 @@ push_t:
 
   rolling_window: 3.0
   min_speed: 0.04
-
-# Fixed waypoint: hover 3cm above bolt
-waypoints:
-  count: [2, 2]
-  fixed_waypoints:
-    # Hover position: 3cm above bolt at [-0.65, 0.0]
-    - [-0.65, 0.0, 0.41, 1.0, 0.0, 0.0, 0.0]
-    - [-0.65, 0.0, 0.33, 1.0, 0.0, 0.0, 0.0]
+  min_angular_velocity: 0.8
 
 goal:
   x_range: [-0.65, -0.65]
@@ -72,3 +98,7 @@ terminations:
   hand_pose_deviation:
     position_threshold: [0.25, 0.25]        # meters (lenient → strict)
     rotation_threshold: [2.5, 2.5]          # radians ~180° → ~180°
+
+procedural_objects:
+  generation:
+    num_shapes: 0  

@@ -7,11 +7,22 @@
 # ==============================================================================
 
 trajectory:
-  phases:
-    grasp: 2.0                  # Hand approaches object
-    manipulate_base: 3.5        # Base manipulation time (keypoints interpolated within)
-    settle: 0.1                 # Hand pauses at goal before retreat (fingers can open)
-    hand_release: 2.0           # Hand retreats from object (eased: slow start, fast end)
+  segments:
+    - name: "grasp"
+      type: "waypoint"
+      pose: null              # Computed: start_poses
+      duration: 2.0
+
+    - name: "goal"
+      type: "waypoint"
+      pose: null              # Computed: goal_poses (push_t will replan)
+      duration: 3.5
+
+    - name: "release"
+      type: "waypoint"
+      pose: null              # Object stays at goal
+      duration: 2.0
+      hand_coupling: "none"   # Hand decouples and retreats
 
 push_t:
   enabled: true
@@ -21,9 +32,6 @@ push_t:
   outline_position: [-0.55, 0.0]
   rolling_window: 2.0
   min_speed: 0.06
-
-waypoints:
-  count: [0, 0]
 
 goal:
   x_range: [-0.55, -0.55]
@@ -37,3 +45,7 @@ terminations:
   trajectory_deviation:
     position_threshold: [2.00, 2.00]
     rotation_threshold: [3.0, 3.0]
+
+procedural_objects:
+  generation:
+    num_shapes: 0  

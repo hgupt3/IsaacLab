@@ -12,7 +12,7 @@
 simulation:
   physics_dt: 0.01              # 1/100 seconds (100 Hz physics)
   decimation: 2                 # Control at 60 Hz (physics_dt * decimation)
-  num_envs: 16384
+  num_envs: 15360
   env_spacing: 3.0
   replicate_physics: false
 
@@ -57,21 +57,67 @@ observations:
 # ==============================================================================
 # TRAJECTORY TIMING
 # ==============================================================================
-# Episode duration = grasp + manipulate_base + (waypoint_pause * max_waypoints) + settle + hand_release
+# ==============================================================================
+# TRAJECTORY (segment-based system)
+# ==============================================================================
 trajectory:
-  target_hz: 5                 # Target update rate (20/3 Hz = 150ms between targets)
+  target_hz: 5                 # Target update rate
   window_size: 5                # Number of lookahead targets in observation
-  
-  # Phase durations (seconds)
-  phases:
-    grasp: 2.0                  # Hand approaches object
-    manipulate_base: 3.0        # Base manipulation time (keypoints interpolated within)
-    settle: 0.1                 # Hand pauses at goal before retreat (fingers can open)
-    hand_release: 2.0           # Hand retreats from object (eased: slow start, fast end)
-  
-  easing_power: 1.5             # Quadratic ease curves (higher = sharper transitions)
+  easing_power: 1.5             # Ease curves for waypoint segments
   release_ease_power: 1.5       # Ease-in power for retreat (2.0 = quadratic, slow start)
-  skip_manipulation_probability: 0.05  # 0.0 = disabled, 0.1 = 10% grasp-only episodes
+  skip_manipulation_probability: 0.05  # Probability of grasp-only episodes
+
+  # Segment-based trajectory composition
+  segments:
+    - name: "grasp"
+      type: "waypoint"
+      pose: null              # Computed: uses start_poses
+      duration: 2.0
+      hand_coupling: "full"
+
+    - name: "explore"
+      type: "random_waypoint"
+      count: [0, 1]          # Random 0-1 waypoints for training variation
+      movement_duration: 3.0  # Per waypoint
+      pause_duration: 0.25    # Per waypoint
+      position_range:
+        x: null              # null = use workspace bounds
+        y: null
+        z: null
+      vary_orientation: true
+      max_rotation: 1.0      # radians (~57°)
+      hand_coupling: "full"
+
+    - name: "explore"
+      type: "random_waypoint"
+      count: [0, 1]          # Random 0-1 waypoints for training variation
+      movement_duration: 3.0  # Per waypoint
+      pause_duration: 0.25    # Per waypoint
+      position_range:
+        x: null              # null = use workspace bounds
+        y: null
+        z: null
+      vary_orientation: true
+      max_rotation: 1.0      # radians (~57°)
+      hand_coupling: "position_only"
+
+    - name: "goal"
+      type: "waypoint"
+      pose: null              # Computed: uses goal_poses
+      duration: 3.0
+      hand_coupling: "full"
+
+    - name: "settle"
+      type: "waypoint"
+      pose: null              # Computed: uses goal_poses
+      duration: 0.1
+      hand_coupling: "full"
+
+    - name: "release"
+      type: "waypoint"
+      pose: null              # Computed: object stays, hand retreats
+      duration: 2.0
+      hand_coupling: "none"   # Hand fully decoupled
 
 # ==============================================================================
 # HAND TRAJECTORY (palm pose guidance)
@@ -85,12 +131,14 @@ hand_trajectory:
   # Grasp region sampling (surface normal based)
   # Palm approaches from surface normal direction, Z axis (blue) faces object
   grasp_sampling:
-    standoff_range: [0.02, 0.04]  # Palm distance from object surface (meters)
+    standoff_range: [0.02, 0.06]  # Palm distance from object surface (meters)
     exclude_bottom_fraction: 0.4  # Exclude bottom 30% of object surface (table side)
     exclude_toward_robot: true    # Flip grasps where fingers point toward robot
     toward_robot_threshold: -0.05   # Reject if finger_dir.x > this (0=strict, 1=permissive)
+    exclude_upward: true          # Flip grasps where fingers point upward
+    upward_threshold: 0.05        # Reject if finger_dir.z > this (0=strict, 1=permissive)
     # Pre-grasp approach waypoint (null = disabled, direct start→grasp)
-    approach_distance: 0.15       # Distance behind grasp for pre-grasp position (meters)
+    approach_distance: 0.1       # Distance behind grasp for pre-grasp position (meters)
     align_fraction: 0.7           # Fraction of grasp phase for alignment (ignored if approach_distance is null)
     # Fixed direction grasp (null = random sampling)
     fixed_origin_offset: null     # [x,y,z] offset from object center to grasp origin (null = object center)
@@ -101,7 +149,7 @@ hand_trajectory:
   # Keypoints are sampled from nearby feasible surface points, ensuring the hand
   # can achieve the pose at each point in the trajectory.
   keypoints:
-    count: [2, 2]               # Random number of additional grasp keypoints
+    count: [0, 1]               # Random number of additional grasp keypoints
     max_surface_perturbation: 0.04  # Max distance to search for nearby surface points (meters)
     roll_perturbation: 0.4      # Max roll perturbation around approach axis (radians, ~23°)
     normal_similarity_threshold: -0.05  # Min dot product of normals (0.5 = ~60°, prevents flipping to opposite face)
@@ -129,28 +177,6 @@ workspace:
   table_surface_z: 0.255        # Height of table surface
 
 # ==============================================================================
-# WAYPOINTS
-# ==============================================================================
-# Intermediate points between start and goal (0-2 randomly sampled)
-waypoints:
-  count: [0, 1]                 # [min, max] waypoints per trajectory
-  movement_duration: 3.0        # Seconds of movement time per waypoint
-  pause_duration: 0.25          # Seconds to pause at each waypoint
-  
-  # Position sampling (null = use workspace bounds, else offset from start)
-  position_range:
-    x: null                     # null = sample from workspace.x
-    y: null                     # null = sample from workspace.y
-    z: null                     # null = sample from workspace.z
-  
-  # Orientation randomization
-  vary_orientation: true
-  max_rotation: 1.0            # Max rotation in radians (1.0 radions ~57 degrees)
-  
-  # Fixed waypoints: list of [x, y, z, qw, qx, qy, qz] poses (overrides random sampling)
-  fixed_waypoints: null         # null = use random sampling
-
-# ==============================================================================
 # GOAL SAMPLING
 # ==============================================================================
 # Goal is always on table surface with stable orientation
@@ -169,12 +195,12 @@ rewards:
   action_l2:
     weight: -0.005
     params:
-      finger_scale: 0.1       
+      finger_scale: 0.2       
     
   action_rate_l2:
     weight: -0.005
     params:
-      finger_scale: 0.1     
+      finger_scale: 0.2    
     
   fingers_to_object:
     weight: 1.5
@@ -188,9 +214,9 @@ rewards:
       error_gate_rot_slope: 0.5        # radians
     
   lookahead_tracking:
-    weight: 7.0
+    weight: 6.0
     params:
-      phases: [manipulation]    # Active in manipulation phase
+      phases: [grasp, manipulation]    # Active in manipulation phase
       use_hand_pose_gate: true         # Apply hand pose gate from hand_pose_following
       use_contact_gating: true         # Enable/disable contact gating
       std: 0.03                   # Position/point cloud error std for positive reward
@@ -228,7 +254,7 @@ rewards:
   early_termination:
     weight: -20.0
     params:
-      term_keys: ["trajectory_deviation", "hand_pose_deviation"]
+      term_keys: ["trajectory_deviation", "hand_pose_deviation", "abnormal_robot"]
     
   arm_table_penalty:
     weight: -0.5
@@ -255,7 +281,7 @@ rewards:
       rot_std: 0.2                # Rotation change threshold (radians)
     
   distal_joint3_penalty:
-    weight: -0.3
+    weight: -0.4
     params:
       phases: [grasp, manipulation, release]  # Active in all phases (no phase restriction)
       std: 1.5                    # (rad) larger = more lenient
@@ -350,16 +376,16 @@ terminations:
     rotation_threshold: [3.0, 1.2] #[2.5, 0.5]          # radians (pose mode only) ~143° → ~29°
   
   hand_pose_deviation:
-    position_threshold: [0.4, 0.2]        # meters (lenient → strict)
-    rotation_threshold: [3.14, 2.0]          # radians ~180° → ~180°
+    position_threshold: [0.4, 0.25]        # meters (lenient → strict)
+    rotation_threshold: [3.14, 3.14]          # radians ~180° → ~180°
 
 # ==============================================================================
 # CURRICULUM (Adaptive Domain Randomization)
 # ==============================================================================
 curriculum:
   difficulty:
-    initial: 0                  # Starting difficulty
-    min: 0
+    initial: 5                  # Starting difficulty
+    min: 5
     max: 10
     
   # Step-based scheduler (set step_interval to null to disable)
@@ -395,8 +421,8 @@ curriculum:
 # All ranges are [min, max]
 randomization:
   object:
-    scale: [0.7, 1.1]
-    mass_scale: [0.2, 2.0]
+    scale: [0.65, 1.1]
+    mass_scale: [0.1, 1.6]
     static_friction: [0.5, 1.0]
     dynamic_friction: [0.5, 1.0]
     restitution: [0.0, 0.0]
@@ -459,7 +485,8 @@ push_t:
   goal_offset: null             # [x, y, z] offset from outline position (null = no offset)
   goal_rotation: null           # Goal quaternion wxyz (null = use outline_rotation)
   rolling_window: 3.0           # Trajectory planning horizon (seconds)
-  min_speed: 0.02               # Minimum speed (m/s) to prevent infinite slowdown
+  min_speed: 0.02               # Minimum linear speed (m/s) for waypoint replanning
+  min_angular_velocity: 1.0     # Minimum angular velocity (rad/s) for helical replanning
   include_in_primitives: true   # Include T-shape in random object selection pool
   object_z_offset: null         # Center-to-bottom distance (null = auto-compute from mesh)
   outline_z_offset: null        # Center-to-bottom distance (null = auto-compute from mesh)

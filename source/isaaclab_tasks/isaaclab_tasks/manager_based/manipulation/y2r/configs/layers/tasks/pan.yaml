@@ -30,11 +30,28 @@ hand_trajectory:
     count: [0, 0]                       # No in-hand manipulation keypoints
 
 trajectory:
-  phases:
-    grasp: 2.5                          # Hand approaches and grasps pan
-    manipulate_base: 4.0                # Lift + lower duration
-    settle: 0.1                         # Pause at goal before release
-    hand_release: 2.0                   # Hand retreats from pan
+  segments:
+    - name: "grasp"
+      type: "waypoint"
+      pose: null              # Computed: start_poses
+      duration: 2.5
+
+    - name: "lift"
+      type: "waypoint"
+      # Lifted position: 10cm higher
+      pose: [-0.55, -0.1, 0.375, 1.0, 0.0, 0.0, 0.0]
+      duration: 2.0
+
+    - name: "goal"
+      type: "waypoint"
+      pose: null              # Computed: goal_poses
+      duration: 2.0
+
+    - name: "release"
+      type: "waypoint"
+      pose: null              # Object stays at goal
+      duration: 2.0
+      hand_coupling: "none"   # Hand decouples and retreats
 
 push_t:
   enabled: true
@@ -46,12 +63,6 @@ push_t:
   outline_rotation: [1.0, 0.0, 0.0, 0.0]
   rolling_window: 2.5
   min_speed: 0.05
-
-waypoints:
-  count: [1, 1]                         # Exactly 1 waypoint (lifted position)
-  pause_duration: 0.01                   # Brief pause at lifted position
-  fixed_waypoints:
-    - [-0.55, -0.1, 0.375, 1.0, 0.0, 0.0, 0.0]
 
 goal:
   x_range: [-0.55, -0.55]
@@ -73,3 +84,7 @@ terminations:
   hand_pose_deviation:
     position_threshold: [1.0, 1.0]      # Lenient hand deviation
     rotation_threshold: [3.14, 3.14]
+
+procedural_objects:
+  generation:
+    num_shapes: 0  

@@ -783,6 +783,11 @@ def _build_terminations_cfg(cfg: Y2RConfig):
         """Termination terms for the MDP."""
 
         time_out = DoneTerm(func=mdp.time_out, time_out=True)
+        
+        abnormal_robot = DoneTerm(
+            func=mdp.abnormal_robot_state,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+        )
 
         trajectory_deviation = DoneTerm(
             func=mdp.trajectory_deviation,
@@ -886,19 +891,15 @@ class TrajectoryEnvCfg(ManagerBasedEnvCfg):
         # Simulation parameters
         self.decimation = cfg.simulation.decimation
         
-        # Compute episode duration (same for all modes - push_t uses phases too)
-        phases = cfg.trajectory.phases
-        max_waypoints = cfg.waypoints.count[1]  # For push_t, this is [0,0] so 0
-        settle_duration = getattr(phases, 'settle', 0.0)
-        # Per-waypoint time = movement + pause
-        waypoint_duration = cfg.waypoints.movement_duration + cfg.waypoints.pause_duration
-        self.episode_length_s = (
-            phases.grasp
-            + phases.manipulate_base
-            + waypoint_duration * max_waypoints  # Movement + pause per waypoint
-            + settle_duration  # Settle phase before retreat
-            + phases.hand_release
-        )
+        # Compute max possible episode duration from segment config
+        # Includes random_waypoint expansion (max count * (movement + pause))
+        max_duration = 0.0
+        for seg in cfg.trajectory.segments:
+            if getattr(seg, "type", None) == "random_waypoint":
+                max_duration += seg.count[1] * (seg.movement_duration + seg.pause_duration)
+            else:
+                max_duration += seg.duration
+        self.episode_length_s = max_duration
         
         self.is_finite_horizon = True
         self.sim.dt = cfg.simulation.physics_dt

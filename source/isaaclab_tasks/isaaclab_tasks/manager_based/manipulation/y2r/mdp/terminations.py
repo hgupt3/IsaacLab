@@ -36,8 +36,12 @@ def time_out(env: ManagerBasedRLEnv) -> torch.Tensor:
     Returns:
         Boolean tensor (num_envs,) - True if episode should end.
     """
+    # Use env step counter (updated before termination check) instead of
+    # trajectory_manager.phase_time (updated during observation compute, later in the step).
+    # This keeps termination aligned with the current step and avoids running
+    # past the computed episode end.
     tm = env.trajectory_manager
-    return tm.phase_time >= tm.t_episode_end
+    return (env.episode_length_buf * env.step_dt) >= tm.t_episode_end
 
 
 def abnormal_robot_state(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:

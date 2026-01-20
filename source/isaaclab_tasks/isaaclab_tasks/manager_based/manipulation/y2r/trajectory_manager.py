@@ -63,20 +63,18 @@ class TrajectoryManager:
         
         # Timing
         self.target_dt = 1.0 / traj.target_hz
-        # Total duration is the same for all modes (phases determine episode length)
-        # For push_t, rolling_window is the replanning horizon, not the episode duration
-        max_waypoints = cfg.waypoints.count[1]  # For push_t, this is [0,0] so 0
-        settle_duration = getattr(traj.phases, 'settle', 0.0)
-        # Per-waypoint time = movement + pause
-        waypoint_duration = cfg.waypoints.movement_duration + cfg.waypoints.pause_duration
-        self.total_duration = (
-            traj.phases.grasp
-            + traj.phases.manipulate_base
-            + waypoint_duration * max_waypoints  # Movement + pause per waypoint
-            + settle_duration  # Settle phase before retreat
-            + traj.phases.hand_release
-        )
-        
+
+        # Compute max possible duration from segment config (for buffer allocation)
+        max_duration = 0.0
+        for seg in traj.segments:
+            if seg.type == "random_waypoint":
+                # Max waypoints * (movement + pause)
+                max_duration += seg.count[1] * (seg.movement_duration + seg.pause_duration)
+            else:
+                max_duration += seg.duration
+
+        self.total_duration = max_duration
+
         # Total number of targets for the trajectory buffer
         self.total_targets = int(self.total_duration / self.target_dt) + 1
         
@@ -92,14 +90,9 @@ class TrajectoryManager:
         # Start/goal poses
         self.start_poses = torch.zeros(num_envs, 7, device=device)
         self.goal_poses = torch.zeros(num_envs, 7, device=device)
-        
+
         # Environment origins (XY offset for each cloned env)
         self.env_origins = torch.zeros(num_envs, 3, device=device)
-        
-        # Waypoints: (num_envs, max_waypoints, 7)
-        wp_cfg = cfg.waypoints
-        self.waypoints = torch.zeros(num_envs, wp_cfg.count[1], 7, device=device)
-        self.num_waypoints = torch.zeros(num_envs, dtype=torch.long, device=device)
         
         # Local point cloud for penetration checking (set by observation term)
         self.points_local: torch.Tensor | None = None
@@ -111,9 +104,9 @@ class TrajectoryManager:
         # Skip manipulation flag per env (grasp-only episodes)
         self.skip_manipulation = torch.zeros(num_envs, dtype=torch.bool, device=device)
         
-        # Per-env phase boundaries (computed at reset based on actual waypoints + skip flag)
+        # Per-env phase boundaries (computed at reset based on segment durations)
+        self.t_grasp_end = torch.zeros(num_envs, device=device)    # End of grasp phase
         self.t_manip_end = torch.zeros(num_envs, device=device)    # End of manipulation phase
-        self.t_settle_end = torch.zeros(num_envs, device=device)   # End of settle phase
         self.t_episode_end = torch.zeros(num_envs, device=device)  # End of episode (for termination)
         
         # ========== Hand trajectory buffers ==========
@@ -153,7 +146,44 @@ class TrajectoryManager:
         # Stored in local frame so it moves with the object
         self.debug_surface_point_local = torch.zeros(num_envs, 3, device=device)
         self.debug_keypoint_points_local = torch.zeros(num_envs, max_keypoints, 3, device=device)
-        
+
+        # ========== Segment-based trajectory buffers ==========
+        # Compute max segments after random_waypoint expansion
+        # Each random_waypoint becomes 2 segments: movement + pause (to implement pause at waypoint)
+        max_segments_after_expansion = sum(
+            seg.count[1] * 2 if seg.type == "random_waypoint" else 1
+            for seg in cfg.trajectory.segments
+        )
+        self.segment_poses = torch.zeros(num_envs, max_segments_after_expansion, 7, device=device)
+        self.segment_boundaries = torch.zeros(num_envs, max_segments_after_expansion + 1, device=device)
+        self.coupling_modes = torch.zeros(num_envs, max_segments_after_expansion, dtype=torch.long, device=device)
+        self.num_segments = torch.zeros(num_envs, dtype=torch.long, device=device)
+        # coupling_modes: 0=full, 1=position_only, 2=none
+
+        # Store hand pose at segment boundaries (for position_only coupling)
+        self.hand_pose_at_segment_boundary = torch.zeros(num_envs, max_segments_after_expansion + 1, 7, device=device)
+
+        # Vectorized segment metadata for GPU parallelization
+        self.segment_durations = torch.zeros(num_envs, max_segments_after_expansion, device=device)
+        self.segment_is_helical = torch.zeros(num_envs, max_segments_after_expansion, dtype=torch.bool, device=device)
+        self.segment_is_grasp = torch.zeros(num_envs, max_segments_after_expansion, dtype=torch.bool, device=device)
+        self.segment_is_release = torch.zeros(num_envs, max_segments_after_expansion, dtype=torch.bool, device=device)
+        self.segment_is_goal = torch.zeros(num_envs, max_segments_after_expansion, dtype=torch.bool, device=device)
+        self.segment_is_return = torch.zeros(num_envs, max_segments_after_expansion, dtype=torch.bool, device=device)
+
+        # Helical segment parameters (only used when segment_is_helical=True)
+        self.segment_helical_axis = torch.zeros(num_envs, max_segments_after_expansion, 3, device=device)
+        self.segment_helical_rotation = torch.zeros(num_envs, max_segments_after_expansion, device=device)
+        self.segment_helical_translation = torch.zeros(num_envs, max_segments_after_expansion, 3, device=device)
+
+        # Custom pose override (for waypoint segments with explicit pose in config)
+        self.segment_has_custom_pose = torch.zeros(num_envs, max_segments_after_expansion, dtype=torch.bool, device=device)
+        self.segment_custom_pose = torch.zeros(num_envs, max_segments_after_expansion, 7, device=device)
+
+        # Hand orientation override (for position_only coupling)
+        self.segment_has_hand_orientation = torch.zeros(num_envs, max_segments_after_expansion, dtype=torch.bool, device=device)
+        self.segment_hand_orientation = torch.zeros(num_envs, max_segments_after_expansion, 4, device=device)
+
         # Object scales for variable scale support
         # Read from USD prims after prestartup scale randomization
         if object_prim_path is not None:
@@ -192,6 +222,210 @@ class TrajectoryManager:
                     scale=1.0,  # Base z_offset at unit scale
                 )
 
+    def _expand_segments(self, env_ids: torch.Tensor, start_poses: torch.Tensor, env_origins: torch.Tensor):
+        """FULLY VECTORIZED: Expand segment configs (random_waypoint → N waypoint segments).
+
+        Process ALL envs in parallel - ZERO LOOPS!
+
+        Args:
+            env_ids: Environment indices to expand for
+            start_poses: Starting object poses (n, 7)
+            env_origins: World origin offset for each env (n, 3)
+        """
+        from isaaclab.utils.math import quat_mul, quat_from_euler_xyz
+
+        n = len(env_ids)
+
+        # Track output segment index per env
+        output_seg_idx = torch.zeros(n, dtype=torch.long, device=self.device)
+
+        # Reset segment buffers for these envs to avoid stale data
+        self.segment_durations[env_ids] = 0.0
+        self.segment_is_helical[env_ids] = False
+        self.segment_is_grasp[env_ids] = False
+        self.segment_is_release[env_ids] = False
+        self.segment_is_goal[env_ids] = False
+        self.segment_is_return[env_ids] = False
+        self.segment_has_custom_pose[env_ids] = False
+        self.segment_custom_pose[env_ids] = 0.0
+        self.segment_has_hand_orientation[env_ids] = False
+        self.segment_hand_orientation[env_ids] = 0.0
+        self.coupling_modes[env_ids] = 0
+
+        # Process each segment config
+        for seg_config in self.cfg.trajectory.segments:
+            if seg_config.type == "random_waypoint":
+                # ===== VECTORIZED RANDOM WAYPOINT SAMPLING =====
+                # Each waypoint becomes TWO segments: movement (interpolates) + pause (holds)
+                # This implements proper waypoint pauses matching old system behavior
+
+                # Sample counts for ALL envs at once (n,)
+                num_wp_per_env = torch.randint(
+                    seg_config.count[0],
+                    seg_config.count[1] + 1,
+                    (n,),
+                    device=self.device
+                )  # (n,)
+
+                max_wp = num_wp_per_env.max().item()
+
+                # Advance output_seg_idx after writing segments; envs with 0 waypoints add 0.
+                if max_wp > 0:
+                    # Sample positions for ALL (env × waypoint) pairs
+                    ws_cfg = self.cfg.workspace
+                    start_local = start_poses[:, :3] - env_origins  # (n, 3)
+
+                    # Validity mask: (n, max_wp)
+                    wp_valid = torch.arange(max_wp, device=self.device).unsqueeze(0) < num_wp_per_env.unsqueeze(1)
+
+                    # Sample ALL positions at once (n, max_wp, 3)
+                    if seg_config.position_range and seg_config.position_range.x is not None:
+                        x_offsets = sample_uniform(
+                            seg_config.position_range.x[0],
+                            seg_config.position_range.x[1],
+                            (n, max_wp),
+                            self.device
+                        )
+                        x_local = start_local[:, 0].unsqueeze(1) + x_offsets
+                        x_local = torch.clamp(x_local, min=ws_cfg.x[0], max=ws_cfg.x[1])
+                    else:
+                        x_local = sample_uniform(ws_cfg.x[0], ws_cfg.x[1], (n, max_wp), self.device)
+
+                    if seg_config.position_range and seg_config.position_range.y is not None:
+                        y_offsets = sample_uniform(
+                            seg_config.position_range.y[0],
+                            seg_config.position_range.y[1],
+                            (n, max_wp),
+                            self.device
+                        )
+                        y_local = start_local[:, 1].unsqueeze(1) + y_offsets
+                        y_local = torch.clamp(y_local, min=ws_cfg.y[0], max=ws_cfg.y[1])
+                    else:
+                        y_local = sample_uniform(ws_cfg.y[0], ws_cfg.y[1], (n, max_wp), self.device)
+
+                    if seg_config.position_range and seg_config.position_range.z is not None:
+                        z_values = sample_uniform(
+                            seg_config.position_range.z[0],
+                            seg_config.position_range.z[1],
+                            (n, max_wp),
+                            self.device
+                        )
+                        z_local = torch.clamp(z_values, min=ws_cfg.z[0], max=ws_cfg.z[1])
+                    else:
+                        z_local = sample_uniform(ws_cfg.z[0], ws_cfg.z[1], (n, max_wp), self.device)
+
+                    pos_local = torch.stack([x_local, y_local, z_local], dim=2)  # (n, max_wp, 3)
+
+                    # Sample orientations for ALL at once (n, max_wp, 4)
+                    if seg_config.vary_orientation:
+                        euler_all = sample_uniform(
+                            -seg_config.max_rotation,
+                            seg_config.max_rotation,
+                            (n, max_wp, 3),
+                            self.device
+                        )  # (n, max_wp, 3)
+
+                        # Batched euler to quaternion
+                        delta_quats = quat_from_euler_xyz(
+                            euler_all[..., 0].reshape(-1),
+                            euler_all[..., 1].reshape(-1),
+                            euler_all[..., 2].reshape(-1)
+                        ).reshape(n, max_wp, 4)  # (n, max_wp, 4)
+
+                        # Apply to start orientation
+                        start_quat_expanded = start_poses[:, 3:7].unsqueeze(1).expand(-1, max_wp, -1)  # (n, max_wp, 4)
+                        quat_all = quat_mul(delta_quats.reshape(n * max_wp, 4), start_quat_expanded.reshape(n * max_wp, 4)).reshape(n, max_wp, 4)
+                    else:
+                        quat_all = start_poses[:, 3:7].unsqueeze(1).expand(-1, max_wp, -1)  # (n, max_wp, 4)
+
+                    # Write to segment buffers (vectorized scatter)
+                    # Each waypoint becomes TWO segments: movement + pause
+                    env_idx_flat, wp_idx_flat = torch.where(wp_valid)
+
+                    # Get global env IDs
+                    global_env_idx = env_ids[env_idx_flat]
+
+                    # Coupling mode (same for both movement and pause)
+                    coupling_map = {"full": 0, "position_only": 1, "none": 2}
+                    coupling_value = coupling_map[seg_config.hand_coupling]
+
+                    # ===== MOVEMENT SEGMENT (interpolates to waypoint) =====
+                    # Segment index: base + 2*wp_idx (even indices are movement)
+                    move_seg_idx = output_seg_idx[env_idx_flat] + wp_idx_flat * 2
+
+                    self.segment_durations[global_env_idx, move_seg_idx] = seg_config.movement_duration
+                    self.coupling_modes[global_env_idx, move_seg_idx] = coupling_value
+                    self.segment_is_helical[global_env_idx, move_seg_idx] = False
+                    self.segment_is_grasp[global_env_idx, move_seg_idx] = False
+                    self.segment_is_release[global_env_idx, move_seg_idx] = False
+                    self.segment_is_goal[global_env_idx, move_seg_idx] = False
+                    self.segment_is_return[global_env_idx, move_seg_idx] = False
+                    self.segment_has_custom_pose[global_env_idx, move_seg_idx] = True
+                    # IMPORTANT: segment_custom_pose positions are stored in ENV-LOCAL frame.
+                    self.segment_custom_pose[global_env_idx, move_seg_idx, :3] = pos_local[env_idx_flat, wp_idx_flat]
+                    self.segment_custom_pose[global_env_idx, move_seg_idx, 3:7] = quat_all[env_idx_flat, wp_idx_flat]
+
+                    # ===== PAUSE SEGMENT (holds at waypoint) =====
+                    # Segment index: base + 2*wp_idx + 1 (odd indices are pause)
+                    pause_seg_idx = move_seg_idx + 1
+
+                    self.segment_durations[global_env_idx, pause_seg_idx] = seg_config.pause_duration
+                    self.coupling_modes[global_env_idx, pause_seg_idx] = coupling_value
+                    self.segment_is_helical[global_env_idx, pause_seg_idx] = False
+                    self.segment_is_grasp[global_env_idx, pause_seg_idx] = False
+                    self.segment_is_release[global_env_idx, pause_seg_idx] = False
+                    self.segment_is_goal[global_env_idx, pause_seg_idx] = False
+                    self.segment_is_return[global_env_idx, pause_seg_idx] = False
+                    self.segment_has_custom_pose[global_env_idx, pause_seg_idx] = True
+                    # Same pose as movement segment end (object holds at waypoint)
+                    self.segment_custom_pose[global_env_idx, pause_seg_idx, :3] = pos_local[env_idx_flat, wp_idx_flat]
+                    self.segment_custom_pose[global_env_idx, pause_seg_idx, 3:7] = quat_all[env_idx_flat, wp_idx_flat]
+
+                    # Advance output index: 2 segments per waypoint
+                    output_seg_idx += num_wp_per_env * 2
+
+            else:
+                # ===== REGULAR SEGMENTS (waypoint, helical) - ALL ENVS AT ONCE =====
+                target_seg_idx = output_seg_idx  # (n,) - current segment index per env
+                global_env_idx = env_ids  # (n,)
+
+                # Duration
+                self.segment_durations[global_env_idx, target_seg_idx] = seg_config.duration
+
+                # Coupling mode
+                coupling_map = {"full": 0, "position_only": 1, "none": 2}
+                self.coupling_modes[global_env_idx, target_seg_idx] = coupling_map[seg_config.hand_coupling]
+
+                # Segment type markers
+                name_lower = seg_config.name.lower()
+                self.segment_is_grasp[global_env_idx, target_seg_idx] = "grasp" in name_lower
+                self.segment_is_release[global_env_idx, target_seg_idx] = "release" in name_lower
+                self.segment_is_goal[global_env_idx, target_seg_idx] = ("goal" in name_lower) or ("place" in name_lower)
+                self.segment_is_return[global_env_idx, target_seg_idx] = "return" in name_lower
+                self.segment_is_helical[global_env_idx, target_seg_idx] = (seg_config.type == "helical")
+
+                # Type-specific fields
+                if seg_config.type == "helical":
+                    self.segment_helical_axis[global_env_idx, target_seg_idx] = torch.tensor(seg_config.axis, dtype=torch.float32, device=self.device).unsqueeze(0).expand(n, 3)
+                    self.segment_helical_rotation[global_env_idx, target_seg_idx] = seg_config.rotation
+                    self.segment_helical_translation[global_env_idx, target_seg_idx] = torch.tensor(seg_config.translation, dtype=torch.float32, device=self.device).unsqueeze(0).expand(n, 3)
+                elif seg_config.type == "waypoint":
+                    if seg_config.pose is not None:
+                        self.segment_has_custom_pose[global_env_idx, target_seg_idx] = True
+                        self.segment_custom_pose[global_env_idx, target_seg_idx] = torch.tensor(seg_config.pose, dtype=torch.float32, device=self.device).unsqueeze(0).expand(n, 7)
+
+                # Hand orientation override
+                if hasattr(seg_config, 'hand_orientation') and seg_config.hand_orientation is not None:
+                    self.segment_has_hand_orientation[global_env_idx, target_seg_idx] = True
+                    self.segment_hand_orientation[global_env_idx, target_seg_idx] = torch.tensor(seg_config.hand_orientation, dtype=torch.float32, device=self.device).unsqueeze(0).expand(n, 4)
+
+                # Advance output index
+                output_seg_idx += 1
+
+        # Store num_segments for each env
+        self.num_segments[env_ids] = output_seg_idx
+
+
     def reset(
         self,
         env_ids: torch.Tensor,
@@ -201,9 +435,9 @@ class TrajectoryManager:
     ):
         """
         Reset trajectory for specified environments.
-        
+
         Generates the ENTIRE trajectory upfront.
-        
+
         Args:
             env_ids: Environment indices to reset.
             start_poses: Starting object poses (n, 7) - pos(3) + quat(4).
@@ -214,6 +448,9 @@ class TrajectoryManager:
             return
 
         n = len(env_ids)
+
+        # Expand segments (random_waypoint → N waypoints)
+        self._expand_segments(env_ids, start_poses, env_origins)
         
         # Reset timing
         self.phase_time[env_ids] = 0.0
@@ -229,50 +466,84 @@ class TrajectoryManager:
         # Store start poses and environment origins
         self.start_poses[env_ids] = start_poses
         self.env_origins[env_ids] = env_origins
-        
-        # Object scales are read once at init from USD prims (after prestartup randomization)
-        
-        # Sample waypoints
-        self._sample_waypoints(env_ids, start_poses, env_origins)
-        
+
         # Sample goal (use start_poses Z for stable placement)
         self._sample_goal(env_ids, env_origins, start_poses)
-        
-        # Sample waypoint count early (needed for grasp keypoint hemisphere constraint)
-        wp_cfg = self.cfg.waypoints
-        self.num_waypoints[env_ids] = torch.randint(
-            wp_cfg.count[0], wp_cfg.count[1] + 1, (len(env_ids),), device=self.device
-        )
-        
-        # For skip envs: goal = start (object stays in place), no waypoints
+
+        # For skip envs: goal = start (object stays in place)
         skip_mask = self.skip_manipulation[env_ids]
         if skip_mask.any():
             self.goal_poses[env_ids[skip_mask]] = self.start_poses[env_ids[skip_mask]]
-            self.num_waypoints[env_ids[skip_mask]] = 0
-        
-        # Compute per-env phase boundaries based on actual waypoint count
-        # This matches _compute_progress() which also uses per-env waypoint count
-        phases = self.cfg.trajectory.phases
-        grasp_duration = phases.grasp
-        settle_duration = getattr(phases, 'settle', 0.0)
-        release_duration = phases.hand_release
-        manip_base = phases.manipulate_base
-        waypoint_duration = wp_cfg.movement_duration + wp_cfg.pause_duration
-        
-        # Per-env manipulation duration based on actual waypoint count
-        # Skip envs: 0 manipulation (grasp → release directly)
-        # Normal envs: base + per-waypoint time
-        actual_wp = self.num_waypoints[env_ids].float()
-        manip_dur = torch.where(
-            skip_mask,
-            torch.zeros(n, device=self.device),
-            manip_base + waypoint_duration * actual_wp
-        )
-        
-        # Store phase boundaries
-        self.t_manip_end[env_ids] = grasp_duration + manip_dur
-        self.t_settle_end[env_ids] = self.t_manip_end[env_ids] + settle_duration
-        self.t_episode_end[env_ids] = self.t_settle_end[env_ids] + release_duration
+
+        # FULLY VECTORIZED: Compute phase boundaries for ALL envs in parallel
+        n = len(env_ids)
+        max_segs = self.segment_durations.shape[1]
+
+        # Create valid segment mask: (n, max_segs)
+        seg_indices = torch.arange(max_segs, device=self.device).unsqueeze(0).expand(n, max_segs)
+        valid_mask = seg_indices < self.num_segments[env_ids].unsqueeze(1)
+
+        # For skip envs: zero out manipulation segment durations (grasp → release directly)
+        # This matches old behavior where skip envs had zero manipulation time
+        if skip_mask.any():
+            skip_env_ids = env_ids[skip_mask]
+            is_manip_skip = ~self.segment_is_grasp[skip_env_ids] & ~self.segment_is_release[skip_env_ids]  # (num_skip, max_segs)
+            self.segment_durations[skip_env_ids] = torch.where(
+                is_manip_skip,
+                torch.full_like(self.segment_durations[skip_env_ids], 0.01),  # Small value to avoid div-by-zero
+                self.segment_durations[skip_env_ids]
+            )
+            # BUG FIX: Also override custom poses to start pose so object doesn't jerk to random waypoints
+            # For skip envs, manipulation segments should keep object at start position.
+            # NOTE: segment_custom_pose positions are stored in ENV-LOCAL frame.
+            start_pose_local = self.start_poses[skip_env_ids].clone()
+            start_pose_local[:, :3] -= self.env_origins[skip_env_ids]
+            start_pose_expanded = start_pose_local.unsqueeze(1).expand(-1, max_segs, -1)  # (num_skip, max_segs, 7)
+            is_manip_skip_3d = is_manip_skip.unsqueeze(2).expand(-1, -1, 7)  # (num_skip, max_segs, 7)
+            self.segment_custom_pose[skip_env_ids] = torch.where(
+                is_manip_skip_3d,
+                start_pose_expanded,
+                self.segment_custom_pose[skip_env_ids]
+            )
+            # Mark these as having custom pose so they use start_poses instead of computed poses
+            self.segment_has_custom_pose[skip_env_ids] = torch.where(
+                is_manip_skip,
+                torch.ones_like(is_manip_skip),
+                self.segment_has_custom_pose[skip_env_ids]
+            )
+
+        # Compute cumulative segment boundaries via masked cumsum
+        self.segment_boundaries[env_ids, 0] = 0.0
+        durations = self.segment_durations[env_ids]  # (n, max_segs)
+        durations_masked = durations * valid_mask.float()
+        cumsum_durations = torch.cumsum(durations_masked, dim=1)  # (n, max_segs)
+        self.segment_boundaries[env_ids, 1:max_segs+1] = cumsum_durations
+
+        # Get segment type masks
+        is_grasp = self.segment_is_grasp[env_ids] & valid_mask  # (n, max_segs)
+        is_release = self.segment_is_release[env_ids] & valid_mask
+
+        # Find LAST occurrence of each segment type using index masking
+        batch_range = torch.arange(n, device=self.device)
+
+        # t_grasp_end: boundary after last grasp segment
+        grasp_indices = torch.where(is_grasp, seg_indices, -1)
+        last_grasp_idx = grasp_indices.max(dim=1).values  # (n,)
+        grasp_boundary_idx = (last_grasp_idx + 1).clamp(min=0, max=max_segs)
+        self.t_grasp_end[env_ids] = self.segment_boundaries[env_ids[batch_range], grasp_boundary_idx]
+        self.t_grasp_end[env_ids[last_grasp_idx == -1]] = 0.0  # No grasp segment
+
+        # t_manip_end: boundary after last manipulation segment (not grasp, not release)
+        manip_mask = valid_mask & ~is_grasp & ~is_release
+        manip_indices = torch.where(manip_mask, seg_indices, -1)
+        last_manip_idx = manip_indices.max(dim=1).values
+        manip_boundary_idx = (last_manip_idx + 1).clamp(min=0, max=max_segs)
+        self.t_manip_end[env_ids] = self.segment_boundaries[env_ids[batch_range], manip_boundary_idx]
+        no_manip = (last_manip_idx == -1)
+        self.t_manip_end[env_ids[no_manip]] = self.t_grasp_end[env_ids[no_manip]]
+
+        # t_episode_end: total duration (boundary after last valid segment)
+        self.t_episode_end[env_ids] = self.segment_boundaries[env_ids[batch_range], self.num_segments[env_ids]]
         
         # === Hand trajectory generation (if enabled) ===
         if self.cfg.hand_trajectory.enabled:
@@ -299,6 +570,16 @@ class TrajectoryManager:
         # Push_t will replan during manipulation phase in step()
         # NOTE: Must be before _sample_grasp_keypoints since keypoints need object poses at future times
         self._generate_full_trajectory(env_ids)
+        # Hold final object target after episode end (matches old phase-based behavior)
+        end_idx = (self.t_episode_end[env_ids] / self.target_dt).long().clamp(0, self.total_targets - 1)
+        time_idx = torch.arange(self.total_targets, device=self.device).unsqueeze(0)
+        hold_mask = time_idx >= end_idx.unsqueeze(1)  # (n, T)
+        end_pose = self.trajectory[env_ids, end_idx]  # (n, 7)
+        self.trajectory[env_ids] = torch.where(
+            hold_mask.unsqueeze(2),
+            end_pose.unsqueeze(1),
+            self.trajectory[env_ids],
+        )
 
         # Sample grasp keypoints (perturbed from grasp pose)
         # Must be AFTER trajectory generation so we can look up object poses at keypoint times
@@ -312,7 +593,14 @@ class TrajectoryManager:
         
         # Generate hand trajectory (after object trajectory, since it depends on it)
         if self.cfg.hand_trajectory.enabled:
-            self._generate_hand_trajectory(env_ids)
+            self._generate_hand_trajectory_from_segments(env_ids)
+            # Hold final hand target after episode end (keep release pose)
+            end_hand = self.hand_trajectory[env_ids, end_idx]  # (n, 7)
+            self.hand_trajectory[env_ids] = torch.where(
+                hold_mask.unsqueeze(2),
+                end_hand.unsqueeze(1),
+                self.hand_trajectory[env_ids],
+            )
 
     def step(self, dt: float, object_poses: torch.Tensor | None = None):
         """
@@ -331,8 +619,8 @@ class TrajectoryManager:
         # Compute current target index from time
         new_idx = (self.phase_time / self.target_dt).long()
         
-        # Clamp to trajectory length (same for all modes now)
-        self.current_idx = torch.clamp(new_idx, max=self.total_targets - self.cfg.trajectory.window_size)
+        # Clamp to trajectory length (window access clamps per-target)
+        self.current_idx = torch.clamp(new_idx, max=self.total_targets - 1)
         
         # Push-T replanning: ONLY during manipulation phase
         if self.cfg.push_t.enabled and object_poses is not None:
@@ -376,69 +664,6 @@ class TrajectoryManager:
         """Get the current (first) target. Returns (num_envs, 7)."""
         batch_idx = torch.arange(self.num_envs, device=self.device)
         return self.trajectory[batch_idx, self.current_idx]
-
-    def _sample_waypoints(self, env_ids: torch.Tensor, start_poses: torch.Tensor, env_origins: torch.Tensor):
-        """Sample waypoints - use fixed_waypoints if specified, else random."""
-        n = len(env_ids)
-        cfg = self.cfg
-        wp_cfg = cfg.waypoints
-        ws_cfg = cfg.workspace
-        
-        # Check for fixed waypoints first (overrides random sampling)
-        if wp_cfg.fixed_waypoints is not None:
-            for wp_idx, wp_pose in enumerate(wp_cfg.fixed_waypoints):
-                if wp_idx >= wp_cfg.count[1]:
-                    break
-                # Position in local frame + env origin
-                pos_local = torch.tensor(wp_pose[:3], device=self.device)
-                pos_world = pos_local.unsqueeze(0).expand(n, 3) + env_origins
-                quat = torch.tensor(wp_pose[3:7], device=self.device).unsqueeze(0).expand(n, 4)
-                
-                self.waypoints[env_ids, wp_idx, :3] = pos_world
-                self.waypoints[env_ids, wp_idx, 3:7] = quat
-            return
-        
-        # Random waypoint sampling (existing logic)
-        # Convert start to local frame for clamping
-        start_local = start_poses[:, :3] - env_origins
-        
-        max_wp = wp_cfg.count[1]
-        for wp_idx in range(max_wp):
-            # Position: sample in local frame (None = use workspace, else offset from start)
-            if wp_cfg.position_range.x is None:
-                x_local = sample_uniform(ws_cfg.x[0], ws_cfg.x[1], (n,), self.device)
-            else:
-                x_local = start_local[:, 0] + sample_uniform(wp_cfg.position_range.x[0], wp_cfg.position_range.x[1], (n,), self.device)
-                x_local = x_local.clamp(ws_cfg.x[0], ws_cfg.x[1])
-            
-            if wp_cfg.position_range.y is None:
-                y_local = sample_uniform(ws_cfg.y[0], ws_cfg.y[1], (n,), self.device)
-            else:
-                y_local = start_local[:, 1] + sample_uniform(wp_cfg.position_range.y[0], wp_cfg.position_range.y[1], (n,), self.device)
-                y_local = y_local.clamp(ws_cfg.y[0], ws_cfg.y[1])
-            
-            if wp_cfg.position_range.z is None:
-                z_local = sample_uniform(ws_cfg.z[0], ws_cfg.z[1], (n,), self.device)
-            else:
-                z_local = sample_uniform(wp_cfg.position_range.z[0], wp_cfg.position_range.z[1], (n,), self.device)
-                z_local = z_local.clamp(ws_cfg.z[0], ws_cfg.z[1])
-            
-            pos_local = torch.stack([x_local, y_local, z_local], dim=-1)
-            
-            # Convert back to world frame
-            pos_world = pos_local + env_origins
-            
-            # Orientation: random rotation in WORLD frame if enabled
-            if wp_cfg.vary_orientation:
-                euler = sample_uniform(-wp_cfg.max_rotation, wp_cfg.max_rotation, (n, 3), self.device)
-                delta_quat = quat_from_euler_xyz(euler[:, 0], euler[:, 1], euler[:, 2])
-                # delta_quat * start_quat = apply delta in world frame
-                quat = quat_mul(delta_quat, start_poses[:, 3:7])
-            else:
-                quat = start_poses[:, 3:7].clone()
-            
-            self.waypoints[env_ids, wp_idx, :3] = pos_world
-            self.waypoints[env_ids, wp_idx, 3:7] = quat
 
     def _sample_goal(self, env_ids: torch.Tensor, env_origins: torch.Tensor, start_poses: torch.Tensor):
         """Sample goal pose (on table).
@@ -488,9 +713,9 @@ class TrajectoryManager:
             
             # Use goal_rotation from config, or fall back to outline_rotation
             if cfg.push_t.goal_rotation is not None:
-                goal_quat = torch.tensor([cfg.push_t.goal_rotation], device=self.device).repeat(n, 1)
+                goal_quat = torch.tensor([cfg.push_t.goal_rotation], dtype=torch.float32, device=self.device).repeat(n, 1)
             else:
-                goal_quat = torch.tensor([cfg.push_t.outline_rotation], device=self.device).repeat(n, 1)
+                goal_quat = torch.tensor([cfg.push_t.outline_rotation], dtype=torch.float32, device=self.device).repeat(n, 1)
         else:
             env_ids_list = env_ids.tolist()
             goal_z_local, goal_quat = get_stable_object_placement(
@@ -657,17 +882,20 @@ class TrajectoryManager:
         # Determine desired roll (either fixed or zero)
         desired_roll = torch.full((n,), cfg.fixed_hand_roll, device=self.device) if cfg.fixed_hand_roll is not None else torch.zeros(n, device=self.device)
 
-        # Compute optimal roll to satisfy finger direction constraint
+        # Compute optimal roll to satisfy all finger direction constraints simultaneously
+        constraints = []
         if cfg.exclude_toward_robot:
-            # Find the closest feasible roll that satisfies finger.x < threshold
-            # Uses desired_roll as starting point (respects fixed_hand_roll if set)
-            roll = self._compute_closest_feasible_roll(
+            constraints.append((0, cfg.toward_robot_threshold))  # x-component
+        if cfg.exclude_upward:
+            constraints.append((2, cfg.upward_threshold))  # z-component
+
+        if len(constraints) > 0:
+            roll = self._compute_feasible_roll_multi_constraint(
                 base_quat=grasp_quat,
                 desired_roll=desired_roll,
-                threshold=cfg.toward_robot_threshold,
+                constraints=constraints,
             )
         else:
-            # No constraint - use desired roll directly
             roll = desired_roll
 
         # Apply the final roll to grasp quaternion
@@ -752,24 +980,26 @@ class TrajectoryManager:
         base_quat: torch.Tensor,  # (n, 4) base quaternion at roll=0
         desired_roll: torch.Tensor,  # (n,) desired roll value
         threshold: float,
+        component_idx: int = 0,  # 0=x, 1=y, 2=z
     ) -> torch.Tensor:
-        """Find roll closest to desired_roll that satisfies finger.x < threshold.
+        """Find roll closest to desired_roll that satisfies finger[component] < threshold.
 
-        As roll varies around the palm Z axis, finger direction rotates in the XY plane:
-            finger.x(roll) = A * cos(roll) + B * sin(roll) = R * cos(roll - φ)
+        As roll varies around the palm Z axis, finger direction rotates in 3D:
+            finger[i](roll) = A * cos(roll) + B * sin(roll) = R * cos(roll - φ)
         where:
-            A = base_X.x (finger.x at roll=0)
-            B = base_Y.x (finger.x at roll=π/2)
+            A = base_X[i] (finger[i] at roll=0)
+            B = base_Y[i] (finger[i] at roll=π/2)
             R = sqrt(A² + B²)
             φ = atan2(B, A)
 
-        The constraint finger.x < threshold defines a feasible region.
+        The constraint finger[component] < threshold defines a feasible region.
         This function returns the roll closest to desired_roll within that region.
 
         Args:
             base_quat: Base quaternion with roll=0 (from _quat_from_z_axis).
             desired_roll: The roll we'd like to use if feasible.
-            threshold: Maximum allowed finger.x value.
+            threshold: Maximum allowed finger[component] value.
+            component_idx: Which component to constrain (0=x, 1=y, 2=z).
 
         Returns:
             Roll values that satisfy the constraint, as close to desired_roll as possible.
@@ -783,9 +1013,9 @@ class TrajectoryManager:
         base_X = quat_apply(base_quat, x_axis.expand(n, 3))  # (n, 3)
         base_Y = quat_apply(base_quat, y_axis.expand(n, 3))  # (n, 3)
 
-        # Coefficients for finger.x = A*cos(roll) + B*sin(roll)
-        A = base_X[:, 0]
-        B = base_Y[:, 0]
+        # Coefficients for finger[component] = A*cos(roll) + B*sin(roll)
+        A = base_X[:, component_idx]
+        B = base_Y[:, component_idx]
 
         # Convert to R*cos(roll - φ) form
         R = torch.sqrt(A**2 + B**2)
@@ -839,6 +1069,131 @@ class TrajectoryManager:
 
         return result
 
+    def _compute_feasible_roll_multi_constraint(
+        self,
+        base_quat: torch.Tensor,  # (n, 4) base quaternion at roll=0
+        desired_roll: torch.Tensor,  # (n,) desired roll value
+        constraints: list[tuple[int, float]],  # [(component_idx, threshold), ...]
+    ) -> torch.Tensor:
+        """Find roll satisfying ALL constraints, or minimize worst violation if impossible.
+
+        For each constraint (component_idx, threshold), computes the feasible region
+        where finger[component] < threshold. Then finds the intersection of all regions.
+
+        If intersection exists: Returns roll from intersection closest to desired_roll.
+        If intersection is empty: Returns roll that minimizes max(violations).
+
+        Args:
+            base_quat: Base quaternion with roll=0.
+            desired_roll: The roll we'd like to use if feasible.
+            constraints: List of (component_idx, threshold) pairs to satisfy.
+
+        Returns:
+            Roll values that best satisfy all constraints.
+        """
+        if len(constraints) == 0:
+            return desired_roll
+
+        n = base_quat.shape[0]
+        device = base_quat.device
+
+        # Get X and Y axes of palm frame in world coordinates
+        x_axis = torch.tensor([1.0, 0.0, 0.0], device=device)
+        y_axis = torch.tensor([0.0, 1.0, 0.0], device=device)
+        base_X = quat_apply(base_quat, x_axis.expand(n, 3))  # (n, 3)
+        base_Y = quat_apply(base_quat, y_axis.expand(n, 3))  # (n, 3)
+
+        # For each constraint, compute feasible region
+        # Each region is represented as a complement of an arc: feasible when |roll - phi| > half_width
+        feasible_regions = []  # List of (phi, half_width, always_feasible, never_feasible)
+
+        for component_idx, threshold in constraints:
+            # Coefficients for finger[component] = A*cos(roll) + B*sin(roll)
+            A = base_X[:, component_idx]
+            B = base_Y[:, component_idx]
+
+            # Convert to R*cos(roll - φ) form
+            R = torch.sqrt(A**2 + B**2)
+            phi = torch.atan2(B, A)
+
+            # Edge cases
+            always_feasible = R <= threshold
+            never_feasible = -R >= threshold
+
+            # Compute feasible region boundaries
+            # Constraint: R * cos(roll - φ) < threshold => |roll - φ| > arccos(threshold / R)
+            ratio = (threshold / R).clamp(-1, 1)
+            half_width = torch.acos(ratio)
+
+            feasible_regions.append((phi, half_width, always_feasible, never_feasible))
+
+        # Find intersection of all feasible regions
+        # Strategy: Sample N candidate rolls uniformly around circle, check which satisfy ALL constraints
+        num_samples = 32
+        candidate_rolls = torch.linspace(-math.pi, math.pi, num_samples, device=device).unsqueeze(0).expand(n, num_samples)  # (n, num_samples)
+
+        # Evaluate all constraints for all candidates
+        all_feasible = torch.ones(n, num_samples, dtype=torch.bool, device=device)
+
+        for (phi, half_width, always_feas, never_feas) in feasible_regions:
+            # Normalize candidate_rolls relative to phi
+            rel_rolls = candidate_rolls - phi.unsqueeze(1)
+            rel_rolls = (rel_rolls + math.pi) % (2 * math.pi) - math.pi
+
+            # Feasible if |rel_rolls| > half_width (outside the infeasible arc)
+            is_feasible = torch.abs(rel_rolls) > half_width.unsqueeze(1)
+
+            # Handle edge cases
+            is_feasible = torch.where(always_feas.unsqueeze(1), torch.ones_like(is_feasible), is_feasible)
+            is_feasible = torch.where(never_feas.unsqueeze(1), torch.zeros_like(is_feasible), is_feasible)
+
+            all_feasible = all_feasible & is_feasible
+
+        # Check if any candidates are fully feasible
+        any_feasible = all_feasible.any(dim=1)  # (n,)
+
+        # Case 1: Intersection exists - pick closest to desired_roll
+        if any_feasible.any():
+            # Compute distance from desired_roll to each candidate (wrap-around distance)
+            dist_to_desired = candidate_rolls - desired_roll.unsqueeze(1)
+            dist_to_desired = (dist_to_desired + math.pi) % (2 * math.pi) - math.pi
+            dist_to_desired = torch.abs(dist_to_desired)
+
+            # Mask out infeasible candidates
+            dist_to_desired[~all_feasible] = float('inf')
+
+            # Pick closest feasible candidate
+            best_idx = dist_to_desired.argmin(dim=1)
+            result_feasible = candidate_rolls[torch.arange(n, device=device), best_idx]
+        else:
+            result_feasible = desired_roll  # Placeholder, will be overwritten
+
+        # Case 2: No intersection - minimize worst violation
+        # Compute violation for each constraint at each candidate roll
+        max_violations = torch.zeros(n, num_samples, device=device)
+
+        for component_idx, threshold in constraints:
+            A = base_X[:, component_idx].unsqueeze(1)  # (n, 1)
+            B = base_Y[:, component_idx].unsqueeze(1)  # (n, 1)
+
+            # Compute finger[component] = A*cos(roll) + B*sin(roll)
+            finger_component = A * torch.cos(candidate_rolls) + B * torch.sin(candidate_rolls)
+
+            # Violation = max(0, finger_component - threshold)
+            violation = torch.relu(finger_component - threshold)
+
+            # Track maximum violation across constraints
+            max_violations = torch.maximum(max_violations, violation)
+
+        # Pick candidate with smallest maximum violation
+        best_idx_fallback = max_violations.argmin(dim=1)
+        result_fallback = candidate_rolls[torch.arange(n, device=device), best_idx_fallback]
+
+        # Final result: use feasible solution if exists, otherwise use fallback
+        result = torch.where(any_feasible, result_feasible, result_fallback)
+
+        return result
+
     def _get_object_pose_at_keypoint_time(self, env_ids: torch.Tensor, kp_idx: int) -> torch.Tensor:
         """Get object pose at the time when keypoint kp_idx is reached.
 
@@ -853,22 +1208,21 @@ class TrajectoryManager:
         """
         n = len(env_ids)
         cfg = self.cfg
-        phases = cfg.trajectory.phases
         max_kp = cfg.hand_trajectory.keypoints.count[1]
 
         # Keypoints are distributed through manipulation phase
         # kp_idx=0 is near start of manipulation, kp_idx=max_kp-1 is near end
-        grasp_duration = phases.grasp
 
         # Get per-env manipulation duration
-        manip_duration = self.t_manip_end[env_ids] - grasp_duration  # (n,)
+        grasp_end = self.t_grasp_end[env_ids]  # (n,)
+        manip_duration = self.t_manip_end[env_ids] - grasp_end  # (n,)
 
         # Time within manipulation phase for this keypoint
         # For forward-only traversal with N segments: grasp → kp_0 → ... → kp_{N-1}
         # kp_k is reached at progress (k+1)/N, where N = max_kp
         # Final keypoint (kp_{N-1}) is at progress 1.0 (goal pose)
         kp_fraction = (kp_idx + 1) / max_kp
-        kp_time = grasp_duration + kp_fraction * manip_duration  # (n,)
+        kp_time = grasp_end + kp_fraction * manip_duration  # (n,)
 
         # Convert to trajectory index
         kp_traj_idx = (kp_time / self.target_dt).long()  # (n,)
@@ -1038,11 +1392,15 @@ class TrajectoryManager:
                 (torch.rand(n, pool_size, device=self.device) * 2 - 1) * cfg.roll_perturbation
             )  # (n, pool_size)
 
-            # Compute closest feasible roll for each point (guarantees finger constraint if possible)
-            candidate_rolls = self._compute_closest_feasible_roll(
+            # Compute closest feasible roll for each point (apply all constraints simultaneously)
+            constraints = [(0, toward_robot_threshold)]  # x-component (toward robot)
+            if grasp_cfg.exclude_upward:
+                constraints.append((2, grasp_cfg.upward_threshold))  # z-component (upward)
+
+            candidate_rolls = self._compute_feasible_roll_multi_constraint(
                 base_quat=base_quat_world.reshape(-1, 4),
                 desired_roll=desired_rolls.reshape(-1),
-                threshold=toward_robot_threshold,
+                constraints=constraints,
             ).reshape(n, pool_size)
 
             # Step 4: Apply the computed rolls
@@ -1074,14 +1432,22 @@ class TrajectoryManager:
                 palm_quat_world.reshape(-1, 4),
                 x_axis.expand(n * pool_size, 3)
             ).reshape(n, pool_size, 3)
+
+            # ===== FILTER 4a: Exclude toward robot =====
             finger_ok = finger_dir_world[..., 0] < toward_robot_threshold
+
+            # ===== FILTER 4b: Exclude upward =====
+            if grasp_cfg.exclude_upward:
+                upward_ok = finger_dir_world[..., 2] < grasp_cfg.upward_threshold
+            else:
+                upward_ok = torch.ones(n, pool_size, dtype=torch.bool, device=self.device)
 
             # ===== FILTER 5: Exclude bottom fraction (final keypoint only) =====
             if is_final:
                 bottom_ok = pool_normals_world[..., 2] > exclude_z
-                valid_mask = dist_ok & normal_ok & height_ok & finger_ok & bottom_ok
+                valid_mask = dist_ok & normal_ok & height_ok & finger_ok & upward_ok & bottom_ok
             else:
-                valid_mask = dist_ok & normal_ok & height_ok & finger_ok
+                valid_mask = dist_ok & normal_ok & height_ok & finger_ok & upward_ok
 
             # ===== Sample from valid candidates =====
             scores = torch.rand(n, pool_size, device=self.device)
@@ -1187,278 +1553,414 @@ class TrajectoryManager:
         self.release_pose[env_ids, :3] = release_pos
         self.release_pose[env_ids, 3:7] = release_quat
 
-    def _generate_hand_trajectory(self, env_ids: torch.Tensor):
-        """Generate hand (palm) trajectory through grasp → manipulation → release.
-        
-        Uses per-env phase boundaries (t_manip_end, t_settle_end) computed at reset
-        based on actual waypoint count and skip_manipulation flag.
-        
+    def _generate_hand_trajectory_from_segments(self, env_ids: torch.Tensor):
+        """Generate hand trajectory from segments with coupling modes + keypoints.
+
+        Keypoints and coupling modes work together:
+        - Keypoints define relative hand pose in object frame (micro-adjustments)
+        - Coupling modes control how that relative pose tracks the object
+
         Args:
-            env_ids: Environment indices.
+            env_ids: Environment indices
         """
+        from isaaclab.utils.math import quat_apply, quat_mul
+
         n = len(env_ids)
-        T = self.total_targets
-        cfg = self.cfg
-        phases = cfg.trajectory.phases
-        
-        # Phase timing from config
-        grasp_duration = phases.grasp
-        release_duration = phases.hand_release
-        
-        # Get actual num_kp per env (for keypoint interpolation)
+        times = torch.arange(self.total_targets, device=self.device).float() * self.target_dt
+
+        # Get keypoints (in object-local frame)
         num_kp = self.num_grasp_keypoints[env_ids]  # (n,)
-        max_kp = cfg.hand_trajectory.keypoints.count[1]
-        
-        # Use per-env phase boundaries computed at reset
-        t_manip_end_per_env = self.t_manip_end[env_ids]    # (n,)
-        t_settle_end_per_env = self.t_settle_end[env_ids]  # (n,)
-        
-        # Compute per-env manipulation duration from boundaries
-        manip_duration_per_env = t_manip_end_per_env - grasp_duration  # (n,)
-        
-        # Release ease-in power (slow start, fast end)
-        release_ease_power = getattr(cfg.trajectory, 'release_ease_power', 2.0)
-        
-        # Time array
-        times = torch.arange(T, device=self.device).float() * self.target_dt  # (T,)
-        times = times.unsqueeze(0).expand(n, T)  # (n, T)
-        
-        t_grasp_end = grasp_duration  # scalar (same for all)
-        
-        # Initialize trajectory
-        positions = torch.zeros(n, T, 3, device=self.device)
-        orientations = torch.zeros(n, T, 4, device=self.device)
-        orientations[:, :, 0] = 1.0  # Identity quaternion default
-        
-        # Get start and end poses
-        start_pos = self.start_palm_pose[env_ids, :3]  # (n, 3)
-        start_quat = self.start_palm_pose[env_ids, 3:7]  # (n, 4)
-        grasp_pos = self.grasp_pose[env_ids, :3]  # (n, 3) relative to object
-        grasp_quat = self.grasp_pose[env_ids, 3:7]  # (n, 4)
-        release_pos = self.release_pose[env_ids, :3]  # (n, 3)
-        release_quat = self.release_pose[env_ids, 3:7]  # (n, 4)
-        
-        # Object start pose (for converting grasp to world frame)
-        obj_pos = self.start_poses[env_ids, :3]
-        obj_quat = self.start_poses[env_ids, 3:7]
-        
-        # Convert grasp pose to world frame
-        grasp_pos_w = quat_apply(obj_quat, grasp_pos) + obj_pos
-        grasp_quat_w = quat_mul(obj_quat, grasp_quat)
-        
-        # === Phase 1: Grasp ===
-        grasp_cfg = cfg.hand_trajectory.grasp_sampling
-        approach_dist = grasp_cfg.approach_distance
-        
-        grasp_mask = times < t_grasp_end  # (n, T)
-        grasp_progress = (times / grasp_duration).clamp(0.0, 1.0)  # (n, T)
-        
-        # Fast-track rotation: complete earlier than position
-        rot_fraction = cfg.hand_trajectory.grasp_rot_completion_fraction
-        rot_progress = (grasp_progress / rot_fraction).clamp(0.0, 1.0)  # (n, T)
-        
-        if approach_dist is not None:
-            # Pre-grasp approach enabled: start → pre-grasp → grasp
-            align_frac = grasp_cfg.align_fraction
-            
-            # Compute pre-grasp position (approach_dist behind grasp along palm Z)
-            # Palm Z axis points toward object (approach direction)
-            palm_z = quat_apply(grasp_quat_w, torch.tensor([0., 0., 1.], device=self.device).expand(n, 3))
-            pre_grasp_pos_w = grasp_pos_w - approach_dist * palm_z  # (n, 3)
-            pre_grasp_quat_w = grasp_quat_w  # Same orientation (already facing object)
-            
-            # Split grasp phase into align (0 to align_frac) and approach (align_frac to 1.0)
-            # Align phase: start → pre-grasp
-            align_mask = grasp_mask & (grasp_progress < align_frac)
-            align_progress = (grasp_progress / align_frac).clamp(0.0, 1.0)  # 0→1 within align phase
-            
-            # Approach phase: pre-grasp → grasp
-            approach_mask = grasp_mask & (grasp_progress >= align_frac)
-            approach_progress = ((grasp_progress - align_frac) / (1 - align_frac)).clamp(0.0, 1.0)  # 0→1 within approach phase
-            
-            # Interpolate align phase: start → pre-grasp
-            p_align = align_progress.unsqueeze(-1)  # (n, T, 1)
-            align_pos = (1 - p_align) * start_pos.unsqueeze(1) + p_align * pre_grasp_pos_w.unsqueeze(1)
-            align_quat = self._batched_slerp(
-                start_quat.unsqueeze(1).expand(n, T, 4),
-                pre_grasp_quat_w.unsqueeze(1).expand(n, T, 4),
-                (rot_progress / align_frac).clamp(0.0, 1.0)  # Fast-track rotation completes during align
-            )
-            positions = torch.where(align_mask.unsqueeze(-1), align_pos, positions)
-            orientations = torch.where(align_mask.unsqueeze(-1), align_quat, orientations)
-            
-            # Interpolate approach phase: pre-grasp → grasp
-            p_approach = approach_progress.unsqueeze(-1)  # (n, T, 1)
-            approach_pos = (1 - p_approach) * pre_grasp_pos_w.unsqueeze(1) + p_approach * grasp_pos_w.unsqueeze(1)
-            # Orientation stays at grasp orientation during approach (rotation already complete)
-            approach_quat = grasp_quat_w.unsqueeze(1).expand(n, T, 4)
-            positions = torch.where(approach_mask.unsqueeze(-1), approach_pos, positions)
-            orientations = torch.where(approach_mask.unsqueeze(-1), approach_quat, orientations)
-        else:
-            # Original behavior: direct start → grasp
-            p = grasp_progress.unsqueeze(-1)  # (n, T, 1)
-            grasp_lerp_pos = (1 - p) * start_pos.unsqueeze(1) + p * grasp_pos_w.unsqueeze(1)  # (n, T, 3)
-            # Rotation uses fast-tracked progress
-            grasp_lerp_quat = self._batched_slerp(
-                start_quat.unsqueeze(1).expand(n, T, 4),
-                grasp_quat_w.unsqueeze(1).expand(n, T, 4),
-                rot_progress  # Fast-tracked rotation
-            )  # (n, T, 4)
-            positions = torch.where(grasp_mask.unsqueeze(-1), grasp_lerp_pos, positions)
-            orientations = torch.where(grasp_mask.unsqueeze(-1), grasp_lerp_quat, orientations)
-        
-        # === Phase 2: Manipulation (interpolate through keypoints, relative to object) ===
-        # For skip envs: manip_mask is always False (skip directly to settle)
-        manip_mask = (times >= t_grasp_end) & (times < t_manip_end_per_env.unsqueeze(1))
-        
-        # Get object trajectory for transforming relative poses to world frame
-        obj_trajectory = self.trajectory[env_ids]  # (n, T, 7)
-        obj_pos_t = obj_trajectory[:, :, :3]  # (n, T, 3)
-        obj_quat_t = obj_trajectory[:, :, 3:7]  # (n, T, 4)
-        
-        # Keypoints for interpolation (already have max_kp from above)
+        max_kp = self.cfg.hand_trajectory.keypoints.count[1]
         keypoints = self.grasp_keypoints[env_ids]  # (n, max_kp, 7)
-        
-        # Compute manipulation progress (0 to 1) within manipulation phase
-        # Use per-env duration to avoid division by zero for skip envs
-        manip_time = (times - t_grasp_end).clamp(min=0.0)  # (n, T)
-        safe_manip_duration = manip_duration_per_env.clamp(min=1e-6)  # Avoid div by zero
-        manip_progress = (manip_time / safe_manip_duration.unsqueeze(1)).clamp(0.0, 1.0)  # (n, T)
-        
-        # Build FORWARD-ONLY keypoint chain: [grasp, kp_0, kp_1, ..., kp_{N-1}]
-        # For N keypoints: grasp → kp_0 → ... → kp_{N-1} (END at final keypoint)
-        # Max chain length = max_kp + 1 (grasp at start, keypoints after)
-        # N=0: [grasp] (stay at grasp)
-        # N=1: [grasp, kp_0] (1 segment, kp_0 at progress 1.0)
-        # N=2: [grasp, kp_0, kp_1] (2 segments, kp_0 at 0.5, kp_1 at 1.0)
-        # N=3: [grasp, kp_0, kp_1, kp_2] (3 segments, kp_k at (k+1)/3)
+
+        # Build keypoint chain: [grasp, kp_0, kp_1, ..., kp_{N-1}]
         max_chain_len = max(2, max_kp + 1)
         kp_chain = torch.zeros(n, max_chain_len, 7, device=self.device)
-        
-        # Position 0: grasp pose
-        kp_chain[:, 0, :3] = grasp_pos
-        kp_chain[:, 0, 3:7] = grasp_quat
-        
+
+        # Position 0: initial grasp pose (object-local)
+        grasp_pos_local = self.grasp_pose[env_ids, :3]
+        grasp_quat_local = self.grasp_pose[env_ids, 3:7]
+        kp_chain[:, 0, :3] = grasp_pos_local
+        kp_chain[:, 0, 3:7] = grasp_quat_local
+
         if max_kp > 0:
-            # Forward pass: positions 1 to max_kp (kp_0 to kp_{max_kp-1})
             kp_chain[:, 1:max_kp+1, :] = keypoints
         else:
-            # No keypoints: just stay at grasp (duplicate for interpolation)
-            kp_chain[:, 1, :3] = grasp_pos
-            kp_chain[:, 1, 3:7] = grasp_quat
-        
-        # Number of segments per env for forward-only traversal
-        # N=0: 1 segment (grasp → grasp)
-        # N>=1: N segments (grasp → kp_0 → ... → kp_{N-1})
-        num_segments = torch.where(
-            num_kp == 0,
-            torch.ones_like(num_kp.float()),
-            num_kp.float()
-        )  # (n,)
-        
-        # Compute segment index for each timestep: (n, T)
-        seg_idx = (manip_progress * num_segments.unsqueeze(1)).long()
-        max_seg_idx = max(1, max_kp - 1)  # Maximum valid segment index
-        seg_idx = seg_idx.clamp(0, max_seg_idx)
-        
-        # Local progress within segment
-        seg_start = seg_idx.float() / num_segments.unsqueeze(1)  # (n, T)
-        seg_end = (seg_idx.float() + 1) / num_segments.unsqueeze(1)  # (n, T)
-        seg_duration = seg_end - seg_start
-        local_progress = ((manip_progress - seg_start) / seg_duration.clamp(min=1e-6)).clamp(0.0, 1.0)  # (n, T)
-        
-        # Map segment index to chain index for "from" pose
-        # For env with num_kp keypoints, chain indices are:
-        # 0=grasp, 1=kp_0, 2=kp_1, ..., num_kp=kp_{num_kp-1}
-        # Segment 0: from idx 0 (grasp), to idx 1 (kp_0)
-        # Segment 1: from idx 1 (kp_0), to idx 2 (kp_1)
-        # ...
-        # Segment N-1: from idx N-1 (kp_{N-2}), to idx N (kp_{N-1})
-        # ...
-        batch_idx = torch.arange(n, device=self.device).unsqueeze(1).expand(n, T)  # (n, T)
-        
-        from_chain_idx = seg_idx  # Segment i starts at chain position i
-        to_chain_idx = seg_idx + 1  # Segment i ends at chain position i+1
-        
-        # Clamp to valid chain range per env
-        # For env with num_kp keypoints, max chain idx = num_kp (final keypoint)
-        max_chain_idx_per_env = torch.where(num_kp == 0, torch.ones_like(num_kp), num_kp)  # (n,)
-        from_chain_idx = from_chain_idx.clamp(max=max_chain_idx_per_env.unsqueeze(1).expand(n, T))
-        to_chain_idx = to_chain_idx.clamp(max=max_chain_idx_per_env.unsqueeze(1).expand(n, T))
-        
-        from_pos = kp_chain[batch_idx, from_chain_idx, :3]  # (n, T, 3)
-        from_quat = kp_chain[batch_idx, from_chain_idx, 3:7]  # (n, T, 4)
-        to_pos = kp_chain[batch_idx, to_chain_idx, :3]  # (n, T, 3)
-        to_quat = kp_chain[batch_idx, to_chain_idx, 3:7]  # (n, T, 4)
-        
-        # Interpolate position
-        lp = local_progress.unsqueeze(-1)  # (n, T, 1)
-        interp_pos_rel = (1 - lp) * from_pos + lp * to_pos  # (n, T, 3)
-        
-        # Interpolate orientation
-        interp_quat_rel = self._batched_slerp(from_quat, to_quat, local_progress)  # (n, T, 4)
-        
-        # Transform interpolated relative pose to world frame using object trajectory
-        manip_pos = quat_apply(
-            obj_quat_t.reshape(-1, 4), 
-            interp_pos_rel.reshape(-1, 3)
-        ).reshape(n, T, 3) + obj_pos_t
-        manip_quat = quat_mul(
-            obj_quat_t.reshape(-1, 4), 
-            interp_quat_rel.reshape(-1, 4)
-        ).reshape(n, T, 4)
-        
-        positions = torch.where(manip_mask.unsqueeze(-1), manip_pos, positions)
-        orientations = torch.where(manip_mask.unsqueeze(-1), manip_quat, orientations)
-        
-        # === Phase 3: Settle (hand stays at final manipulation pose) ===
-        # Final manipulation pose is the last keypoint (kp_{N-1}) at goal
-        # Final chain index = num_kp (last keypoint in chain)
-        final_chain_idx = torch.where(num_kp == 0, torch.ones_like(num_kp), num_kp)  # (n,)
-        batch_idx_1d = torch.arange(n, device=self.device)
-        final_rel_pos = kp_chain[batch_idx_1d, final_chain_idx, :3]  # (n, 3) = grasp_pos
-        final_rel_quat = kp_chain[batch_idx_1d, final_chain_idx, 3:7]  # (n, 4) = grasp_quat
-        
-        # Transform final relative pose using object position at END of manipulation
-        # For skip envs: use grasp end time (object doesn't move during "manipulation")
-        manip_end_idx_per_env = (t_manip_end_per_env / self.target_dt).long().clamp(0, T - 1)  # (n,)
-        obj_pos_at_release = obj_pos_t[batch_idx_1d, manip_end_idx_per_env, :]  # (n, 3)
-        obj_quat_at_release = obj_quat_t[batch_idx_1d, manip_end_idx_per_env, :]  # (n, 4)
-        final_grasp_pos_w = quat_apply(obj_quat_at_release, final_rel_pos) + obj_pos_at_release
-        final_grasp_quat_w = quat_mul(obj_quat_at_release, final_rel_quat)
-        
-        # Settle phase: hand stays at final manipulation pose (fingers can open)
-        # Use per-env boundaries for skip support
-        settle_mask = (times >= t_manip_end_per_env.unsqueeze(1)) & (times < t_settle_end_per_env.unsqueeze(1))
-        positions = torch.where(settle_mask.unsqueeze(-1), 
-                               final_grasp_pos_w.unsqueeze(1).expand(n, T, 3), positions)
-        orientations = torch.where(settle_mask.unsqueeze(-1), 
-                                  final_grasp_quat_w.unsqueeze(1).expand(n, T, 4), orientations)
-        
-        # === Phase 4: Retreat (interpolate to release pose with ease-in) ===
-        retreat_mask = times >= t_settle_end_per_env.unsqueeze(1)
-        # Speed up retreat to complete before buffer ends, leaving room for hold at release
-        # This ensures the last window_size targets are all at release pose
-        window_buffer = self.cfg.trajectory.window_size * self.target_dt
-        effective_release_duration = max(release_duration - window_buffer, self.target_dt)
-        retreat_linear = ((times - t_settle_end_per_env.unsqueeze(1)) / effective_release_duration).clamp(0.0, 1.0)
-        # Apply ease-in: slow start, fast end (t^power)
-        retreat_progress = retreat_linear ** release_ease_power
-        
-        # Vectorized interpolation for retreat (eased)
-        p_ret = retreat_progress.unsqueeze(-1)  # (n, T, 1)
-        retreat_lerp_pos = (1 - p_ret) * final_grasp_pos_w.unsqueeze(1) + p_ret * release_pos.unsqueeze(1)
-        retreat_lerp_quat = self._batched_slerp(
-            final_grasp_quat_w.unsqueeze(1).expand(n, T, 4),
-            release_quat.unsqueeze(1).expand(n, T, 4),
-            retreat_progress
-        )
-        positions = torch.where(retreat_mask.unsqueeze(-1), retreat_lerp_pos, positions)
-        orientations = torch.where(retreat_mask.unsqueeze(-1), retreat_lerp_quat, orientations)
-        
-        # Store hand trajectory
-        self.hand_trajectory[env_ids, :, :3] = positions
-        self.hand_trajectory[env_ids, :, 3:7] = orientations
+            # No keypoints - duplicate grasp
+            kp_chain[:, 1, :3] = grasp_pos_local
+            kp_chain[:, 1, 3:7] = grasp_quat_local
+
+        # Important: per-env keypoint count can be 0 even if max_kp > 0.
+        # In that case, treat the chain as [grasp, grasp] (ignore sampled kp_0).
+        zero_kp_mask = num_kp == 0
+        if zero_kp_mask.any():
+            kp_chain[zero_kp_mask, 1, :3] = grasp_pos_local[zero_kp_mask]
+            kp_chain[zero_kp_mask, 1, 3:7] = grasp_quat_local[zero_kp_mask]
+
+        # ===== FULLY VECTORIZED: Process ALL (env × segment × timestep) at once - ZERO LOOPS! =====
+
+        max_segs = self.segment_durations.shape[1]
+
+        # Step 1: Precompute segment masks for ALL segments at once (n, max_segs, total_targets)
+        times_3d = times.view(1, 1, -1).expand(n, max_segs, -1)  # (n, max_segs, total_targets)
+        seg_starts_3d = self.segment_boundaries[env_ids, :-1].unsqueeze(2)  # (n, max_segs, 1)
+        seg_ends_3d = self.segment_boundaries[env_ids, 1:].unsqueeze(2)  # (n, max_segs, 1)
+        valid_segs_3d = (torch.arange(max_segs, device=self.device).view(1, -1, 1) < self.num_segments[env_ids].view(n, 1, 1))  # (n, max_segs, 1)
+
+        # For LAST segment: use <= for end boundary to include exact endpoint
+        is_last_seg_3d = (torch.arange(max_segs, device=self.device).view(1, -1, 1) == (self.num_segments[env_ids].view(n, 1, 1) - 1))
+        seg_masks_normal = (times_3d >= seg_starts_3d) & (times_3d < seg_ends_3d)
+        seg_masks_last = (times_3d >= seg_starts_3d) & (times_3d <= seg_ends_3d)
+        seg_masks_3d = torch.where(is_last_seg_3d, seg_masks_last, seg_masks_normal) & valid_segs_3d  # (n, max_segs, total_targets)
+
+        # Step 2: Compute total manipulation duration per env (vectorized)
+        manip_mask_2d = ~self.segment_is_grasp[env_ids] & ~self.segment_is_release[env_ids]  # (n, max_segs)
+        manip_durations_per_seg = self.segment_durations[env_ids] * manip_mask_2d.float()  # (n, max_segs)
+        manip_duration_total = manip_durations_per_seg.sum(dim=1).clamp(min=1e-6)  # (n,)
+
+        # Step 3: Find LAST timestep per (env, segment) for smooth transitions - FULLY VECTORIZED!
+        # Reverse timestep dimension, find first True, convert back to get LAST True
+        seg_masks_reversed = seg_masks_3d.flip(dims=[2])  # (n, max_segs, total_targets)
+        first_true_reversed = seg_masks_reversed.long().argmax(dim=2)  # (n, max_segs) - index of first True in reversed
+        last_timestep_per_segment = (self.total_targets - 1) - first_true_reversed  # (n, max_segs)
+        has_any_timesteps = seg_masks_3d.any(dim=2)  # (n, max_segs)
+        last_timestep_per_segment = torch.where(has_any_timesteps, last_timestep_per_segment, torch.zeros_like(last_timestep_per_segment))
+
+        # Initialize output
+        positions_all = torch.zeros(n, self.total_targets, 3, device=self.device)
+        orientations_all = torch.zeros(n, self.total_targets, 4, device=self.device)
+        # Default orientation to identity for any timesteps not covered by masks
+        orientations_all[:, :, 0] = 1.0
+
+        # Step 4: Process GRASP segments - ALL at once
+        is_grasp_3d = self.segment_is_grasp[env_ids].unsqueeze(2).expand(-1, -1, self.total_targets)  # (n, max_segs, total_targets)
+        grasp_mask_3d = seg_masks_3d & is_grasp_3d  # (n, max_segs, total_targets)
+
+        env_idx_g, seg_idx_g, time_idx_g = torch.where(grasp_mask_3d)
+
+        if len(env_idx_g) > 0:
+            # Compute local progress for ALL grasp timesteps
+            local_t_g = ((times[time_idx_g] - self.segment_boundaries[env_ids[env_idx_g], seg_idx_g]) /
+                         self.segment_durations[env_ids[env_idx_g], seg_idx_g].clamp(min=1e-6)).clamp(0, 1)
+
+            # Gather object poses
+            global_env_idx = env_ids[env_idx_g]
+            obj_pos_g = self.trajectory[global_env_idx, time_idx_g, :3]
+            obj_quat_g = self.trajectory[global_env_idx, time_idx_g, 3:7]
+
+            # Transform grasp pose to world
+            grasp_pos_world_g = quat_apply(obj_quat_g, grasp_pos_local[env_idx_g]) + obj_pos_g
+            grasp_quat_world_g = quat_mul(obj_quat_g, grasp_quat_local[env_idx_g])
+
+            # Start pose (MUST be in world coordinates!)
+            start_pos_g = self.start_palm_pose[global_env_idx, :3]
+            start_quat_g = self.start_palm_pose[global_env_idx, 3:7]
+
+            # Handle approach_distance if configured
+            cfg_grasp = self.cfg.hand_trajectory.grasp_sampling
+            if cfg_grasp.approach_distance is not None and cfg_grasp.approach_distance > 0:
+                # Compute pre-grasp pose: grasp_pos - approach_distance * palm_z_axis
+                # Palm Z points toward object (approach direction)
+                palm_z_local = torch.tensor([0., 0., 1.], device=self.device).expand(len(env_idx_g), 3)
+                palm_z_world_g = quat_apply(grasp_quat_world_g, palm_z_local)  # (num_grasp_timesteps, 3)
+
+                pre_grasp_pos_g = grasp_pos_world_g - cfg_grasp.approach_distance * palm_z_world_g
+                pre_grasp_quat_g = grasp_quat_world_g.clone()  # Same orientation as grasp
+
+                # Two-phase interpolation:
+                # Phase 1 (0 → align_fraction): start → pre-grasp
+                # Phase 2 (align_fraction → 1.0): pre-grasp → grasp
+                align_frac = cfg_grasp.align_fraction
+                in_phase1 = local_t_g < align_frac
+
+                # Fast-track rotation: completes earlier than position
+                rot_fraction = self.cfg.hand_trajectory.grasp_rot_completion_fraction
+                rot_progress = (local_t_g / rot_fraction).clamp(0, 1)
+
+                # Phase 1: Interpolate start → pre-grasp
+                t_phase1 = (local_t_g / align_frac).clamp(0, 1)
+                pos_phase1 = start_pos_g + t_phase1.unsqueeze(1) * (pre_grasp_pos_g - start_pos_g)
+                # Rotation uses fast-tracked progress during align phase
+                rot_progress_phase1 = (rot_progress / align_frac).clamp(0, 1)
+                quat_phase1 = self._batched_slerp(start_quat_g, pre_grasp_quat_g, rot_progress_phase1)
+
+                # Phase 2: Interpolate pre-grasp → grasp
+                t_phase2 = ((local_t_g - align_frac) / (1.0 - align_frac)).clamp(0, 1)
+                pos_phase2 = pre_grasp_pos_g + t_phase2.unsqueeze(1) * (grasp_pos_world_g - pre_grasp_pos_g)
+                # Rotation already complete during align phase, so just hold grasp orientation
+                quat_phase2 = grasp_quat_world_g.expand(len(env_idx_g), 4)
+
+                # Select based on phase
+                hand_pos_g = torch.where(in_phase1.unsqueeze(1), pos_phase1, pos_phase2)
+                quat_mask = in_phase1.unsqueeze(1).expand(-1, 4)
+                hand_quat_g = torch.where(quat_mask, quat_phase1, quat_phase2)
+            else:
+                # No approach distance: direct interpolation start → grasp
+                # Fast-track rotation: completes earlier than position
+                rot_fraction = self.cfg.hand_trajectory.grasp_rot_completion_fraction
+                rot_progress = (local_t_g / rot_fraction).clamp(0, 1)
+
+                hand_pos_g = start_pos_g + local_t_g.unsqueeze(1) * (grasp_pos_world_g - start_pos_g)
+                hand_quat_g = self._batched_slerp(start_quat_g, grasp_quat_world_g, rot_progress)
+
+            # Scatter write
+            positions_all[env_idx_g, time_idx_g] = hand_pos_g
+            orientations_all[env_idx_g, time_idx_g] = hand_quat_g
+
+        # Step 5: Pre-compute segment boundary orientations for position_only coupling
+        # We can't use orientations_all here because it hasn't been filled yet!
+        # Instead, compute what the orientation WILL BE at each segment boundary.
+        # FULLY VECTORIZED: Process all (env, seg_idx) pairs at once - NO LOOP!
+
+        # Build keypoint chain: [grasp, kp_0, kp_1, ..., kp_{N-1}]
+        max_kp = self.grasp_keypoints.shape[1]
+        kp_chain = torch.zeros(n, max_kp + 1, 7, device=self.device)
+        kp_chain[:, 0, :3] = self.grasp_pose[env_ids, :3]
+        kp_chain[:, 0, 3:7] = self.grasp_pose[env_ids, 3:7]
+        if max_kp > 0:
+            kp_chain[:, 1:, :3] = self.grasp_keypoints[env_ids, :, :3]
+            kp_chain[:, 1:, 3:7] = self.grasp_keypoints[env_ids, :, 3:7]
+
+        # Per-env: if num_kp == 0, duplicate grasp at index 1 (ignore kp_0).
+        zero_kp_mask = num_kp == 0
+        if zero_kp_mask.any():
+            kp_chain[zero_kp_mask, 1, :3] = kp_chain[zero_kp_mask, 0, :3]
+            kp_chain[zero_kp_mask, 1, 3:7] = kp_chain[zero_kp_mask, 0, 3:7]
+
+        # Get segment start times for ALL segments at once: (n, max_segs)
+        seg_start_times = self.segment_boundaries[env_ids, :max_segs]  # (n, max_segs)
+        seg_start_indices = (seg_start_times / self.target_dt).long().clamp(0, self.total_targets - 1)  # (n, max_segs)
+
+        # Get object quaternions at segment starts: (n, max_segs, 4)
+        env_range_2d = torch.arange(n, device=self.device).unsqueeze(1).expand(n, max_segs)  # (n, max_segs)
+        # NOTE: self.trajectory is indexed by GLOBAL env ids, not local batch indices.
+        global_env_range_2d = env_ids.unsqueeze(1).expand(n, max_segs)  # (n, max_segs)
+        obj_quat_at_starts = self.trajectory[global_env_range_2d, seg_start_indices, 3:7]  # (n, max_segs, 4)
+
+        # Compute global manipulation progress at ALL segment boundaries: (n, max_segs)
+        # Must be measured in "manipulation-only time" (exclude grasp/release durations),
+        # matching the progress definition used in Step 6.
+        cumsum_manip_time = torch.cumsum(manip_durations_per_seg, dim=1)  # (n, max_segs)
+        seg_manip_start_time = cumsum_manip_time - manip_durations_per_seg  # (n, max_segs)
+        global_manip_progress = (seg_manip_start_time / manip_duration_total.unsqueeze(1)).clamp(0, 1)  # (n, max_segs)
+
+        # Interpolate through keypoint chain at all progress values
+        num_kp_per_env = num_kp.unsqueeze(1)  # (n, 1) - num_kp is already indexed by env_ids
+        num_segments_kp = num_kp_per_env.clamp(min=1)  # (n, 1)
+
+        seg_idx_kp = (global_manip_progress * num_segments_kp).long().clamp(min=0)  # (n, max_segs)
+        seg_start_kp = seg_idx_kp.float() / num_segments_kp  # (n, max_segs)
+        seg_end_kp = (seg_idx_kp + 1).float() / num_segments_kp  # (n, max_segs)
+        local_progress_kp = ((global_manip_progress - seg_start_kp) / (seg_end_kp - seg_start_kp).clamp(min=1e-6)).clamp(0, 1)  # (n, max_segs)
+
+        # Clamp keypoint indices
+        max_chain_idx = torch.where(num_kp_per_env == 0, torch.ones_like(num_kp_per_env), num_kp_per_env)  # (n, 1)
+        from_idx_kp = seg_idx_kp.clamp(max=max_chain_idx)  # (n, max_segs)
+        to_idx_kp = (seg_idx_kp + 1).clamp(max=max_chain_idx)  # (n, max_segs)
+
+        # Gather keypoints using advanced indexing (flatten, gather, reshape)
+        env_idx_flat = env_range_2d.reshape(-1)  # (n * max_segs,)
+        from_idx_flat = from_idx_kp.reshape(-1)  # (n * max_segs,)
+        to_idx_flat = to_idx_kp.reshape(-1)  # (n * max_segs,)
+
+        from_quat_local_flat = kp_chain[env_idx_flat, from_idx_flat, 3:7]  # (n*max_segs, 4)
+        to_quat_local_flat = kp_chain[env_idx_flat, to_idx_flat, 3:7]  # (n*max_segs, 4)
+
+        # Reshape to (n, max_segs, 4)
+        from_quat_local = from_quat_local_flat.reshape(n, max_segs, 4)
+        to_quat_local = to_quat_local_flat.reshape(n, max_segs, 4)
+
+        # Interpolate (batched SLERP across all env-segment pairs)
+        interp_quat_local = self._batched_slerp(
+            from_quat_local.reshape(n * max_segs, 4),
+            to_quat_local.reshape(n * max_segs, 4),
+            local_progress_kp.reshape(n * max_segs)
+        ).reshape(n, max_segs, 4)
+
+        # Transform to world frame: batched quaternion multiplication
+        hand_quat_world = quat_mul(
+            obj_quat_at_starts.reshape(n * max_segs, 4),
+            interp_quat_local.reshape(n * max_segs, 4)
+        ).reshape(n, max_segs, 4)
+
+        # Use these pre-computed orientations for position_only coupling
+        prev_hand_quat_per_seg = hand_quat_world  # (n, max_segs, 4)
+
+        # Step 6: Process MANIPULATION segments (coupling mode 0 or 1) - ALL at once
+        is_manip_3d = manip_mask_2d.unsqueeze(2).expand(-1, -1, self.total_targets)  # (n, max_segs, total_targets)
+        coupling_full_or_pos = ((self.coupling_modes[env_ids] == 0) | (self.coupling_modes[env_ids] == 1)).unsqueeze(2).expand(-1, -1, self.total_targets)
+        manip_mask_3d = seg_masks_3d & is_manip_3d & coupling_full_or_pos
+
+        env_idx_m, seg_idx_m, time_idx_m = torch.where(manip_mask_3d)
+
+        if len(env_idx_m) > 0:
+            # Compute cumulative manipulation time up to each segment start (vectorized)
+            cumsum_manip_time = torch.cumsum(manip_durations_per_seg, dim=1)  # (n, max_segs)
+            seg_manip_start_time = cumsum_manip_time - manip_durations_per_seg  # (n, max_segs)
+
+            # Local time within segment
+            local_t_within_seg = times[time_idx_m] - self.segment_boundaries[env_ids[env_idx_m], seg_idx_m]
+
+            # Global manipulation progress [0, 1]
+            global_manip_progress = ((seg_manip_start_time[env_idx_m, seg_idx_m] + local_t_within_seg) /
+                                     manip_duration_total[env_idx_m]).clamp(0, 1)
+
+            # Keypoint interpolation
+            num_kp_per_env = num_kp[env_idx_m]  # (num_manip_timesteps,)
+            num_segments_kp = num_kp_per_env.clamp(min=1)
+
+            seg_idx_kp = (global_manip_progress * num_segments_kp).long().clamp(min=0)
+            seg_start_kp = seg_idx_kp.float() / num_segments_kp
+            seg_end_kp = (seg_idx_kp + 1).float() / num_segments_kp
+            local_progress_kp = ((global_manip_progress - seg_start_kp) / (seg_end_kp - seg_start_kp).clamp(min=1e-6)).clamp(0, 1)
+
+            # Gather keypoints with PER-ENV chain index clamping
+            # For env with num_kp keypoints, max chain idx = num_kp (final keypoint)
+            # num_kp=0: max_chain_idx=1 (grasp duplicated at position 1)
+            # num_kp=N: max_chain_idx=N (chain has grasp + N keypoints)
+            max_chain_idx_per_timestep = torch.where(num_kp_per_env == 0, torch.ones_like(num_kp_per_env), num_kp_per_env)
+            from_idx_kp = seg_idx_kp.clamp(max=max_chain_idx_per_timestep)
+            to_idx_kp = (seg_idx_kp + 1).clamp(max=max_chain_idx_per_timestep)
+
+            from_pos_local_m = kp_chain[env_idx_m, from_idx_kp, :3]
+            from_quat_local_m = kp_chain[env_idx_m, from_idx_kp, 3:7]
+            to_pos_local_m = kp_chain[env_idx_m, to_idx_kp, :3]
+            to_quat_local_m = kp_chain[env_idx_m, to_idx_kp, 3:7]
+
+            # Interpolate keypoints
+            interp_pos_local_m = from_pos_local_m + local_progress_kp.unsqueeze(1) * (to_pos_local_m - from_pos_local_m)
+            interp_quat_local_m = self._batched_slerp(from_quat_local_m, to_quat_local_m, local_progress_kp)
+
+            # Gather object trajectory
+            global_env_idx_m = env_ids[env_idx_m]
+            obj_pos_m = self.trajectory[global_env_idx_m, time_idx_m, :3]
+            obj_quat_m = self.trajectory[global_env_idx_m, time_idx_m, 3:7]
+
+            # Apply coupling (split by coupling mode)
+            coupling_m = self.coupling_modes[env_ids[env_idx_m], seg_idx_m]
+
+            # FULL coupling (mode 0)
+            full_mask = coupling_m == 0
+            if full_mask.any():
+                hand_pos_full = quat_apply(obj_quat_m[full_mask], interp_pos_local_m[full_mask]) + obj_pos_m[full_mask]
+                hand_quat_full = quat_mul(obj_quat_m[full_mask], interp_quat_local_m[full_mask])
+                positions_all[env_idx_m[full_mask], time_idx_m[full_mask]] = hand_pos_full
+                orientations_all[env_idx_m[full_mask], time_idx_m[full_mask]] = hand_quat_full
+
+            # POSITION_ONLY coupling (mode 1)
+            pos_only_mask = coupling_m == 1
+            if pos_only_mask.any():
+                hand_pos_posonly = quat_apply(obj_quat_m[pos_only_mask], interp_pos_local_m[pos_only_mask]) + obj_pos_m[pos_only_mask]
+                # Orientation: use previous segment's last orientation
+                hand_quat_posonly = prev_hand_quat_per_seg[env_idx_m[pos_only_mask], seg_idx_m[pos_only_mask]]
+                positions_all[env_idx_m[pos_only_mask], time_idx_m[pos_only_mask]] = hand_pos_posonly
+                orientations_all[env_idx_m[pos_only_mask], time_idx_m[pos_only_mask]] = hand_quat_posonly
+
+        # Step 7: Process DECOUPLED segments (coupling mode 2) - ALL at once
+        is_decouple = (self.coupling_modes[env_ids] == 2).unsqueeze(2).expand(-1, -1, self.total_targets)
+        decouple_mask_3d = seg_masks_3d & is_decouple
+
+        env_idx_d, seg_idx_d, time_idx_d = torch.where(decouple_mask_3d)
+
+        if len(env_idx_d) > 0:
+            # Target: release pose (default - custom poses handled separately if needed)
+            global_env_idx_d = env_ids[env_idx_d]
+            target_pos_d = self.release_pose[global_env_idx_d, :3]
+            target_quat_d = self.release_pose[global_env_idx_d, 3:7]
+
+            # Compute starting pose for interpolation:
+            # Transform grasp keypoint using object pose at END of last manipulation segment
+            # This matches old code: final_grasp_pos_w = quat_apply(obj_quat_at_release, final_rel_pos) + obj_pos_at_release
+
+            # Find the last timestep of the previous segment
+            prev_seg_idx_d = (seg_idx_d - 1).clamp(min=0)
+            prev_seg_end_time = self.segment_boundaries[env_ids[env_idx_d], prev_seg_idx_d + 1]
+            prev_seg_end_idx = (prev_seg_end_time / self.target_dt).long().clamp(0, self.total_targets - 1)
+
+            # Get object pose at that timestep
+            obj_pos_at_release = self.trajectory[global_env_idx_d, prev_seg_end_idx, :3]
+            obj_quat_at_release = self.trajectory[global_env_idx_d, prev_seg_end_idx, 3:7]
+
+            # Get grasp pose in object-local frame (last keypoint in chain)
+            # kp_chain structure: [grasp, kp_0, kp_1, ..., kp_{N-1}]
+            # - If num_kp == 0: final is grasp (from self.grasp_pose)
+            # - If num_kp == N: final is kp_{N-1} (from self.grasp_keypoints[:, N-1])
+            num_kp = self.num_grasp_keypoints[global_env_idx_d]
+            has_keypoints = num_kp > 0
+
+            # For envs WITH keypoints: use last keypoint (index num_kp-1)
+            # For envs WITHOUT keypoints: use grasp pose
+            final_rel_pos = torch.zeros(len(global_env_idx_d), 3, device=self.device)
+            final_rel_quat = torch.zeros(len(global_env_idx_d), 4, device=self.device)
+
+            if has_keypoints.any():
+                kp_idx = (num_kp[has_keypoints] - 1).clamp(min=0)  # Last keypoint index (0-based)
+                final_rel_pos[has_keypoints] = self.grasp_keypoints[global_env_idx_d[has_keypoints], kp_idx, :3]
+                final_rel_quat[has_keypoints] = self.grasp_keypoints[global_env_idx_d[has_keypoints], kp_idx, 3:7]
+
+            if (~has_keypoints).any():
+                final_rel_pos[~has_keypoints] = self.grasp_pose[global_env_idx_d[~has_keypoints], :3]
+                final_rel_quat[~has_keypoints] = self.grasp_pose[global_env_idx_d[~has_keypoints], 3:7]
+
+            # Transform to world frame
+            final_grasp_pos_w = quat_apply(obj_quat_at_release, final_rel_pos) + obj_pos_at_release
+            final_grasp_quat_w = quat_mul(obj_quat_at_release, final_rel_quat)
+
+            # Local progress (linear)
+            # Speed up retreat to complete before buffer ends, leaving room for hold at release
+            # This ensures the last window_size targets are all at release pose
+            window_buffer = self.cfg.trajectory.window_size * self.target_dt
+            segment_duration_d = self.segment_durations[env_ids[env_idx_d], seg_idx_d]
+            effective_duration_d = (segment_duration_d - window_buffer).clamp(min=self.target_dt)
+
+            local_t_d = ((times[time_idx_d] - self.segment_boundaries[env_ids[env_idx_d], seg_idx_d]) /
+                         effective_duration_d).clamp(0, 1)
+
+            # Apply ease-in: slow start, fast end (t^power)
+            release_ease_power = getattr(self.cfg.trajectory, 'release_ease_power', 2.0)
+            eased_t_d = local_t_d ** release_ease_power
+
+            # Interpolate with easing from final_grasp_pos_w to release pose
+            hand_pos_d = final_grasp_pos_w + eased_t_d.unsqueeze(1) * (target_pos_d - final_grasp_pos_w)
+            hand_quat_d = self._batched_slerp(final_grasp_quat_w, target_quat_d, eased_t_d)
+
+            # Scatter write
+            positions_all[env_idx_d, time_idx_d] = hand_pos_d
+            orientations_all[env_idx_d, time_idx_d] = hand_quat_d
+
+        # Step 8: Write to hand_trajectory buffer (vectorized scatter)
+        env_idx_all = env_ids.unsqueeze(1).expand(-1, self.total_targets)  # (n, total_targets)
+        time_idx_all = torch.arange(self.total_targets, device=self.device).unsqueeze(0).expand(n, -1)  # (n, total_targets)
+
+        env_flat = env_idx_all.reshape(-1)
+        time_flat = time_idx_all.reshape(-1)
+
+        self.hand_trajectory[env_flat, time_flat, :3] = positions_all.reshape(-1, 3)
+        self.hand_trajectory[env_flat, time_flat, 3:7] = orientations_all.reshape(-1, 4)
+
+        # Store hand poses at segment boundaries for position_only coupling during replanning
+        # FULLY VECTORIZED: Process all (env, seg_idx) pairs at once - NO LOOP!
+        max_segs_plus_one = self.segment_boundaries.shape[1]  # max_segs + 1
+
+        # Get all boundary times: (n, max_segs+1)
+        boundary_times_all = self.segment_boundaries[env_ids]  # (n, max_segs+1)
+
+        # Convert to timestep indices
+        boundary_indices_all = (boundary_times_all / self.target_dt).long().clamp(min=0, max=self.total_targets - 1)  # (n, max_segs+1)
+
+        # Gather hand poses at all boundary indices using advanced indexing
+        # For each (env, seg_idx), get hand_trajectory[env, boundary_indices_all[env, seg_idx]]
+        env_indices_expanded = env_ids.unsqueeze(1).expand(-1, max_segs_plus_one)  # (n, max_segs+1)
+
+        # Flatten for gather
+        env_flat = env_indices_expanded.reshape(-1)  # (n * (max_segs+1),)
+        time_flat = boundary_indices_all.reshape(-1)  # (n * (max_segs+1),)
+
+        # Gather: (n * (max_segs+1), 7)
+        hand_poses_flat = self.hand_trajectory[env_flat, time_flat]
+
+        # Reshape and store: (n, max_segs+1, 7)
+        self.hand_pose_at_segment_boundary[env_ids] = hand_poses_flat.reshape(n, max_segs_plus_one, 7)
 
     def get_hand_window_targets(self) -> torch.Tensor:
         """Get current window of hand pose targets.
@@ -1483,198 +1985,639 @@ class TrajectoryManager:
         batch_idx = torch.arange(self.num_envs, device=self.device)
         return self.hand_trajectory[batch_idx, self.current_idx]
 
-    def _generate_full_trajectory(self, env_ids: torch.Tensor):
-        """Generate entire trajectory for given environments."""
+    def _compute_segment_poses_vectorized(self, env_ids: torch.Tensor):
+        """VECTORIZED: Compute segment target poses for all specified envs in parallel.
+
+        Directly writes to self.segment_poses[env_ids, :, :] buffer.
+
+        Args:
+            env_ids: (n,) Environment indices to compute poses for
+        """
+        from isaaclab.utils.math import quat_mul, quat_from_angle_axis
+
         n = len(env_ids)
-        cfg = self.cfg
+        max_segs = self.segment_poses.shape[1]
+
+        # Initialize
+        self.segment_poses[env_ids] = 0.0
+
+        # FULLY VECTORIZED with sequential dependency handling via iterative updates
+        # Process segments in order (small loop over ~10 segments, NOT 16k envs!)
+        # This loop is NECESSARY due to chaining (segment i depends on segment i-1)
+        # BUT it's over segments (max ~10), processing ALL 16k envs in parallel per segment!
+
+        for seg_idx in range(max_segs):
+            has_segment = (seg_idx < self.num_segments[env_ids])
+            if not has_segment.any():
+                break
+
+            # Get previous pose (vectorized)
+            prev_poses = self.start_poses[env_ids] if seg_idx == 0 else self.segment_poses[env_ids, seg_idx - 1]
+
+            # HELICAL: Compute ALL helical poses for this segment index (vectorized)
+            is_helical = self.segment_is_helical[env_ids, seg_idx] & has_segment
+            if is_helical.any():
+                hel_envs = env_ids[is_helical]
+                translation = self.segment_helical_translation[hel_envs, seg_idx]
+                axes = self.segment_helical_axis[hel_envs, seg_idx] / torch.norm(self.segment_helical_axis[hel_envs, seg_idx], dim=1, keepdim=True)
+                angles = self.segment_helical_rotation[hel_envs, seg_idx]
+                delta_quats = quat_from_angle_axis(angles, axes)
+                self.segment_poses[hel_envs, seg_idx, :3] = prev_poses[is_helical, :3] + translation
+                self.segment_poses[hel_envs, seg_idx, 3:7] = quat_mul(prev_poses[is_helical, 3:7], delta_quats)
+
+            # WAYPOINT: Compute ALL waypoint poses for this segment index (vectorized)
+            is_waypoint = ~is_helical & has_segment
+            if is_waypoint.any():
+                wp_envs = env_ids[is_waypoint]
+                has_custom = self.segment_has_custom_pose[wp_envs, seg_idx]
+
+                # Custom poses (convert from env-local to world frame)
+                if has_custom.any():
+                    custom_envs = wp_envs[has_custom]
+                    custom_pose_local = self.segment_custom_pose[custom_envs, seg_idx]
+                    # Position: add env_origins
+                    custom_pos_world = custom_pose_local[:, :3] + self.env_origins[custom_envs]
+                    # Orientation: keep as-is (quaternions are orientation, not affected by translation)
+                    custom_quat = custom_pose_local[:, 3:7]
+                    self.segment_poses[custom_envs, seg_idx] = torch.cat([custom_pos_world, custom_quat], dim=1)
+
+                # Computed poses (vectorized with where)
+                needs_compute = ~has_custom
+                if needs_compute.any():
+                    comp_envs = wp_envs[needs_compute]
+                    comp_prev_poses = prev_poses[is_waypoint][needs_compute]
+
+                    # Start with previous pose, then overwrite based on segment type
+                    result_poses = comp_prev_poses.clone()
+
+                    # Grasp → start_poses
+                    is_grasp = self.segment_is_grasp[comp_envs, seg_idx]
+                    result_poses = torch.where(is_grasp.unsqueeze(1), self.start_poses[comp_envs], result_poses)
+
+                    # Goal → goal_poses
+                    is_goal = self.segment_is_goal[comp_envs, seg_idx]
+                    result_poses = torch.where(is_goal.unsqueeze(1), self.goal_poses[comp_envs], result_poses)
+
+                    # Return → start_poses
+                    is_return = self.segment_is_return[comp_envs, seg_idx]
+                    result_poses = torch.where(is_return.unsqueeze(1), self.start_poses[comp_envs], result_poses)
+
+                    self.segment_poses[comp_envs, seg_idx] = result_poses
+
+    def _generate_waypoint_segment_batched(
+        self, start_poses, end_poses, all_times, seg_start_times, durations, env_masks
+    ):
+        """FULLY VECTORIZED: Generate waypoint trajectories for multiple envs in parallel.
+
+        Args:
+            start_poses: (n, 7) start poses for each env
+            end_poses: (n, 7) end poses for each env
+            all_times: (T,) global time array
+            seg_start_times: (n,) segment start time per env
+            durations: (n,) segment duration per env
+            env_masks: (n, T) boolean mask of valid timesteps per env
+
+        Returns:
+            positions: (n, T, 3) positions (invalid timesteps are zeros)
+            orientations: (n, T, 4) orientations (invalid timesteps are zeros)
+        """
+        n = start_poses.shape[0]
+        T = all_times.shape[0]
+
+        # Compute local progress for each env at each timestep
+        raw_t = ((all_times.unsqueeze(0) - seg_start_times.unsqueeze(1)) / durations.unsqueeze(1)).clamp(0, 1)  # (n, T)
+
+        # Apply easing (fully vectorized)
+        easing_power = self.cfg.trajectory.easing_power
+        local_t = torch.where(
+            raw_t < 0.5,
+            ((raw_t * 2.0) ** easing_power) * 0.5,
+            0.5 + (1.0 - ((1.0 - raw_t) * 2.0) ** easing_power) * 0.5
+        )  # (n, T)
+
+        # Interpolate positions (fully vectorized)
+        start_pos = start_poses[:, :3].unsqueeze(1)  # (n, 1, 3)
+        end_pos = end_poses[:, :3].unsqueeze(1)  # (n, 1, 3)
+        positions = start_pos + local_t.unsqueeze(-1) * (end_pos - start_pos)  # (n, T, 3)
+
+        # Interpolate orientations (FULLY VECTORIZED - no loops!)
+        start_quat = start_poses[:, 3:7]  # (n, 4)
+        end_quat = end_poses[:, 3:7]  # (n, 4)
+
+        # Expand to (n, T, 4) for batched SLERP
+        start_quat_expanded = start_quat.unsqueeze(1).expand(n, T, 4)  # (n, T, 4)
+        end_quat_expanded = end_quat.unsqueeze(1).expand(n, T, 4)  # (n, T, 4)
+
+        # Reshape to (n*T, 4) for batched SLERP
+        start_flat = start_quat_expanded.reshape(n * T, 4)
+        end_flat = end_quat_expanded.reshape(n * T, 4)
+        t_flat = local_t.reshape(n * T)
+
+        # Batched SLERP for ALL (n*T) pairs at once
+        orientations_flat = self._batched_slerp(start_flat, end_flat, t_flat)  # (n*T, 4)
+        orientations = orientations_flat.reshape(n, T, 4)  # (n, T, 4)
+
+        # Mask invalid timesteps
+        positions = positions * env_masks.unsqueeze(-1).float()
+        orientations = orientations * env_masks.unsqueeze(-1).float()
+
+        return positions, orientations
+
+    def _generate_helical_segment_batched(
+        self, start_poses, end_poses, all_times, seg_start_times, durations, axes, rotations, translations, env_masks
+    ):
+        """FULLY VECTORIZED: Generate helical trajectories for multiple envs - NO LOOPS.
+
+        Args:
+            start_poses: (n, 7) start poses
+            end_poses: (n, 7) end poses
+            all_times: (T,) global time array
+            seg_start_times: (n,) segment start times
+            durations: (n,) segment durations
+            axes: (n, 3) rotation axes
+            rotations: (n,) total rotations in radians
+            translations: (n, 3) translation vectors
+            env_masks: (n, T) boolean mask
+
+        Returns:
+            positions: (n, T, 3)
+            orientations: (n, T, 4)
+        """
+        from isaaclab.utils.math import quat_mul
+
+        n = start_poses.shape[0]
+        T = all_times.shape[0]
+
+        # Normalize axes
+        axes_norm = axes / torch.norm(axes, dim=1, keepdim=True)  # (n, 3)
+
+        # Compute local progress: (n, T)
+        local_t = ((all_times.unsqueeze(0) - seg_start_times.unsqueeze(1)) / durations.unsqueeze(1).clamp(min=1e-6)).clamp(0, 1)
+
+        # Positions: start + t * translation
+        start_pos = start_poses[:, :3].unsqueeze(1)  # (n, 1, 3)
+        positions = start_pos + local_t.unsqueeze(-1) * translations.unsqueeze(1)  # (n, T, 3)
+
+        # Orientations: incremental rotation around axis
+        start_quat = start_poses[:, 3:7]  # (n, 4)
+        angles = rotations.unsqueeze(1) * local_t  # (n, T)
+
+        # Convert axis-angle to quaternions (batched)
+        half_angles = angles / 2  # (n, T)
+        sin_half = torch.sin(half_angles)  # (n, T)
+        cos_half = torch.cos(half_angles)  # (n, T)
+
+        # delta_quats: (n, T, 4)
+        delta_quats = torch.zeros(n, T, 4, device=self.device)
+        delta_quats[:, :, 0] = cos_half
+        delta_quats[:, :, 1:4] = axes_norm.unsqueeze(1) * sin_half.unsqueeze(-1)  # (n, T, 3)
+
+        # Apply rotation: quat_mul for all (n*T) pairs
+        delta_flat = delta_quats.reshape(n * T, 4)
+        start_flat = start_quat.unsqueeze(1).expand(n, T, 4).reshape(n * T, 4)
+        orientations_flat = quat_mul(delta_flat, start_flat)
+        orientations = orientations_flat.reshape(n, T, 4)
+
+        # Mask invalid timesteps
+        positions = positions * env_masks.unsqueeze(-1).float()
+        orientations = orientations * env_masks.unsqueeze(-1).float()
+
+        return positions, orientations
+
+    def _generate_full_trajectory(self, env_ids: torch.Tensor):
+        """FULLY VECTORIZED: Generate entire trajectory from segments - NO ENV LOOPS.
+
+        Args:
+            env_ids: Environment indices to generate for
+        """
+        n = len(env_ids)
+        max_segs = self.segment_poses.shape[1]
         T = self.total_targets
-        
-        # Time array for all targets
+
+        # Clear buffers for these envs to avoid stale targets if any timestep is not written
+        self.trajectory[env_ids] = 0.0
+        # Default orientation to identity
+        self.trajectory[env_ids, :, 3] = 1.0
+
+        # Compute all segment poses in one vectorized call
+        self._compute_segment_poses_vectorized(env_ids)
+
+        # Time array for timestep indices
         times = torch.arange(T, device=self.device).float() * self.target_dt  # (T,)
-        times = times.unsqueeze(0).expand(n, T)  # (n, T)
+
+        # FULLY VECTORIZED: Process ALL (env × segment) at once - NO SEGMENT LOOP!
+        # Build 3D start/end poses
+        start_poses_3d = torch.zeros(n, max_segs, 7, device=self.device)
+        start_poses_3d[:, 0] = self.start_poses[env_ids]
+        start_poses_3d[:, 1:] = self.segment_poses[env_ids, :-1]
+        end_poses_3d = self.segment_poses[env_ids]
+
+        # Build 3D timing
+        seg_start_times_3d = self.segment_boundaries[env_ids, :-1]
+        seg_end_times_3d = self.segment_boundaries[env_ids, 1:]
+        seg_durations_3d = seg_end_times_3d - seg_start_times_3d
+
+        # Build 3D masks
+        valid_seg_mask = torch.arange(max_segs, device=self.device).unsqueeze(0) < self.num_segments[env_ids].unsqueeze(1)
+        times_3d = times.view(1, 1, -1).expand(n, max_segs, -1)
         
-        # Compute progress (0 to 1) based on phase
-        progress = self._compute_progress(env_ids, times)  # (n, T)
-        
-        # Interpolate positions through start -> waypoints -> goal
-        positions = self._interpolate_positions(env_ids, progress)  # (n, T, 3)
-        
-        # Interpolate orientations
-        orientations = self._interpolate_orientations(env_ids, progress)  # (n, T, 4)
-        
+        # For LAST segment: use <= for end boundary to include exact endpoint
+        # This fixes the boundary condition where t=episode_end would be excluded
+        is_last_seg = torch.arange(max_segs, device=self.device).unsqueeze(0) == (self.num_segments[env_ids].unsqueeze(1) - 1)
+        seg_time_mask_normal = (times_3d >= seg_start_times_3d.unsqueeze(2)) & (times_3d < seg_end_times_3d.unsqueeze(2))
+        seg_time_mask_last = (times_3d >= seg_start_times_3d.unsqueeze(2)) & (times_3d <= seg_end_times_3d.unsqueeze(2))
+        seg_time_mask = torch.where(is_last_seg.unsqueeze(2), seg_time_mask_last, seg_time_mask_normal)
+        seg_mask_3d = seg_time_mask & valid_seg_mask.unsqueeze(2)
+
+        # Separate waypoint/helical
+        waypoint_mask_3d = seg_mask_3d & ~self.segment_is_helical[env_ids].unsqueeze(2)
+        helical_mask_3d = seg_mask_3d & self.segment_is_helical[env_ids].unsqueeze(2)
+
+        # Generate ALL waypoint segments at once
+        env_idx_wp, seg_idx_wp, time_idx_wp = torch.where(waypoint_mask_3d)
+        if len(env_idx_wp) > 0:
+            global_env_idx_wp = env_ids[env_idx_wp]
+            local_t = ((times[time_idx_wp] - seg_start_times_3d[env_idx_wp, seg_idx_wp]) /
+                       seg_durations_3d[env_idx_wp, seg_idx_wp].clamp(min=1e-6)).clamp(0, 1)
+            easing_power = self.cfg.trajectory.easing_power
+            eased_t = torch.where(local_t < 0.5,
+                                  0.5 * torch.pow(2 * local_t, easing_power),
+                                  1.0 - 0.5 * torch.pow(2 * (1 - local_t), easing_power))
+            pos = (start_poses_3d[env_idx_wp, seg_idx_wp, :3] +
+                   eased_t.unsqueeze(1) * (end_poses_3d[env_idx_wp, seg_idx_wp, :3] - start_poses_3d[env_idx_wp, seg_idx_wp, :3]))
+            quat = self._batched_slerp(start_poses_3d[env_idx_wp, seg_idx_wp, 3:7],
+                                       end_poses_3d[env_idx_wp, seg_idx_wp, 3:7], eased_t)
+
+            # Scatter write using advanced indexing
+            self.trajectory[global_env_idx_wp, time_idx_wp, :3] = pos
+            self.trajectory[global_env_idx_wp, time_idx_wp, 3:7] = quat
+
+        # Generate ALL helical segments at once
+        env_idx_hel, seg_idx_hel, time_idx_hel = torch.where(helical_mask_3d)
+        if len(env_idx_hel) > 0:
+            global_env_idx_hel = env_ids[env_idx_hel]
+            axes = self.segment_helical_axis[global_env_idx_hel, seg_idx_hel]
+            axes = axes / torch.norm(axes, dim=1, keepdim=True).clamp(min=1e-8)
+            local_t = ((times[time_idx_hel] - seg_start_times_3d[env_idx_hel, seg_idx_hel]) /
+                       seg_durations_3d[env_idx_hel, seg_idx_hel].clamp(min=1e-6)).clamp(0, 1)
+            pos = start_poses_3d[env_idx_hel, seg_idx_hel, :3] + local_t.unsqueeze(1) * self.segment_helical_translation[global_env_idx_hel, seg_idx_hel]
+            angles = self.segment_helical_rotation[global_env_idx_hel, seg_idx_hel] * local_t
+            delta_quats = torch.zeros(len(env_idx_hel), 4, device=self.device)
+            delta_quats[:, 0] = torch.cos(angles / 2)
+            delta_quats[:, 1:4] = axes * torch.sin(angles / 2).unsqueeze(1)
+            quat = quat_mul(delta_quats, start_poses_3d[env_idx_hel, seg_idx_hel, 3:7])
+
+            # Scatter write using advanced indexing
+            self.trajectory[global_env_idx_hel, time_idx_hel, :3] = pos
+            self.trajectory[global_env_idx_hel, time_idx_hel, 3:7] = quat
+
         # Apply penetration check (clamp z so point cloud stays above table)
+        # Keep as a post-pass since we generated via sparse scatter writes.
+        positions = self.trajectory[env_ids, :, :3]
+        orientations = self.trajectory[env_ids, :, 3:7]
         positions = self._apply_penetration_check(positions, orientations, env_ids)
-        
-        # Store trajectory
         self.trajectory[env_ids, :, :3] = positions
-        self.trajectory[env_ids, :, 3:7] = orientations
 
     def _replan_manipulation_phase(self, env_ids: torch.Tensor):
         """Replan manipulation portion of trajectory to current segment target.
-        
+
         Segment-aware replanning: determines which segment we're in based on
-        manipulation progress and replans to that segment's target:
-        - Segment 0: heading to waypoint_0
-        - Segment 1: heading to waypoint_1 (or goal if only 1 waypoint)
-        - ...
-        - Segment N: heading to goal
-        
+        current phase_time vs segment boundaries, then replans to that segment's target.
+
         This method:
         - Only updates trajectory indices from current_idx to segment end
         - Does not reset phase_time or current_idx (episode continues normally)
         - Uses rolling_window as planning horizon
         - Enforces minimum speed to prevent infinite slowdown near target
-        
+
         Args:
             env_ids: Environment indices to replan.
         """
         n = len(env_ids)
         if n == 0:
             return
-        
+
         # Get current object positions
         current_pos = self.current_object_poses[env_ids, :3]  # (n, 3)
         current_quat = self.current_object_poses[env_ids, 3:7]  # (n, 4)
-        
-        # Compute manipulation progress (0 to 1)
-        grasp_end = self.cfg.trajectory.phases.grasp
-        manip_duration = self.t_manip_end[env_ids] - grasp_end  # (n,)
-        manip_time = self.phase_time[env_ids] - grasp_end  # (n,)
-        progress = (manip_time / manip_duration.clamp(min=1e-6)).clamp(0.0, 1.0)  # (n,)
-        
-        # Determine segment index based on progress
-        # With N waypoints, there are N+1 segments
-        num_wp = self.num_waypoints[env_ids].float()  # (n,)
-        num_segments = num_wp + 1  # (n,)
-        segment_idx = (progress * num_segments).long()
-        segment_idx = segment_idx.clamp(max=(num_segments - 1).long())  # Clamp to last segment
-        
+
         # Get per-env manipulation end index
         manip_end_idx = (self.t_manip_end[env_ids] / self.target_dt).long()  # (n,)
         current_idx = self.current_idx[env_ids]  # (n,)
-        
+
         # Planning horizon from config
         rolling_window_targets = int(self.cfg.push_t.rolling_window / self.target_dt)
-        
-        for i, env_id in enumerate(env_ids):
-            env_id_item = env_id.item()
-            start_idx = current_idx[i].item()
-            end_idx = manip_end_idx[i].item()
-            seg = segment_idx[i].item()
-            n_wp = int(num_wp[i].item())
-            
-            # Get target for this segment (waypoint or goal)
-            if seg < n_wp:
-                # Heading to waypoint[seg]
-                target_pos = self.waypoints[env_id_item, seg, :3].unsqueeze(0)  # (1, 3)
-                target_quat = self.waypoints[env_id_item, seg, 3:7].unsqueeze(0)  # (1, 4)
-            else:
-                # Heading to goal
-                target_pos = self.goal_poses[env_id_item, :3].unsqueeze(0)  # (1, 3)
-                target_quat = self.goal_poses[env_id_item, 3:7].unsqueeze(0)  # (1, 4)
-            
-            # Current position for this env
-            pos = current_pos[i:i+1]  # (1, 3)
-            quat = current_quat[i:i+1]  # (1, 4)
-            
-            # Remaining targets in manipulation phase
-            num_remaining = max(1, end_idx - start_idx)
-            
-            # Use rolling_window as planning horizon, but not exceeding remaining time
-            horizon = min(rolling_window_targets, num_remaining)
-            
-            # Calculate distance to segment target for speed adjustment
-            distance_to_target = torch.norm(target_pos - pos).item()
-            
-            # Enforce minimum speed
-            remaining_time = num_remaining * self.target_dt
-            min_speed = self.cfg.push_t.min_speed
-            natural_speed = distance_to_target / remaining_time if remaining_time > 0 else float('inf')
-            
-            if natural_speed < min_speed and distance_to_target > 1e-4:
-                # Object is close to target but has time left - move at min_speed
-                actual_duration = distance_to_target / min_speed
-                actual_targets = min(int(actual_duration / self.target_dt) + 1, horizon)
-            else:
-                # Normal case: spread movement over horizon
-                actual_targets = horizon
-            
-            # Generate trajectory from current to segment target
-            if actual_targets > 0:
-                interp_progress = torch.linspace(0, 1, actual_targets, device=self.device)
-                
-                # Interpolate positions
-                positions = pos + interp_progress.unsqueeze(-1) * (target_pos - pos)  # (actual_targets, 3)
-                
-                # Interpolate orientations
-                orientations = self._batched_slerp(
-                    quat.expand(actual_targets, 4),
-                    target_quat.expand(actual_targets, 4),
-                    interp_progress
-                )  # (actual_targets, 4)
-                
-                # Write to trajectory buffer starting from current_idx
-                write_end = min(start_idx + actual_targets, self.total_targets)
-                write_len = write_end - start_idx
-                self.trajectory[env_id_item, start_idx:write_end, :3] = positions[:write_len]
-                self.trajectory[env_id_item, start_idx:write_end, 3:7] = orientations[:write_len]
-            
-            # Fill remaining manipulation indices with segment target pose
-            if start_idx + actual_targets < end_idx:
-                fill_start = start_idx + actual_targets
-                fill_end = min(end_idx, self.total_targets)
-                self.trajectory[env_id_item, fill_start:fill_end, :3] = target_pos
-                self.trajectory[env_id_item, fill_start:fill_end, 3:7] = target_quat
+
+        # FULLY VECTORIZED: Process all envs in parallel - NO LOOP!
+
+        # 1. Find current segment index for all envs using vectorized searchsorted - NO LOOP!
+        current_times = self.phase_time[env_ids]  # (n,)
+        num_segs = self.num_segments[env_ids]  # (n,)
+
+        # Vectorized segment finding: compare current_time against all boundaries at once
+        # segment_boundaries[env, :] = [0, t1, t2, ..., t_num_segs, 0, 0, ...]
+        max_segs_plus_one = self.segment_boundaries.shape[1]
+        boundaries = self.segment_boundaries[env_ids]  # (n, max_segs+1)
+
+        # Find which segment: boundaries[seg] <= current_time < boundaries[seg+1]
+        # Create mask for all segments: (n, max_segs+1)
+        current_times_expanded = current_times.unsqueeze(1)  # (n, 1)
+
+        # Check if current_time >= boundary[i] for all i
+        after_start = current_times_expanded >= boundaries  # (n, max_segs+1)
+
+        # Find the LAST True value (rightmost segment start that we've passed)
+        # Multiply by segment indices and take max
+        seg_indices = torch.arange(max_segs_plus_one, device=self.device).unsqueeze(0).expand(n, -1)  # (n, max_segs+1)
+        # Set invalid segments to -1 so they don't interfere with max
+        seg_indices_masked = torch.where(after_start, seg_indices, -1)
+        current_seg_idx = seg_indices_masked.max(dim=1).values  # (n,)
+
+        # Clamp to valid range [0, num_segs-1]
+        current_seg_idx = torch.clamp(current_seg_idx, min=0, max=num_segs.max() - 1)
+        # Per-env clamping to account for different num_segments
+        current_seg_idx = torch.minimum(current_seg_idx, num_segs - 1)
+
+        # 2. Gather target poses, segment types, and start poses (batched advanced indexing)
+        batch_range = torch.arange(n, device=self.device)
+        target_pos = self.segment_poses[env_ids, current_seg_idx, :3]  # (n, 3)
+        target_quat = self.segment_poses[env_ids, current_seg_idx, 3:7]  # (n, 4)
+        is_helical = self.segment_is_helical[env_ids, current_seg_idx]  # (n,)
+
+        # Get segment start poses (for helical rotation calculation)
+        # If seg_idx == 0: use start_poses, else use previous segment's end pose
+        is_first_seg = (current_seg_idx == 0)
+        seg_start_poses = torch.zeros(n, 7, device=self.device)
+        if is_first_seg.any():
+            seg_start_poses[is_first_seg] = self.start_poses[env_ids[is_first_seg]]
+        if (~is_first_seg).any():
+            prev_seg_idx = (current_seg_idx[~is_first_seg] - 1).clamp(min=0)
+            seg_start_poses[~is_first_seg] = self.segment_poses[env_ids[~is_first_seg], prev_seg_idx]
+
+        # 3. Compute remaining targets and horizons (vectorized)
+        num_remaining = torch.clamp(manip_end_idx - current_idx, min=1)  # (n,)
+        horizon = torch.minimum(
+            torch.full_like(num_remaining, rolling_window_targets),
+            num_remaining
+        )  # (n,)
+
+        # 4. Calculate distances and speeds (vectorized)
+        distance_to_target = torch.norm(target_pos - current_pos, dim=1)  # (n,)
+        remaining_time = num_remaining.float() * self.target_dt  # (n,)
+        min_speed = self.cfg.push_t.min_speed
+
+        # Avoid division by zero
+        safe_remaining_time = torch.where(remaining_time > 0, remaining_time, torch.ones_like(remaining_time))
+        natural_speed = distance_to_target / safe_remaining_time  # (n,)
+
+        # Determine actual_targets based on speed constraint
+        # HELICAL segments: ignore min_speed, always use horizon (maintain coupled motion)
+        # WAYPOINT segments: apply min_speed constraint for catch-up
+        slow_mask = (natural_speed < min_speed) & (distance_to_target > 1e-4) & ~is_helical  # (n,)
+        actual_duration = distance_to_target / min_speed  # (n,)
+        speed_based_targets = torch.clamp((actual_duration / self.target_dt).long() + 1, min=1, max=horizon.max())  # (n,)
+
+        actual_targets = torch.where(slow_mask, speed_based_targets, horizon)  # (n,)
+
+        # 5. Generate trajectories with variable lengths (padded batching)
+        max_targets = actual_targets.max().item()
+
+        if max_targets > 0:
+            # Create progress array for all envs (padded to max_targets)
+            t_steps = torch.linspace(0, 1, max_targets, device=self.device)  # (max_targets,)
+            valid_mask = torch.arange(max_targets, device=self.device).unsqueeze(0) < actual_targets.unsqueeze(1)  # (n, max_targets)
+
+            # Expand start/end poses
+            start_pos_expanded = current_pos.unsqueeze(1).expand(n, max_targets, 3)  # (n, max_targets, 3)
+            target_pos_expanded = target_pos.unsqueeze(1).expand(n, max_targets, 3)  # (n, max_targets, 3)
+            start_quat_expanded = current_quat.unsqueeze(1).expand(n, max_targets, 4)  # (n, max_targets, 4)
+            target_quat_expanded = target_quat.unsqueeze(1).expand(n, max_targets, 4)  # (n, max_targets, 4)
+
+            # Position and orientation: split by segment type
+            positions = torch.zeros(n, max_targets, 3, device=self.device)
+            orientations = torch.zeros(n, max_targets, 4, device=self.device)
+
+            # WAYPOINT segments: linear interpolation from current to target
+            waypoint_mask = ~is_helical
+            if waypoint_mask.any():
+                positions[waypoint_mask] = (start_pos_expanded[waypoint_mask] +
+                                           t_steps.unsqueeze(0).unsqueeze(-1) *
+                                           (target_pos_expanded[waypoint_mask] - start_pos_expanded[waypoint_mask]))
+
+            # Waypoint segments: SLERP from current to target
+            waypoint_mask = ~is_helical
+            if waypoint_mask.any():
+                wp_count = waypoint_mask.sum().item()
+                wp_indices = torch.where(waypoint_mask)[0]
+                start_flat = start_quat_expanded[wp_indices].reshape(wp_count * max_targets, 4)
+                target_flat = target_quat_expanded[wp_indices].reshape(wp_count * max_targets, 4)
+                t_flat = t_steps.unsqueeze(0).expand(wp_count, max_targets).reshape(wp_count * max_targets)
+                orientations_flat = self._batched_slerp(start_flat, target_flat, t_flat)
+                orientations[wp_indices] = orientations_flat.reshape(wp_count, max_targets, 4)
+
+            # Helical segments: position to target, rotation with alignment correction + helical component
+            # During replanning: interpolate position AND non-helical rotation to target, maintain min helical rotation
+            if is_helical.any():
+                hel_indices = torch.where(is_helical)[0]
+                n_hel = len(hel_indices)
+
+                # Get helical parameters
+                axes = self.segment_helical_axis[env_ids[hel_indices], current_seg_idx[hel_indices]]  # (n_hel, 3)
+                axes = axes / torch.norm(axes, dim=1, keepdim=True).clamp(min=1e-8)  # Normalize
+
+                # Current state and targets
+                current_pos_hel = current_pos[hel_indices]  # (n_hel, 3)
+                current_quat_hel = current_quat[hel_indices]  # (n_hel, 4)
+                target_pos_hel = target_pos[hel_indices]  # (n_hel, 3)
+                target_quat_hel = target_quat[hel_indices]  # (n_hel, 4)
+
+                # Minimum angular velocity
+                min_angular_vel = self.cfg.push_t.min_angular_velocity
+
+                # Generate trajectory for planning window
+                for t_idx in range(max_targets):
+                    # Time step and progress
+                    dt = t_idx * self.target_dt  # (scalar)
+                    progress = t_steps[t_idx]  # (scalar) [0, 1]
+
+                    # Position: linear interpolation from current to ACTUAL target
+                    positions[hel_indices, t_idx] = current_pos_hel + progress * (target_pos_hel - current_pos_hel)
+
+                    # Rotation: SLERP to target (fixes all axes) + extra helical rotation
+                    # Step 1: SLERP from current to target orientation (fixes misalignment in all axes)
+                    base_quat = self._batched_slerp(current_quat_hel, target_quat_hel, progress)
+
+                    # Step 2: Add additional rotation around helical axis at min angular velocity
+                    angle_delta = torch.full((n_hel,), min_angular_vel * dt, device=self.device)  # (n_hel,)
+
+                    # Convert to quaternion
+                    delta_quats = torch.zeros(n_hel, 4, device=self.device)
+                    delta_quats[:, 0] = torch.cos(angle_delta / 2)
+                    delta_quats[:, 1:4] = axes * torch.sin(angle_delta / 2).unsqueeze(1)
+
+                    # Apply extra helical rotation: final_quat = delta_quat * base_quat
+                    orientations[hel_indices, t_idx] = quat_mul(delta_quats, base_quat)
+
+            # 6. Scatter write to trajectory (only valid timesteps)
+            write_indices = current_idx.unsqueeze(1) + torch.arange(max_targets, device=self.device).unsqueeze(0)  # (n, max_targets)
+            write_indices = torch.clamp(write_indices, max=self.total_targets - 1)
+            write_mask = valid_mask & (write_indices < self.total_targets)  # (n, max_targets)
+
+            env_idx_flat = env_ids.unsqueeze(1).expand(n, max_targets)[write_mask]
+            time_idx_flat = write_indices[write_mask]
+            pos_flat = positions[write_mask]
+            quat_flat = orientations[write_mask]
+
+            self.trajectory[env_idx_flat, time_idx_flat, :3] = pos_flat
+            self.trajectory[env_idx_flat, time_idx_flat, 3:7] = quat_flat
+
+        # 7. Fill remaining manipulation indices with segment target pose (vectorized)
+        fill_start = current_idx + actual_targets  # (n,)
+        fill_end = torch.clamp(manip_end_idx, max=self.total_targets)  # (n,)
+        needs_fill = fill_start < fill_end  # (n,)
+
+        if needs_fill.any():
+            fill_envs = env_ids[needs_fill]
+            fill_starts = fill_start[needs_fill]
+            fill_ends = fill_end[needs_fill]
+            fill_target_pos = target_pos[needs_fill]
+            fill_target_quat = target_quat[needs_fill]
+
+            max_fill_len = (fill_ends - fill_starts).max().item()
+            fill_range = torch.arange(max_fill_len, device=self.device).unsqueeze(0)  # (1, max_fill_len)
+            fill_mask = fill_range < (fill_ends - fill_starts).unsqueeze(1)  # (num_fill, max_fill_len)
+
+            fill_time_idx = fill_starts.unsqueeze(1) + fill_range  # (num_fill, max_fill_len)
+            fill_env_idx = fill_envs.unsqueeze(1).expand(-1, max_fill_len)  # (num_fill, max_fill_len)
+
+            fill_env_flat = fill_env_idx[fill_mask]
+            fill_time_flat = fill_time_idx[fill_mask]
+            fill_pos_flat = fill_target_pos.unsqueeze(1).expand(-1, max_fill_len, 3)[fill_mask]
+            fill_quat_flat = fill_target_quat.unsqueeze(1).expand(-1, max_fill_len, 4)[fill_mask]
+
+            self.trajectory[fill_env_flat, fill_time_flat, :3] = fill_pos_flat
+            self.trajectory[fill_env_flat, fill_time_flat, 3:7] = fill_quat_flat
 
     def _update_hand_trajectory_manipulation(self, env_ids: torch.Tensor):
-        """Update hand trajectory for remaining manipulation phase after object replan.
-        
-        Hand maintains grasp_pose (fixed relative pose) to the object.
-        Transforms grasp_pose to world frame using updated object trajectory.
-        
+        """Update hand trajectory after object replanning.
+
+        Respects coupling modes:
+        - full (0): Hand position and orientation follow object
+        - position_only (1): Hand position follows, orientation frozen at segment start
+        - none (2): Should not be called during manipulation phase
+
         Args:
             env_ids: Environment indices to update.
         """
         from isaaclab.utils.math import quat_mul, quat_apply
-        
+
         n = len(env_ids)
         if n == 0:
             return
-        
-        # Get per-env manipulation phase bounds
-        grasp_end_idx = int(self.cfg.trajectory.phases.grasp / self.target_dt)
+
+        # Get per-env manipulation end index (do NOT overwrite release phase)
         manip_end_idx = (self.t_manip_end[env_ids] / self.target_dt).long()  # (n,)
         current_idx = self.current_idx[env_ids]  # (n,)
-        
+
         # Get grasp pose relative to object (stored at reset)
         grasp_pos_rel = self.grasp_pose[env_ids, :3]  # (n, 3)
         grasp_quat_rel = self.grasp_pose[env_ids, 3:7]  # (n, 4)
-        
-        # Update hand trajectory for each env from current_idx to manip_end
-        for i, env_id in enumerate(env_ids):
-            env_id = env_id.item()
-            start_idx = max(current_idx[i].item(), grasp_end_idx)
-            end_idx = min(manip_end_idx[i].item(), self.total_targets)
-            
-            if start_idx >= end_idx:
-                continue
-            
-            num_targets = end_idx - start_idx
-            
-            # Get updated object trajectory for this range
-            obj_pos = self.trajectory[env_id, start_idx:end_idx, :3]  # (num_targets, 3)
-            obj_quat = self.trajectory[env_id, start_idx:end_idx, 3:7]  # (num_targets, 4)
-            
-            # Transform grasp pose to world frame: hand_pos_w = obj_pos + R_obj * grasp_pos_rel
-            grasp_pos_local = grasp_pos_rel[i:i+1].expand(num_targets, 3)  # (num_targets, 3)
-            grasp_quat_local = grasp_quat_rel[i:i+1].expand(num_targets, 4)  # (num_targets, 4)
-            
-            hand_pos_w = quat_apply(obj_quat, grasp_pos_local) + obj_pos  # (num_targets, 3)
-            hand_quat_w = quat_mul(obj_quat, grasp_quat_local)  # (num_targets, 4)
-            
-            # Update hand trajectory
-            self.hand_trajectory[env_id, start_idx:end_idx, :3] = hand_pos_w
-            self.hand_trajectory[env_id, start_idx:end_idx, 3:7] = hand_quat_w
+
+        # FULLY VECTORIZED: Update all envs at once - NO LOOP!
+        # Clamp manipulation end indices to trajectory bounds
+        manip_end_idx = torch.clamp(manip_end_idx, max=self.total_targets)
+
+        # Find max length needed for batching
+        max_len = (manip_end_idx - current_idx).max().item()
+
+        if max_len <= 0:
+            return
+
+        # Build batch indices: range_mask determines valid timesteps for each env
+        range_mask = torch.arange(max_len, device=self.device).unsqueeze(0) < (manip_end_idx - current_idx).unsqueeze(1)  # (n, max_len)
+        time_indices = current_idx.unsqueeze(1) + torch.arange(max_len, device=self.device).unsqueeze(0)  # (n, max_len)
+        time_indices = torch.clamp(time_indices, max=self.total_targets - 1)  # Prevent out-of-bounds
+
+        # Gather object trajectories (batched)
+        env_range = env_ids.unsqueeze(1).expand(n, max_len)  # (n, max_len)
+        obj_pos = self.trajectory[env_range, time_indices, :3]  # (n, max_len, 3)
+        obj_quat = self.trajectory[env_range, time_indices, 3:7]  # (n, max_len, 4)
+
+        # Expand grasp poses to match all timesteps
+        grasp_pos_expanded = grasp_pos_rel.unsqueeze(1).expand(n, max_len, 3)  # (n, max_len, 3)
+        grasp_quat_expanded = grasp_quat_rel.unsqueeze(1).expand(n, max_len, 4)  # (n, max_len, 4)
+
+        # Batched transforms: flatten, transform, reshape
+        obj_pos_flat = obj_pos.reshape(n * max_len, 3)
+        obj_quat_flat = obj_quat.reshape(n * max_len, 4)
+        grasp_pos_flat = grasp_pos_expanded.reshape(n * max_len, 3)
+        grasp_quat_flat = grasp_quat_expanded.reshape(n * max_len, 4)
+
+        # Position ALWAYS follows object (for both full and position_only coupling)
+        hand_pos_flat = quat_apply(obj_quat_flat, grasp_pos_flat) + obj_pos_flat  # (n*max_len, 3)
+        hand_pos = hand_pos_flat.reshape(n, max_len, 3)
+
+        # Orientation depends on coupling mode
+        # Need to determine which segment each timestep belongs to
+        times = time_indices.float() * self.target_dt  # (n, max_len)
+
+        # Find current segment index for each timestep
+        # For each (env, timestep), find which segment it's in
+        max_segs = self.segment_boundaries.shape[1] - 1
+        boundaries = self.segment_boundaries[env_ids]  # (n, max_segs+1)
+
+        # Expand for comparison: (n, max_len, max_segs+1)
+        times_expanded = times.unsqueeze(2)  # (n, max_len, 1)
+        boundaries_expanded = boundaries.unsqueeze(1)  # (n, 1, max_segs+1)
+
+        # Find which boundary each time has passed
+        after_start = times_expanded >= boundaries_expanded  # (n, max_len, max_segs+1)
+
+        # Find rightmost True (last boundary passed)
+        seg_indices_range = torch.arange(max_segs + 1, device=self.device).view(1, 1, -1)  # (1, 1, max_segs+1)
+        seg_indices_masked = torch.where(after_start, seg_indices_range, -1)
+        current_seg_per_timestep = seg_indices_masked.max(dim=2).values  # (n, max_len)
+        current_seg_per_timestep = torch.clamp(current_seg_per_timestep, min=0, max=max_segs-1)
+
+        # Clamp to valid range per env
+        num_segs_expanded = self.num_segments[env_ids].unsqueeze(1).expand(n, max_len)  # (n, max_len)
+        current_seg_per_timestep = torch.minimum(current_seg_per_timestep, num_segs_expanded - 1)
+
+        # Get coupling mode for each timestep
+        env_idx_flat = env_range.reshape(-1)  # (n*max_len,)
+        seg_idx_flat = current_seg_per_timestep.reshape(-1)  # (n*max_len,)
+        coupling_modes_flat = self.coupling_modes[env_idx_flat, seg_idx_flat]  # (n*max_len,)
+
+        # Apply coupling modes
+        hand_quat = torch.zeros(n, max_len, 4, device=self.device)
+
+        # FULL coupling (mode 0): orientation follows object
+        full_mask = (coupling_modes_flat == 0)
+        if full_mask.any():
+            hand_quat_full = quat_mul(obj_quat_flat[full_mask], grasp_quat_flat[full_mask])
+            hand_quat.reshape(n * max_len, 4)[full_mask] = hand_quat_full
+
+        # POSITION_ONLY coupling (mode 1): orientation frozen at segment start
+        # Use pre-computed hand_pose_at_segment_boundary buffer
+        pos_only_mask = (coupling_modes_flat == 1)
+        if pos_only_mask.any():
+            pos_only_env_idx = env_idx_flat[pos_only_mask]
+            pos_only_seg_idx = seg_idx_flat[pos_only_mask]
+
+            # Get hand orientation at segment start (stored during initial trajectory generation)
+            # hand_pose_at_segment_boundary[env, K] = hand pose at time when segment K starts
+            frozen_quat = self.hand_pose_at_segment_boundary[pos_only_env_idx, pos_only_seg_idx, 3:7]  # (num_pos_only, 4)
+
+            hand_quat.reshape(n * max_len, 4)[pos_only_mask] = frozen_quat
+
+        # Scatter write using mask (only write valid timesteps)
+        valid_env_idx = env_range[range_mask]  # (num_valid,)
+        valid_time_idx = time_indices[range_mask]  # (num_valid,)
+        valid_hand_pos = hand_pos[range_mask]  # (num_valid, 3)
+        valid_hand_quat = hand_quat[range_mask]  # (num_valid, 4)
+
+        self.hand_trajectory[valid_env_idx, valid_time_idx, :3] = valid_hand_pos
+        self.hand_trajectory[valid_env_idx, valid_time_idx, 3:7] = valid_hand_quat
 
     def _slerp(self, q1: torch.Tensor, q2: torch.Tensor, t: float) -> torch.Tensor:
         """Spherical linear interpolation between two quaternions."""
@@ -1699,223 +2642,6 @@ class TrajectoryManager:
         w2 = torch.sin(t * theta) / sin_theta
         
         return w1 * q1 + w2 * q2
-
-    def _compute_progress(self, env_ids: torch.Tensor, times: torch.Tensor) -> torch.Tensor:
-        """
-        Compute progress (0 to 1) with phase-based easing and waypoint pauses.
-        
-        For push-T mode: Always in manipulate phase (no grasp/release).
-        For normal mode:
-        - grasp: stationary at start (progress = 0) - object waits while hand approaches
-        - manipulate: move segments with pauses at waypoints
-        - hand_release: stationary at goal (progress = 1) - object stays while hand retreats
-        
-        Waypoint pauses: Object pauses briefly at each waypoint before continuing.
-        
-        Uses per-env waypoint count for timing, so envs with fewer waypoints
-        reach goal faster.
-        
-        Args:
-            env_ids: Environment indices (n,)
-            times: Time array (n, T)
-        """
-        cfg = self.cfg.trajectory
-        wp_cfg = self.cfg.waypoints
-        n, T = times.shape
-        
-        # Per-env waypoint count and skip flag
-        num_wp = self.num_waypoints[env_ids].float()  # (n,)
-        skip_mask = self.skip_manipulation[env_ids]   # (n,)
-        
-        # Duration components
-        base_move_duration = cfg.phases.manipulate_base
-        movement_duration = wp_cfg.movement_duration
-        pause_duration = wp_cfg.pause_duration
-        waypoint_duration = movement_duration + pause_duration  # Per-waypoint time
-        
-        # Per-env manipulation duration
-        # Skip envs: 0 manipulation (grasp → release directly)
-        # Normal envs: base + per-waypoint time
-        manip_duration = torch.where(
-            skip_mask,
-            torch.zeros(n, device=self.device),
-            base_move_duration + waypoint_duration * num_wp
-        )  # (n,)
-        
-        # Per-env total movement time (excluding pauses)
-        # For skip envs, this is 0
-        total_move_duration = torch.where(
-            skip_mask,
-            torch.zeros(n, device=self.device),
-            base_move_duration + movement_duration * num_wp
-        )  # (n,)
-        
-        # All modes use phases (push_t included - grasp/manipulation/release)
-        t1 = cfg.phases.grasp  # End of grasp phase (same for all)
-        t2 = t1 + manip_duration  # Per-env end of manipulate phase (n,)
-        
-        progress = torch.zeros_like(times)
-        
-        # Grasp phase: progress = 0 (object stationary while hand approaches)
-        # Already zeros
-        
-        # Per-env manipulation phase with waypoint pauses
-        # Expand t2 to (n, T) for comparison
-        t2_expanded = t2.unsqueeze(1).expand(n, T)
-        mask = (times >= t1) & (times < t2_expanded)
-        
-        if mask.any():
-            # For each (env, time) in mask, compute progress
-            # We need to handle this per-env since durations differ
-            
-            manip_t = times - t1  # Time within manipulation phase (n, T)
-            
-            # Per-env number of segments: num_wp + 1
-            num_seg = (num_wp + 1).unsqueeze(1)  # (n, 1)
-            
-            # Per-env move time per segment
-            safe_total_move = total_move_duration.clamp(min=1e-6)  # Avoid div by zero
-            move_per_seg = (safe_total_move / num_seg.squeeze(1)).unsqueeze(1)  # (n, 1)
-            
-            # Per-env block duration (move + pause)
-            block_duration = move_per_seg + pause_duration  # (n, 1)
-            
-            # Which block are we in?
-            max_seg = (num_seg - 1).long()  # (n, 1)
-            seg_idx = (manip_t / block_duration).long()  # (n, T)
-            seg_idx = torch.clamp(seg_idx, min=torch.zeros_like(max_seg), max=max_seg)  # (n, T)
-            block_t = manip_t - seg_idx.float() * block_duration  # (n, T)
-            
-            # Are we moving or pausing?
-            in_move = block_t < move_per_seg
-            
-            # Progress during move: interpolate within segment
-            move_progress = (seg_idx.float() + block_t / move_per_seg) / num_seg
-            # Progress during pause: hold at segment end
-            pause_progress = (seg_idx.float() + 1.0) / num_seg
-            
-            raw_progress = torch.where(in_move, move_progress, pause_progress).clamp(0.0, 1.0)
-            
-            # Apply symmetric easing
-            eased = torch.where(
-                raw_progress < 0.5,
-                ((raw_progress * 2.0) ** cfg.easing_power) * 0.5,
-                0.5 + (1.0 - ((1.0 - raw_progress) * 2.0) ** cfg.easing_power) * 0.5
-            )
-            
-            # Only apply to masked positions
-            progress = torch.where(mask, eased, progress)
-        
-        # Release phase: progress = 1 (object stationary at goal)
-        mask_release = times >= t2_expanded
-        progress[mask_release] = 1.0
-        
-        return progress.clamp(0.0, 1.0)
-
-    def _interpolate_positions(self, env_ids: torch.Tensor, progress: torch.Tensor) -> torch.Tensor:
-        """
-        Interpolate positions using Catmull-Rom spline through control points.
-        
-        Unlike Bezier, Catmull-Rom splines PASS THROUGH all control points.
-        Control points: start -> waypoints -> goal
-        """
-        n, T = progress.shape
-        cfg = self.cfg
-        max_wp = cfg.waypoints.count[1]
-        
-        start = self.start_poses[env_ids, :3]  # (n, 3)
-        goal = self.goal_poses[env_ids, :3]    # (n, 3)
-        waypoints = self.waypoints[env_ids, :, :3]  # (n, max_wp, 3)
-        num_wp = self.num_waypoints[env_ids]   # (n,)
-        
-        # Build control points: (n, max_wp+2, 3)
-        control = torch.zeros(n, max_wp + 2, 3, device=self.device)
-        control[:, 0] = start
-        control[:, 1:1+max_wp] = waypoints
-        control[:, -1] = goal
-        
-        # For unused waypoints, interpolate between start and goal (vectorized)
-        if max_wp > 0:
-            t_vals = torch.arange(1, max_wp + 1, device=self.device).float() / (max_wp + 1)  # (max_wp,)
-            slot_indices = torch.arange(max_wp, device=self.device)  # (max_wp,)
-            unused_mask = num_wp.unsqueeze(1) <= slot_indices.unsqueeze(0)  # (n, max_wp)
-            
-            t_exp = t_vals.view(1, max_wp, 1)  # (1, max_wp, 1)
-            interpolated = (1 - t_exp) * start.unsqueeze(1) + t_exp * goal.unsqueeze(1)  # (n, max_wp, 3)
-            control[:, 1:1+max_wp] = torch.where(unused_mask.unsqueeze(-1), interpolated, control[:, 1:1+max_wp])
-        
-        # Catmull-Rom spline interpolation
-        num_segments = max_wp + 1  # Number of segments between control points
-        
-        # Map progress [0, 1] to segment index and local t
-        p_scaled = progress * num_segments  # (n, T)
-        seg_idx = p_scaled.long().clamp(0, num_segments - 1)  # (n, T)
-        t_local = p_scaled - seg_idx.float()  # (n, T) in [0, 1]
-        
-        # For each point, get 4 control points (p0, p1, p2, p3) for Catmull-Rom
-        # Pad control points at ends for boundary handling
-        padded = torch.cat([control[:, :1], control, control[:, -1:]], dim=1)  # (n, max_wp+4, 3)
-        
-        # Gather control points: p0=seg_idx, p1=seg_idx+1, p2=seg_idx+2, p3=seg_idx+3
-        batch_idx = torch.arange(n, device=self.device).unsqueeze(1).expand(n, T)
-        p0 = padded[batch_idx, seg_idx]      # (n, T, 3)
-        p1 = padded[batch_idx, seg_idx + 1]  # (n, T, 3)
-        p2 = padded[batch_idx, seg_idx + 2]  # (n, T, 3)
-        p3 = padded[batch_idx, seg_idx + 3]  # (n, T, 3)
-        
-        # Catmull-Rom formula: P(t) = 0.5 * ((2*p1) + (-p0+p2)*t + (2*p0-5*p1+4*p2-p3)*t^2 + (-p0+3*p1-3*p2+p3)*t^3)
-        t = t_local.unsqueeze(-1)  # (n, T, 1)
-        t2 = t * t
-        t3 = t2 * t
-        
-        positions = 0.5 * (
-            2 * p1 +
-            (-p0 + p2) * t +
-            (2*p0 - 5*p1 + 4*p2 - p3) * t2 +
-            (-p0 + 3*p1 - 3*p2 + p3) * t3
-        )
-        
-        return positions  # (n, T, 3)
-
-    def _interpolate_orientations(self, env_ids: torch.Tensor, progress: torch.Tensor) -> torch.Tensor:
-        """Interpolate orientations using piecewise SLERP through waypoints."""
-        n, T = progress.shape
-        cfg = self.cfg
-        max_wp = cfg.waypoints.count[1]
-        
-        # Build orientation control points: start -> waypoints -> goal
-        quats = torch.zeros(n, max_wp + 2, 4, device=self.device)
-        quats[:, 0] = self.start_poses[env_ids, 3:7]
-        quats[:, 1:1+max_wp] = self.waypoints[env_ids, :, 3:7]
-        quats[:, -1] = self.goal_poses[env_ids, 3:7]
-        
-        # For unused waypoints, SLERP between start and goal (vectorized)
-        num_wp = self.num_waypoints[env_ids]
-        if max_wp > 0:
-            t_vals = torch.arange(1, max_wp + 1, device=self.device).float() / (max_wp + 1)  # (max_wp,)
-            slot_indices = torch.arange(max_wp, device=self.device)  # (max_wp,)
-            unused_mask = num_wp.unsqueeze(1) <= slot_indices.unsqueeze(0)  # (n, max_wp)
-            
-            # SLERP all slots at once: (n, max_wp, 4)
-            start_q = quats[:, 0:1, :].expand(n, max_wp, 4)  # (n, max_wp, 4)
-            goal_q = quats[:, -1:, :].expand(n, max_wp, 4)   # (n, max_wp, 4)
-            t_exp = t_vals.view(1, max_wp).expand(n, max_wp)  # (n, max_wp)
-            interpolated_q = self._batched_slerp(start_q, goal_q, t_exp)  # (n, max_wp, 4)
-            
-            quats[:, 1:1+max_wp] = torch.where(unused_mask.unsqueeze(-1), interpolated_q, quats[:, 1:1+max_wp])
-        
-        # Piecewise SLERP through control points
-        num_segments = max_wp + 1
-        p_scaled = progress * num_segments  # (n, T)
-        seg_idx = p_scaled.long().clamp(0, num_segments - 1)  # (n, T)
-        t_local = p_scaled - seg_idx.float()  # (n, T)
-        
-        # Gather segment endpoints
-        batch_idx = torch.arange(n, device=self.device).unsqueeze(1).expand(n, T)
-        q0 = quats[batch_idx, seg_idx]      # (n, T, 4)
-        q1 = quats[batch_idx, seg_idx + 1]  # (n, T, 4)
-        
-        return self._batched_slerp(q0, q1, t_local)
 
     def _batched_slerp(self, q0: torch.Tensor, q1: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """Batched spherical linear interpolation."""
@@ -2016,28 +2742,53 @@ class TrajectoryManager:
     # ---- Phase helpers ----
     
     def get_phase(self) -> torch.Tensor:
-        """Get current phase index for each environment.
-        
+        """FULLY VECTORIZED: Get current phase index for each environment (segment-based).
+
         Returns:
             0 = grasp (hand approaches object)
             1 = manipulate (hand moves with object)
-            2 = release (settle + retreat - hand stays/retreats, fingers open)
-        
-        Note: Settle phase is included in release (phase 2) for reward purposes.
-        During settle, trajectory_success and finger_release are active,
-        manipulation rewards are disabled.
-        
-        Uses per-env phase boundaries (t_manip_end) computed at reset based on
-        actual waypoint count and skip_manipulation flag.
+            2 = release (hand retreats, fingers open)
+
+        Maps segment names to phase indices:
+        - "grasp" → phase 0
+        - "release" → phase 2
+        - everything else → phase 1 (manipulation)
         """
-        t = self.phase_time
-        t_grasp_end = self.cfg.trajectory.phases.grasp
-        
-        # Use per-env boundaries computed at reset
-        phase = torch.zeros_like(t, dtype=torch.long)
-        phase[t >= t_grasp_end] = 1       # manipulate
-        phase[t >= self.t_manip_end] = 2  # release (settle + retreat)
-        
+        t = self.phase_time  # (num_envs,)
+        phase = torch.ones(self.num_envs, dtype=torch.long, device=self.device)  # Default: manipulation
+
+        # Find current segment index for ALL envs using vectorized searchsorted
+        max_segs_plus_one = self.segment_boundaries.shape[1]
+
+        # Create mask: (num_envs, max_segs+1) - True where t >= boundary
+        t_expanded = t.unsqueeze(1)  # (num_envs, 1)
+        after_start = t_expanded >= self.segment_boundaries  # (num_envs, max_segs+1)
+
+        # Find LAST True (rightmost boundary we've passed)
+        # Boundaries: [0, end_seg0, end_seg1, ..., end_segN] (max_segs+1 entries)
+        # If we're between boundaries[K] and boundaries[K+1], we're IN segment K
+        # The rightmost boundary we've passed IS the current segment index
+        seg_indices = torch.arange(max_segs_plus_one, device=self.device).unsqueeze(0).expand(self.num_envs, -1)
+        seg_indices_masked = torch.where(after_start, seg_indices, torch.full_like(seg_indices, -1))
+        current_seg_idx = seg_indices_masked.max(dim=1).values  # (num_envs,)
+
+        # Clamp to valid segment range [0, num_segs-1]
+        # If we're past all boundaries (idx >= num_segs), clamp to last segment
+        current_seg_idx = current_seg_idx.clamp(min=0)
+        max_segs_tensor = self.segment_boundaries.shape[1] - 1  # max_segs
+        current_seg_idx = current_seg_idx.clamp(max=max_segs_tensor - 1)
+        current_seg_idx = torch.minimum(current_seg_idx, self.num_segments - 1)
+
+        # Gather segment type flags for current segments
+        env_range = torch.arange(self.num_envs, device=self.device)
+        is_grasp_current = self.segment_is_grasp[env_range, current_seg_idx]  # (num_envs,)
+        is_release_current = self.segment_is_release[env_range, current_seg_idx]  # (num_envs,)
+
+        # Map to phase indices (vectorized)
+        phase = torch.where(is_grasp_current, 0, phase)
+        phase = torch.where(is_release_current, 2, phase)
+        # Remaining are already set to 1 (manipulation)
+
         return phase
 
     def is_in_release_phase(self) -> torch.Tensor:

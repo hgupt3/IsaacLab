@@ -21,11 +21,28 @@ hand_trajectory:
     count: [0, 0]               # Random number of additional grasp keypoints
 
 trajectory:
-  phases:
-    grasp: 3.0                  # Hand approaches object
-    manipulate_base: 5.0        # Increased for pour + return trajectory
-    settle: 0.1                 # Hand pauses at goal before retreat (fingers can open)
-    hand_release: 2.0           # Hand retreats from object (eased: slow start, fast end)
+  segments:
+    - name: "grasp"
+      type: "waypoint"
+      pose: null              # Computed: start_poses
+      duration: 3.0
+
+    - name: "pour"
+      type: "waypoint"
+      # Pour position: above cup, tilted 90 degrees to pour
+      pose: [-0.55, 0.12, 0.423, 0.707, -0.707, 0.0, 0.0]
+      duration: 2.5
+
+    - name: "return"
+      type: "waypoint"
+      pose: null              # Computed: returns to start_poses
+      duration: 2.5
+
+    - name: "release"
+      type: "waypoint"
+      pose: null              # Object stays at return position
+      duration: 2.0
+      hand_coupling: "none"   # Hand decouples and retreats
 
 push_t:
   enabled: true
@@ -37,14 +54,6 @@ push_t:
   outline_rotation: [1.0, 0.0, 0.0, 0.0]
   rolling_window: 2.5
   min_speed: 0.05
-
-waypoints:
-  count: [1, 1]                 # Exactly 1 waypoint (pour position)
-  fixed_waypoints:
-    # Pour position: above cup, tilted 90 degrees
-    # Position: outline_position [-0.55, 0.15] + z offset (table 0.255 + 0.16 = 0.415)
-    # Rotation: tilted 90 degrees to pour [qw, qx, qy, qz]
-    - [-0.55, 0.12, 0.423, 0.707, -0.707, 0.0, 0.0]
 
 goal:
   return_to_start: true         # Return bottle to original position
@@ -64,3 +73,7 @@ terminations:
   hand_pose_deviation:
     position_threshold: [1.0, 1.0]         # meters (lenient → strict)
     rotation_threshold: [3.14, 3.14]          # radians ~180° → ~180°
+
+procedural_objects:
+  generation:
+    num_shapes: 0  

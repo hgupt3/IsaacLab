@@ -61,6 +61,9 @@ import random
 import time
 import torch
 
+import carb
+import omni
+
 from rl_games.common import env_configurations, vecenv
 from rl_games.common.player import BasePlayer
 from rl_games.torch_runner import Runner
@@ -190,22 +193,51 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     dt = env.unwrapped.step_dt
 
-    # reset environment
-    obs = env.reset()
-    if isinstance(obs, dict):
-        obs = obs["obs"]
+    # reset environment (use enable_grad to allow tensor modifications)
+    with torch.enable_grad():
+        obs = env.reset()
+        if isinstance(obs, dict):
+            obs = obs["obs"]
     timestep = 0
     # required: enables the flag for batched observations
     _ = agent.get_batch_size(obs, 1)
     # initialize RNN states if used
     if agent.is_rnn:
         agent.init_rnn()
+
+    # Setup keyboard event listener for manual reset
+    reset_requested = {"flag": False}
+
+    def on_keyboard_event(event, *args):
+        """Handle keyboard events for manual reset."""
+        if event.type == carb.input.KeyboardEventType.KEY_PRESS:
+            if event.input.name == "KEY_1" or event.input.name == "NUMPAD_1":
+                reset_requested["flag"] = True
+                print("[INFO] Manual reset requested (Key: 1)")
+        return True
+
+    # Subscribe to keyboard events
+    appwindow = omni.appwindow.get_default_app_window()
+    kb_input = carb.input.acquire_input_interface()
+    keyboard = appwindow.get_keyboard()
+    kb_sub = kb_input.subscribe_to_keyboard_events(keyboard, on_keyboard_event)
+
+    print("[INFO] Keyboard controls enabled: Press '1' to reset environments")
+
     # simulate environment
     # note: We simplified the logic in rl-games player.py (:func:`BasePlayer.run()`) function in an
     #   attempt to have complete control over environment stepping. However, this removes other
     #   operations such as masking that is used for multi-agent learning by RL-Games.
     while simulation_app.is_running():
         start_time = time.time()
+
+        # Check if manual reset was requested via keyboard
+        if reset_requested["flag"]:
+            # Force reset by setting episode length to max for all environments
+            env.unwrapped.episode_length_buf[:] = env.unwrapped.max_episode_length
+            reset_requested["flag"] = False
+            print("[INFO] Manual reset triggered")
+
         # run everything in inference mode
         with torch.inference_mode():
             # convert obs to agent format
@@ -231,6 +263,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         sleep_time = dt - (time.time() - start_time)
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
+
+    # cleanup keyboard subscription
+    kb_sub.unsubscribe()
 
     # close the simulator
     env.close()

@@ -22,7 +22,7 @@ visualization:
 
 # Fewer envs for visualization
 simulation:
-  num_envs: 1
+  num_envs: 2
 
 procedural_objects:
   generation:

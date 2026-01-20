@@ -1006,10 +1006,16 @@ class target_sequence_obs_b(ManagerTermBase):
         
         # Waypoint region: 3D box (12 edges)
         if self.visualize_waypoint_region:
+            # Find random_waypoint segments for position_range
+            random_wp_segments = [seg for seg in cfg.trajectory.segments if seg.type == "random_waypoint"]
+            if not random_wp_segments:
+                # No random waypoints, skip visualization
+                return
+
+            wp_cfg = random_wp_segments[0]  # Use first random_waypoint segment
             start_local = starts - origins
-            
+
             # X bounds (None = workspace, else offset from start)
-            wp_cfg = cfg.waypoints
             if wp_cfg.position_range.x is None:
                 x_min = torch.full((E,), cfg.workspace.x[0], device=device)
                 x_max = torch.full((E,), cfg.workspace.x[1], device=device)

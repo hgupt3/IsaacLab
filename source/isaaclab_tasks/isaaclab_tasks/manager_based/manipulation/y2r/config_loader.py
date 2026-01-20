@@ -21,6 +21,7 @@ To add a new task:
 from __future__ import annotations
 
 from dataclasses import dataclass, field, is_dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, get_origin, get_type_hints
 
@@ -122,21 +123,62 @@ class ObservationsConfig:
 
 
 @dataclass
-class PhasesConfig:
-    grasp: float
-    manipulate_base: float
-    settle: float = 0.0  # Pause at goal before retreat (fingers can open)
-    hand_release: float = 2.5
-
-
-@dataclass
 class TrajectoryConfig:
     target_hz: float
     window_size: int
-    phases: PhasesConfig
     easing_power: float
-    release_ease_power: float = 2.0  # Ease-in power for retreat (slow start)
     skip_manipulation_probability: float = 0.0  # Probability of grasp-only episodes
+    segments: list[dict] = field(default_factory=list)  # List of segment configs (REQUIRED)
+
+
+# ==============================================================================
+# SEGMENT-BASED TRAJECTORY SYSTEM
+# ==============================================================================
+
+class HandCouplingMode(str, Enum):
+    """Hand coupling modes for segments."""
+    FULL = "full"                # Hand rotates + translates with object (default)
+    POSITION_ONLY = "position_only"  # Hand translates but orientation fixed
+    NONE = "none"                # Hand fully decoupled
+
+
+@dataclass
+class BaseSegmentConfig:
+    """Base class for all trajectory segments."""
+    name: str                    # Human-readable identifier
+    duration: float              # Seconds for this segment
+    type: str = "base"           # Segment type (overridden by children)
+    hand_coupling: str = "full"  # Defaults to "full" - only specify if different
+    hand_orientation: list[float] | None = None  # Optional fixed hand quat [qw,qx,qy,qz] for position_only mode
+
+
+@dataclass
+class WaypointSegmentConfig(BaseSegmentConfig):
+    """Move to discrete waypoint target."""
+    pose: list[float] | None = None  # [x,y,z,qw,qx,qy,qz] or null (computed at reset)
+    type: str = "waypoint"
+
+
+@dataclass
+class HelicalSegmentConfig(BaseSegmentConfig):
+    """Helical motion: coupled rotation + translation."""
+    axis: list[float] = field(default_factory=list)  # Rotation axis unit vector [x,y,z]
+    rotation: float = 0.0        # Total rotation in radians
+    translation: list[float] = field(default_factory=list)  # Translation vector [x,y,z]
+    type: str = "helical"
+
+
+@dataclass
+class RandomWaypointSegmentConfig(BaseSegmentConfig):
+    """Generates random waypoints at reset time (expands to N waypoint segments)."""
+    count: tuple[int, int] = (0, 0)  # [min, max] waypoints to sample
+    movement_duration: float = 3.0   # Duration PER waypoint (total = N * movement_duration)
+    pause_duration: float = 0.0      # Pause PER waypoint
+    position_range: PositionRangeConfig | None = None
+    vary_orientation: bool = False
+    max_rotation: float = 0.0
+    type: str = "random_waypoint"
+    duration: float = 0.0  # Ignored - computed at reset based on sampled count
 
 
 # ==============================================================================
@@ -149,6 +191,8 @@ class GraspSamplingConfig:
     exclude_bottom_fraction: float
     exclude_toward_robot: bool
     toward_robot_threshold: float
+    exclude_upward: bool
+    upward_threshold: float
     approach_distance: float | None  # Pre-grasp distance (null = disabled)
     align_fraction: float            # Fraction of grasp phase for alignment
     fixed_origin_offset: list[float] | None  # [x,y,z] offset from object center (null = center)
@@ -205,17 +249,6 @@ class PositionRangeConfig:
     x: tuple[float, float] | None
     y: tuple[float, float] | None
     z: tuple[float, float] | None
-
-
-@dataclass
-class WaypointsConfig:
-    count: tuple[int, int]
-    movement_duration: float  # Seconds of movement time per waypoint
-    pause_duration: float     # Seconds to pause at each waypoint
-    position_range: PositionRangeConfig
-    vary_orientation: bool
-    max_rotation: float
-    fixed_waypoints: list[list[float]] | None  # [[x,y,z,qw,qx,qy,qz], ...] overrides random
 
 
 @dataclass
@@ -400,6 +433,7 @@ class PushTConfig:
     goal_rotation: tuple[float, float, float, float] | None
     rolling_window: float
     min_speed: float
+    min_angular_velocity: float
     include_in_primitives: bool
     object_z_offset: float | None  # null = auto-compute from mesh geometry
     outline_z_offset: float | None  # null = auto-compute from mesh geometry
@@ -459,7 +493,6 @@ class Y2RConfig:
     trajectory: TrajectoryConfig
     hand_trajectory: HandTrajectoryConfig
     workspace: WorkspaceConfig
-    waypoints: WaypointsConfig
     goal: GoalConfig
     rewards: RewardsConfig
     terminations: TerminationsConfig
@@ -477,6 +510,104 @@ class Y2RConfig:
 # ==============================================================================
 # PUBLIC API
 # ==============================================================================
+
+def _parse_segments(yaml_segments: list[dict]) -> list[BaseSegmentConfig]:
+    """Parse segment configs from YAML.
+
+    Args:
+        yaml_segments: List of segment dicts from YAML
+
+    Returns:
+        List of parsed segment config objects
+    """
+    segments = []
+    for seg_dict in yaml_segments:
+        seg_type = seg_dict["type"]
+
+        if seg_type == "waypoint":
+            seg = WaypointSegmentConfig(
+                name=seg_dict["name"],
+                duration=seg_dict["duration"],
+                pose=seg_dict.get("pose"),  # Can be null
+                hand_coupling=seg_dict.get("hand_coupling", "full"),  # Has default in dataclass
+                hand_orientation=seg_dict.get("hand_orientation"),  # Optional fixed orientation
+            )
+        elif seg_type == "helical":
+            seg = HelicalSegmentConfig(
+                name=seg_dict["name"],
+                duration=seg_dict["duration"],
+                axis=seg_dict["axis"],
+                rotation=seg_dict["rotation"],
+                translation=seg_dict["translation"],
+                hand_coupling=seg_dict.get("hand_coupling", "full"),  # Has default in dataclass
+                hand_orientation=seg_dict.get("hand_orientation"),  # Optional fixed orientation
+            )
+        elif seg_type == "random_waypoint":
+            # Parse position_range if present
+            pos_range = None
+            if "position_range" in seg_dict:
+                pr = seg_dict["position_range"]
+                pos_range = PositionRangeConfig(
+                    x=tuple(pr["x"]) if pr.get("x") else None,
+                    y=tuple(pr["y"]) if pr.get("y") else None,
+                    z=tuple(pr["z"]) if pr.get("z") else None,
+                )
+
+            seg = RandomWaypointSegmentConfig(
+                name=seg_dict["name"],
+                count=tuple(seg_dict["count"]),
+                movement_duration=seg_dict["movement_duration"],
+                pause_duration=seg_dict["pause_duration"],
+                position_range=pos_range,
+                vary_orientation=seg_dict["vary_orientation"],
+                max_rotation=seg_dict["max_rotation"],
+                hand_coupling=seg_dict.get("hand_coupling", "full"),  # Has default in dataclass
+            )
+        else:
+            raise ValueError(f"Unknown segment type: {seg_type}")
+
+        segments.append(seg)
+
+    return segments
+
+
+def get_config_file_paths(mode: str = "train", task: str = "base") -> list[Path]:
+    """Return list of YAML files that will be loaded for given mode/task.
+
+    This ensures wandb logging matches actual config composition by maintaining
+    a single source of truth for which files are loaded.
+
+    Args:
+        mode: One of "train", "distill", "play", "play_student", "keyboard"
+        task: Task name - "base" or any YAML file in configs/layers/tasks/
+
+    Returns:
+        List of Path objects for YAML files that will be loaded
+    """
+    config_dir = Path(__file__).parent / "configs"
+    files = [config_dir / "base.yaml"]
+
+    # Mode layers (mirrors get_config() logic exactly)
+    if mode == "distill":
+        files.append(config_dir / "layers" / "student.yaml")
+    elif mode == "play":
+        files.append(config_dir / "layers" / "play.yaml")
+    elif mode == "play_student":
+        files.extend([
+            config_dir / "layers" / "student.yaml",
+            config_dir / "layers" / "play.yaml",
+            config_dir / "layers" / "student_play.yaml"
+        ])
+    elif mode == "keyboard":
+        files.append(config_dir / "layers" / "keyboard.yaml")
+    # mode == "train" uses base only
+
+    # Task layer (optional, applied last)
+    if task != "base":
+        files.append(config_dir / "layers" / "tasks" / f"{task}.yaml")
+
+    return files
+
 
 def get_config(mode: str = "train", task: str = "base") -> Y2RConfig:
     """Load Y2R config with layer-based composition.
@@ -516,5 +647,9 @@ def get_config(mode: str = "train", task: str = "base") -> Y2RConfig:
     # Task layer (optional, applied last)
     if task != "base":
         cfg = _deep_merge(cfg, _load_yaml(f"layers/tasks/{task}"))
-    
+
+    # Parse segments from YAML dict to segment config objects
+    if "trajectory" in cfg and "segments" in cfg["trajectory"]:
+        cfg["trajectory"]["segments"] = _parse_segments(cfg["trajectory"]["segments"])
+
     return _auto_parse(Y2RConfig, cfg)
