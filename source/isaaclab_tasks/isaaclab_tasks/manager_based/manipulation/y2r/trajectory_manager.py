@@ -57,113 +57,82 @@ class TrajectoryManager:
         self.device = device
         self.table_height = table_height
         self.object_prim_path = object_prim_path
-        
-        # Extract trajectory settings from config
+
         traj = cfg.trajectory
-        
-        # Timing
         self.target_dt = 1.0 / traj.target_hz
 
-        # Compute max possible duration from segment config (for buffer allocation)
+        # Max duration for buffer allocation
         max_duration = 0.0
         for seg in traj.segments:
             if seg.type == "random_waypoint":
-                # Max waypoints * (movement + pause)
                 max_duration += seg.count[1] * (seg.movement_duration + seg.pause_duration)
             else:
                 max_duration += seg.duration
 
         self.total_duration = max_duration
-
-        # Total number of targets for the trajectory buffer
         self.total_targets = int(self.total_duration / self.target_dt) + 1
-        
-        # Full trajectory buffer: (num_envs, total_targets, 7) for pos(3) + quat(4)
+
+        # Object trajectory buffer
         self.trajectory = torch.zeros(num_envs, self.total_targets, 7, device=device)
-        
-        # Current window index (which target is "current")
         self.current_idx = torch.zeros(num_envs, dtype=torch.long, device=device)
-        
-        # Phase time (seconds since episode start)
         self.phase_time = torch.zeros(num_envs, device=device)
-        
-        # Start/goal poses
+
         self.start_poses = torch.zeros(num_envs, 7, device=device)
         self.goal_poses = torch.zeros(num_envs, 7, device=device)
-
-        # Environment origins (XY offset for each cloned env)
         self.env_origins = torch.zeros(num_envs, 3, device=device)
-        
-        # Local point cloud for penetration checking (set by observation term)
         self.points_local: torch.Tensor | None = None
-        
-        # For push-T replanning: track when to regenerate trajectory
+
+        # Push-T replanning tracking
         self.last_replan_idx = torch.zeros(num_envs, dtype=torch.long, device=device)
         self.current_object_poses = torch.zeros(num_envs, 7, device=device)
-        
-        # Skip manipulation flag per env (grasp-only episodes)
+
         self.skip_manipulation = torch.zeros(num_envs, dtype=torch.bool, device=device)
-        
-        # Per-env phase boundaries (computed at reset based on segment durations)
-        self.t_grasp_end = torch.zeros(num_envs, device=device)    # End of grasp phase
-        self.t_manip_end = torch.zeros(num_envs, device=device)    # End of manipulation phase
-        self.t_episode_end = torch.zeros(num_envs, device=device)  # End of episode (for termination)
-        
-        # ========== Hand trajectory buffers ==========
-        # Hand trajectory buffer: (num_envs, total_targets, 7) for palm pos(3) + quat(4)
+
+        # Phase boundaries (computed at reset)
+        self.t_grasp_end = torch.zeros(num_envs, device=device)
+        self.t_manip_end = torch.zeros(num_envs, device=device)
+        self.t_episode_end = torch.zeros(num_envs, device=device)
+
+        # Hand trajectory
         self.hand_trajectory = torch.zeros(num_envs, self.total_targets, 7, device=device)
 
-        # Grasp pose: initial grasp pose relative to object (num_envs, 7)
-        # This is the transform from object frame to palm frame at grasp
+        # Grasp pose in object frame
         self.grasp_pose = torch.zeros(num_envs, 7, device=device)
 
-        # ========== Surface-based grasp representation ==========
-        # Initial grasp defined by surface point, normal, roll, standoff
+        # Surface-based grasp
         hand_cfg = cfg.hand_trajectory
-        self.grasp_surface_point = torch.zeros(num_envs, 3, device=device)   # Point on object surface (local)
-        self.grasp_surface_normal = torch.zeros(num_envs, 3, device=device)  # Surface normal (local)
-        self.grasp_roll = torch.zeros(num_envs, device=device)               # Roll around approach axis
-        self.grasp_standoff = torch.zeros(num_envs, device=device)           # Distance from surface
-        self.grasp_surface_idx = torch.zeros(num_envs, dtype=torch.long, device=device)  # Index in point pool
+        self.grasp_surface_point = torch.zeros(num_envs, 3, device=device)
+        self.grasp_surface_normal = torch.zeros(num_envs, 3, device=device)
+        self.grasp_roll = torch.zeros(num_envs, device=device)
+        self.grasp_standoff = torch.zeros(num_envs, device=device)
+        self.grasp_surface_idx = torch.zeros(num_envs, dtype=torch.long, device=device)
 
-        # Keypoints: perturbed surface points during manipulation
         max_keypoints = hand_cfg.keypoints.count[1]
         self.keypoint_surface_points = torch.zeros(num_envs, max_keypoints, 3, device=device)
         self.keypoint_surface_normals = torch.zeros(num_envs, max_keypoints, 3, device=device)
         self.keypoint_rolls = torch.zeros(num_envs, max_keypoints, device=device)
         self.num_grasp_keypoints = torch.zeros(num_envs, dtype=torch.long, device=device)
-
-        # Legacy: keep grasp_keypoints for compatibility with _generate_hand_trajectory
         self.grasp_keypoints = torch.zeros(num_envs, max_keypoints, 7, device=device)
 
-        # Release pose: target palm position for release phase (num_envs, 7)
         self.release_pose = torch.zeros(num_envs, 7, device=device)
-
-        # Starting palm pose (captured at reset for interpolation)
         self.start_palm_pose = torch.zeros(num_envs, 7, device=device)
 
-        # Debug: surface points in OBJECT-LOCAL frame for visualization (num_envs, 3)
-        # Stored in local frame so it moves with the object
+        # Debug: surface points in object-local frame
         self.debug_surface_point_local = torch.zeros(num_envs, 3, device=device)
         self.debug_keypoint_points_local = torch.zeros(num_envs, max_keypoints, 3, device=device)
 
-        # ========== Segment-based trajectory buffers ==========
-        # Compute max segments after random_waypoint expansion
-        # Each random_waypoint becomes 2 segments: movement + pause (to implement pause at waypoint)
+        # Segment-based trajectory
+        # Max segments after random_waypoint expansion (each becomes movement + pause)
         max_segments_after_expansion = sum(
             seg.count[1] * 2 if seg.type == "random_waypoint" else 1
             for seg in cfg.trajectory.segments
         )
         self.segment_poses = torch.zeros(num_envs, max_segments_after_expansion, 7, device=device)
         self.segment_boundaries = torch.zeros(num_envs, max_segments_after_expansion + 1, device=device)
-        self.coupling_modes = torch.zeros(num_envs, max_segments_after_expansion, dtype=torch.long, device=device)
+        self.coupling_modes = torch.zeros(num_envs, max_segments_after_expansion, dtype=torch.long, device=device)  # 0=full, 1=position_only, 2=none
         self.num_segments = torch.zeros(num_envs, dtype=torch.long, device=device)
-        # coupling_modes: 0=full, 1=position_only, 2=none
-
-        # Store hand pose at segment boundaries (for position_only coupling)
         self.hand_pose_at_segment_boundary = torch.zeros(num_envs, max_segments_after_expansion + 1, 7, device=device)
 
-        # Vectorized segment metadata for GPU parallelization
         self.segment_durations = torch.zeros(num_envs, max_segments_after_expansion, device=device)
         self.segment_is_helical = torch.zeros(num_envs, max_segments_after_expansion, dtype=torch.bool, device=device)
         self.segment_is_grasp = torch.zeros(num_envs, max_segments_after_expansion, dtype=torch.bool, device=device)
@@ -255,30 +224,20 @@ class TrajectoryManager:
         # Process each segment config
         for seg_config in self.cfg.trajectory.segments:
             if seg_config.type == "random_waypoint":
-                # ===== VECTORIZED RANDOM WAYPOINT SAMPLING =====
-                # Each waypoint becomes TWO segments: movement (interpolates) + pause (holds)
-                # This implements proper waypoint pauses matching old system behavior
-
-                # Sample counts for ALL envs at once (n,)
+                # Each waypoint becomes two segments: movement + pause
                 num_wp_per_env = torch.randint(
                     seg_config.count[0],
                     seg_config.count[1] + 1,
                     (n,),
                     device=self.device
-                )  # (n,)
+                )
 
                 max_wp = num_wp_per_env.max().item()
 
-                # Advance output_seg_idx after writing segments; envs with 0 waypoints add 0.
                 if max_wp > 0:
-                    # Sample positions for ALL (env × waypoint) pairs
                     ws_cfg = self.cfg.workspace
-                    start_local = start_poses[:, :3] - env_origins  # (n, 3)
-
-                    # Validity mask: (n, max_wp)
+                    start_local = start_poses[:, :3] - env_origins
                     wp_valid = torch.arange(max_wp, device=self.device).unsqueeze(0) < num_wp_per_env.unsqueeze(1)
-
-                    # Sample ALL positions at once (n, max_wp, 3)
                     if seg_config.position_range and seg_config.position_range.x is not None:
                         x_offsets = sample_uniform(
                             seg_config.position_range.x[0],
@@ -476,7 +435,6 @@ class TrajectoryManager:
             self.goal_poses[env_ids[skip_mask]] = self.start_poses[env_ids[skip_mask]]
 
         # FULLY VECTORIZED: Compute phase boundaries for ALL envs in parallel
-        n = len(env_ids)
         max_segs = self.segment_durations.shape[1]
 
         # Create valid segment mask: (n, max_segs)
@@ -1568,34 +1526,8 @@ class TrajectoryManager:
         n = len(env_ids)
         times = torch.arange(self.total_targets, device=self.device).float() * self.target_dt
 
-        # Get keypoints (in object-local frame)
+        # Get per-env keypoint counts (used later in trajectory generation)
         num_kp = self.num_grasp_keypoints[env_ids]  # (n,)
-        max_kp = self.cfg.hand_trajectory.keypoints.count[1]
-        keypoints = self.grasp_keypoints[env_ids]  # (n, max_kp, 7)
-
-        # Build keypoint chain: [grasp, kp_0, kp_1, ..., kp_{N-1}]
-        max_chain_len = max(2, max_kp + 1)
-        kp_chain = torch.zeros(n, max_chain_len, 7, device=self.device)
-
-        # Position 0: initial grasp pose (object-local)
-        grasp_pos_local = self.grasp_pose[env_ids, :3]
-        grasp_quat_local = self.grasp_pose[env_ids, 3:7]
-        kp_chain[:, 0, :3] = grasp_pos_local
-        kp_chain[:, 0, 3:7] = grasp_quat_local
-
-        if max_kp > 0:
-            kp_chain[:, 1:max_kp+1, :] = keypoints
-        else:
-            # No keypoints - duplicate grasp
-            kp_chain[:, 1, :3] = grasp_pos_local
-            kp_chain[:, 1, 3:7] = grasp_quat_local
-
-        # Important: per-env keypoint count can be 0 even if max_kp > 0.
-        # In that case, treat the chain as [grasp, grasp] (ignore sampled kp_0).
-        zero_kp_mask = num_kp == 0
-        if zero_kp_mask.any():
-            kp_chain[zero_kp_mask, 1, :3] = grasp_pos_local[zero_kp_mask]
-            kp_chain[zero_kp_mask, 1, 3:7] = grasp_quat_local[zero_kp_mask]
 
         # ===== FULLY VECTORIZED: Process ALL (env × segment × timestep) at once - ZERO LOOPS! =====
 
@@ -1649,8 +1581,8 @@ class TrajectoryManager:
             obj_quat_g = self.trajectory[global_env_idx, time_idx_g, 3:7]
 
             # Transform grasp pose to world
-            grasp_pos_world_g = quat_apply(obj_quat_g, grasp_pos_local[env_idx_g]) + obj_pos_g
-            grasp_quat_world_g = quat_mul(obj_quat_g, grasp_quat_local[env_idx_g])
+            grasp_pos_world_g = quat_apply(obj_quat_g, self.grasp_pose[global_env_idx, :3]) + obj_pos_g
+            grasp_quat_world_g = quat_mul(obj_quat_g, self.grasp_pose[global_env_idx, 3:7])
 
             # Start pose (MUST be in world coordinates!)
             start_pos_g = self.start_palm_pose[global_env_idx, :3]
@@ -1722,8 +1654,9 @@ class TrajectoryManager:
             kp_chain[:, 1:, 3:7] = self.grasp_keypoints[env_ids, :, 3:7]
 
         # Per-env: if num_kp == 0, duplicate grasp at index 1 (ignore kp_0).
+        # Only do this if max_kp > 0, otherwise kp_chain has no index 1.
         zero_kp_mask = num_kp == 0
-        if zero_kp_mask.any():
+        if max_kp > 0 and zero_kp_mask.any():
             kp_chain[zero_kp_mask, 1, :3] = kp_chain[zero_kp_mask, 0, :3]
             kp_chain[zero_kp_mask, 1, 3:7] = kp_chain[zero_kp_mask, 0, 3:7]
 
@@ -1754,7 +1687,12 @@ class TrajectoryManager:
         local_progress_kp = ((global_manip_progress - seg_start_kp) / (seg_end_kp - seg_start_kp).clamp(min=1e-6)).clamp(0, 1)  # (n, max_segs)
 
         # Clamp keypoint indices
-        max_chain_idx = torch.where(num_kp_per_env == 0, torch.ones_like(num_kp_per_env), num_kp_per_env)  # (n, 1)
+        # kp_chain has shape (n, max_kp + 1, 7), so valid indices are [0, max_kp]
+        # When max_kp=0, only index 0 is valid, so we must clamp to 0 not 1.
+        actual_max_chain_idx = max_kp  # Max valid index in kp_chain's second dimension
+        max_chain_idx = torch.where(num_kp_per_env == 0,
+                                     torch.zeros_like(num_kp_per_env),
+                                     num_kp_per_env.clamp(max=actual_max_chain_idx))  # (n, 1)
         from_idx_kp = seg_idx_kp.clamp(max=max_chain_idx)  # (n, max_segs)
         to_idx_kp = (seg_idx_kp + 1).clamp(max=max_chain_idx)  # (n, max_segs)
 
@@ -1766,14 +1704,10 @@ class TrajectoryManager:
         from_quat_local_flat = kp_chain[env_idx_flat, from_idx_flat, 3:7]  # (n*max_segs, 4)
         to_quat_local_flat = kp_chain[env_idx_flat, to_idx_flat, 3:7]  # (n*max_segs, 4)
 
-        # Reshape to (n, max_segs, 4)
-        from_quat_local = from_quat_local_flat.reshape(n, max_segs, 4)
-        to_quat_local = to_quat_local_flat.reshape(n, max_segs, 4)
-
         # Interpolate (batched SLERP across all env-segment pairs)
         interp_quat_local = self._batched_slerp(
-            from_quat_local.reshape(n * max_segs, 4),
-            to_quat_local.reshape(n * max_segs, 4),
+            from_quat_local_flat,
+            to_quat_local_flat,
             local_progress_kp.reshape(n * max_segs)
         ).reshape(n, max_segs, 4)
 
@@ -1794,10 +1728,6 @@ class TrajectoryManager:
         env_idx_m, seg_idx_m, time_idx_m = torch.where(manip_mask_3d)
 
         if len(env_idx_m) > 0:
-            # Compute cumulative manipulation time up to each segment start (vectorized)
-            cumsum_manip_time = torch.cumsum(manip_durations_per_seg, dim=1)  # (n, max_segs)
-            seg_manip_start_time = cumsum_manip_time - manip_durations_per_seg  # (n, max_segs)
-
             # Local time within segment
             local_t_within_seg = times[time_idx_m] - self.segment_boundaries[env_ids[env_idx_m], seg_idx_m]
 
@@ -1816,9 +1746,13 @@ class TrajectoryManager:
 
             # Gather keypoints with PER-ENV chain index clamping
             # For env with num_kp keypoints, max chain idx = num_kp (final keypoint)
-            # num_kp=0: max_chain_idx=1 (grasp duplicated at position 1)
+            # num_kp=0: max_chain_idx=0 (only grasp at position 0, when max_kp=0)
             # num_kp=N: max_chain_idx=N (chain has grasp + N keypoints)
-            max_chain_idx_per_timestep = torch.where(num_kp_per_env == 0, torch.ones_like(num_kp_per_env), num_kp_per_env)
+            # IMPORTANT: When max_kp=0, kp_chain has shape (n, 1, 7), so only index 0 is valid
+            actual_max_chain_idx = max_kp  # Max valid index in kp_chain's second dimension
+            max_chain_idx_per_timestep = torch.where(num_kp_per_env == 0,
+                                                      torch.zeros_like(num_kp_per_env),
+                                                      num_kp_per_env.clamp(max=actual_max_chain_idx))
             from_idx_kp = seg_idx_kp.clamp(max=max_chain_idx_per_timestep)
             to_idx_kp = (seg_idx_kp + 1).clamp(max=max_chain_idx_per_timestep)
 
