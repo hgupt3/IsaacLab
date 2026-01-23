@@ -142,7 +142,7 @@ class TrajectoryManager:
 
         # Helical segment parameters (only used when segment_is_helical=True)
         self.segment_helical_axis = torch.zeros(num_envs, max_segments_after_expansion, 3, device=device)
-        self.segment_helical_rotation = torch.zeros(num_envs, max_segments_after_expansion, device=device)
+        self.segment_helical_angular_velocity = torch.zeros(num_envs, max_segments_after_expansion, device=device)
         self.segment_helical_translation = torch.zeros(num_envs, max_segments_after_expansion, 3, device=device)
 
         # Custom pose override (for waypoint segments with explicit pose in config)
@@ -366,7 +366,7 @@ class TrajectoryManager:
                 # Type-specific fields
                 if seg_config.type == "helical":
                     self.segment_helical_axis[global_env_idx, target_seg_idx] = torch.tensor(seg_config.axis, dtype=torch.float32, device=self.device).unsqueeze(0).expand(n, 3)
-                    self.segment_helical_rotation[global_env_idx, target_seg_idx] = seg_config.rotation
+                    self.segment_helical_angular_velocity[global_env_idx, target_seg_idx] = seg_config.angular_velocity
                     self.segment_helical_translation[global_env_idx, target_seg_idx] = torch.tensor(seg_config.translation, dtype=torch.float32, device=self.device).unsqueeze(0).expand(n, 3)
                 elif seg_config.type == "waypoint":
                     if seg_config.pose is not None:
@@ -1954,7 +1954,9 @@ class TrajectoryManager:
                 hel_envs = env_ids[is_helical]
                 translation = self.segment_helical_translation[hel_envs, seg_idx]
                 axes = self.segment_helical_axis[hel_envs, seg_idx] / torch.norm(self.segment_helical_axis[hel_envs, seg_idx], dim=1, keepdim=True)
-                angles = self.segment_helical_rotation[hel_envs, seg_idx]
+                angular_velocity = self.segment_helical_angular_velocity[hel_envs, seg_idx]
+                duration = self.segment_durations[hel_envs, seg_idx]
+                angles = angular_velocity * duration  # Total rotation = angular_velocity * duration
                 delta_quats = quat_from_angle_axis(angles, axes)
                 self.segment_poses[hel_envs, seg_idx, :3] = prev_poses[is_helical, :3] + translation
                 self.segment_poses[hel_envs, seg_idx, 3:7] = quat_mul(prev_poses[is_helical, 3:7], delta_quats)
@@ -2195,7 +2197,9 @@ class TrajectoryManager:
             local_t = ((times[time_idx_hel] - seg_start_times_3d[env_idx_hel, seg_idx_hel]) /
                        seg_durations_3d[env_idx_hel, seg_idx_hel].clamp(min=1e-6)).clamp(0, 1)
             pos = start_poses_3d[env_idx_hel, seg_idx_hel, :3] + local_t.unsqueeze(1) * self.segment_helical_translation[global_env_idx_hel, seg_idx_hel]
-            angles = self.segment_helical_rotation[global_env_idx_hel, seg_idx_hel] * local_t
+            angular_velocity = self.segment_helical_angular_velocity[global_env_idx_hel, seg_idx_hel]
+            duration = seg_durations_3d[env_idx_hel, seg_idx_hel]
+            angles = angular_velocity * duration * local_t  # rotation = angular_velocity * time
             delta_quats = torch.zeros(len(env_idx_hel), 4, device=self.device)
             delta_quats[:, 0] = torch.cos(angles / 2)
             delta_quats[:, 1:4] = axes * torch.sin(angles / 2).unsqueeze(1)
@@ -2349,8 +2353,8 @@ class TrajectoryManager:
                 orientations_flat = self._batched_slerp(start_flat, target_flat, t_flat)
                 orientations[wp_indices] = orientations_flat.reshape(wp_count, max_targets, 4)
 
-            # Helical segments: position to target, rotation with alignment correction + helical component
-            # During replanning: interpolate position AND non-helical rotation to target, maintain min helical rotation
+            # Helical segments: position to target, rotation at constant angular velocity
+            # During replanning: interpolate position to target, rotate at constant angular velocity from current orientation
             if is_helical.any():
                 hel_indices = torch.where(is_helical)[0]
                 n_hel = len(hel_indices)
@@ -2358,15 +2362,12 @@ class TrajectoryManager:
                 # Get helical parameters
                 axes = self.segment_helical_axis[env_ids[hel_indices], current_seg_idx[hel_indices]]  # (n_hel, 3)
                 axes = axes / torch.norm(axes, dim=1, keepdim=True).clamp(min=1e-8)  # Normalize
+                angular_velocity = self.segment_helical_angular_velocity[env_ids[hel_indices], current_seg_idx[hel_indices]]  # (n_hel,)
 
                 # Current state and targets
                 current_pos_hel = current_pos[hel_indices]  # (n_hel, 3)
                 current_quat_hel = current_quat[hel_indices]  # (n_hel, 4)
                 target_pos_hel = target_pos[hel_indices]  # (n_hel, 3)
-                target_quat_hel = target_quat[hel_indices]  # (n_hel, 4)
-
-                # Minimum angular velocity
-                min_angular_vel = self.cfg.push_t.min_angular_velocity
 
                 # Generate trajectory for planning window
                 for t_idx in range(max_targets):
@@ -2374,23 +2375,19 @@ class TrajectoryManager:
                     dt = t_idx * self.target_dt  # (scalar)
                     progress = t_steps[t_idx]  # (scalar) [0, 1]
 
-                    # Position: linear interpolation from current to ACTUAL target
+                    # Position: linear interpolation from current to target
                     positions[hel_indices, t_idx] = current_pos_hel + progress * (target_pos_hel - current_pos_hel)
 
-                    # Rotation: SLERP to target (fixes all axes) + extra helical rotation
-                    # Step 1: SLERP from current to target orientation (fixes misalignment in all axes)
-                    base_quat = self._batched_slerp(current_quat_hel, target_quat_hel, progress)
-
-                    # Step 2: Add additional rotation around helical axis at min angular velocity
-                    angle_delta = torch.full((n_hel,), min_angular_vel * dt, device=self.device)  # (n_hel,)
+                    # Rotation: constant angular velocity around helical axis
+                    angle_delta = angular_velocity * dt  # (n_hel,) - rotation angle from current orientation
 
                     # Convert to quaternion
                     delta_quats = torch.zeros(n_hel, 4, device=self.device)
                     delta_quats[:, 0] = torch.cos(angle_delta / 2)
                     delta_quats[:, 1:4] = axes * torch.sin(angle_delta / 2).unsqueeze(1)
 
-                    # Apply extra helical rotation: final_quat = delta_quat * base_quat
-                    orientations[hel_indices, t_idx] = quat_mul(delta_quats, base_quat)
+                    # Apply helical rotation from current orientation
+                    orientations[hel_indices, t_idx] = quat_mul(delta_quats, current_quat_hel)
 
             # 6. Scatter write to trajectory (only valid timesteps)
             write_indices = current_idx.unsqueeze(1) + torch.arange(max_targets, device=self.device).unsqueeze(0)  # (n, max_targets)

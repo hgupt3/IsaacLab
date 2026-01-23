@@ -486,7 +486,6 @@ push_t:
   goal_rotation: null           # Goal quaternion wxyz (null = use outline_rotation)
   rolling_window: 3.0           # Trajectory planning horizon (seconds)
   min_speed: 0.02               # Minimum linear speed (m/s) for waypoint replanning
-  min_angular_velocity: 1.0     # Minimum angular velocity (rad/s) for helical replanning
   include_in_primitives: true   # Include T-shape in random object selection pool
   object_z_offset: null         # Center-to-bottom distance (null = auto-compute from mesh)
   outline_z_offset: null        # Center-to-bottom distance (null = auto-compute from mesh)

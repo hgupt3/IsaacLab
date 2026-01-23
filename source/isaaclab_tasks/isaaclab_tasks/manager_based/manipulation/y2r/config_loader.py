@@ -163,7 +163,7 @@ class WaypointSegmentConfig(BaseSegmentConfig):
 class HelicalSegmentConfig(BaseSegmentConfig):
     """Helical motion: coupled rotation + translation."""
     axis: list[float] = field(default_factory=list)  # Rotation axis unit vector [x,y,z]
-    rotation: float = 0.0        # Total rotation in radians
+    angular_velocity: float = 1.0  # Angular velocity in rad/s (total rotation = angular_velocity * duration)
     translation: list[float] = field(default_factory=list)  # Translation vector [x,y,z]
     type: str = "helical"
 
@@ -433,7 +433,6 @@ class PushTConfig:
     goal_rotation: tuple[float, float, float, float] | None
     rolling_window: float
     min_speed: float
-    min_angular_velocity: float
     include_in_primitives: bool
     object_z_offset: float | None  # null = auto-compute from mesh geometry
     outline_z_offset: float | None  # null = auto-compute from mesh geometry
@@ -511,6 +510,27 @@ class Y2RConfig:
 # PUBLIC API
 # ==============================================================================
 
+def _validate_segment_fields(seg_dict: dict, expected_fields: set[str], seg_type: str) -> None:
+    """Validate that segment dict only contains expected fields.
+
+    Args:
+        seg_dict: Segment dictionary from YAML
+        expected_fields: Set of allowed field names
+        seg_type: Segment type name for error messages
+
+    Raises:
+        ValueError: If unknown fields are found
+    """
+    actual_fields = set(seg_dict.keys())
+    unexpected_fields = actual_fields - expected_fields
+
+    if unexpected_fields:
+        raise ValueError(
+            f"Unexpected fields in '{seg_type}' segment '{seg_dict.get('name', 'unknown')}': "
+            f"{sorted(unexpected_fields)}. Expected fields: {sorted(expected_fields)}"
+        )
+
+
 def _parse_segments(yaml_segments: list[dict]) -> list[BaseSegmentConfig]:
     """Parse segment configs from YAML.
 
@@ -525,6 +545,10 @@ def _parse_segments(yaml_segments: list[dict]) -> list[BaseSegmentConfig]:
         seg_type = seg_dict["type"]
 
         if seg_type == "waypoint":
+            # Validate fields
+            expected = {"type", "name", "duration", "pose", "hand_coupling", "hand_orientation"}
+            _validate_segment_fields(seg_dict, expected, "waypoint")
+
             seg = WaypointSegmentConfig(
                 name=seg_dict["name"],
                 duration=seg_dict["duration"],
@@ -533,16 +557,25 @@ def _parse_segments(yaml_segments: list[dict]) -> list[BaseSegmentConfig]:
                 hand_orientation=seg_dict.get("hand_orientation"),  # Optional fixed orientation
             )
         elif seg_type == "helical":
+            # Validate fields
+            expected = {"type", "name", "duration", "axis", "angular_velocity", "translation", "hand_coupling", "hand_orientation"}
+            _validate_segment_fields(seg_dict, expected, "helical")
+
             seg = HelicalSegmentConfig(
                 name=seg_dict["name"],
                 duration=seg_dict["duration"],
                 axis=seg_dict["axis"],
-                rotation=seg_dict["rotation"],
+                angular_velocity=seg_dict["angular_velocity"],
                 translation=seg_dict["translation"],
                 hand_coupling=seg_dict.get("hand_coupling", "full"),  # Has default in dataclass
                 hand_orientation=seg_dict.get("hand_orientation"),  # Optional fixed orientation
             )
         elif seg_type == "random_waypoint":
+            # Validate fields
+            expected = {"type", "name", "count", "movement_duration", "pause_duration", "position_range",
+                       "vary_orientation", "max_rotation", "hand_coupling"}
+            _validate_segment_fields(seg_dict, expected, "random_waypoint")
+
             # Parse position_range if present
             pos_range = None
             if "position_range" in seg_dict:
