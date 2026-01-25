@@ -14,7 +14,7 @@ hand_trajectory:
     fixed_hand_roll: 0.0               # 180° roll - fingers pointing up (+Z)
     exclude_toward_robot: false         # Disable constraint to allow full 180° roll
     # Pre-grasp approach
-    approach_distance: 0.2   # 30cm pre-grasp distance
+    approach_distance: 0.15   # 30cm pre-grasp distance
     align_fraction: 0.7      # 70% of grasp phase to reach pre-grasp
 
   keypoints:
@@ -31,12 +31,12 @@ trajectory:
       type: "waypoint"
       # Pour position: above cup, tilted 90 degrees to pour
       pose: [-0.55, 0.12, 0.423, 0.707, -0.707, 0.0, 0.0]
-      duration: 2.5
+      duration: 4.5
 
     - name: "return"
       type: "waypoint"
       pose: null              # Computed: returns to start_poses
-      duration: 2.5
+      duration: 4.0
 
     - name: "release"
       type: "waypoint"
@@ -48,7 +48,7 @@ push_t:
   enabled: true
   object_usd: "assets/bottle/bottle.usd"
   outline_usd: "assets/cup/cup.usd"
-  object_scale: 0.8
+  object_scale: 0.75
   outline_position: [-0.55, 0.23]
   object_rotation: [1.0, 0.0, 0.0, 0.0]
   outline_rotation: [1.0, 0.0, 0.0, 0.0]

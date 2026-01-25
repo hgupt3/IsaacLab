@@ -18,7 +18,7 @@ observations:
 hand_trajectory:
   grasp_sampling:
     # Fixed direction grasp: approach from handle side
-    fixed_origin_offset: [0.0, 0, 0]           # Grasp at pan center
+    fixed_origin_offset: [0, 0, 0]           # Grasp at pan center
     fixed_direction: [0, 0, 1]          # Approach from +Y (handle side)
     fixed_hand_roll: 0.0               # 90° roll for handle grasp
     exclude_toward_robot: false         # Allow full range of motion

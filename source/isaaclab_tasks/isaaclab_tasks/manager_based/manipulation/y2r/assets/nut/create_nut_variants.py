@@ -36,34 +36,9 @@ def modify_mesh(
         modified[outer_mask, 0] *= radial_scale
         modified[outer_mask, 1] *= radial_scale
 
-    # Step 2: Chamfer inner hole at top AND bottom edges
+    # Step 2: Chamfer disabled (modifying bolt instead)
     chamfered_top = 0
     chamfered_bottom = 0
-
-    for i in np.where(inner_mask)[0]:
-        z = modified[i, 2]
-
-        # Distance from top or bottom edge
-        dist_from_top = z_max - z
-        dist_from_bottom = z - z_min
-
-        # Chamfer top edge
-        if dist_from_top < chamfer_depth:
-            t = dist_from_top / chamfer_depth
-            outward_factor = (1 - t) ** 2  # Quadratic easing
-            scale = 1.0 + (chamfer_expansion * outward_factor)
-            modified[i, 0] *= scale
-            modified[i, 1] *= scale
-            chamfered_top += 1
-
-        # Chamfer bottom edge (independent of top)
-        elif dist_from_bottom < chamfer_depth:
-            t = dist_from_bottom / chamfer_depth
-            outward_factor = (1 - t) ** 2  # Quadratic easing
-            scale = 1.0 + (chamfer_expansion * outward_factor)
-            modified[i, 0] *= scale
-            modified[i, 1] *= scale
-            chamfered_bottom += 1
 
     # Update mesh
     modified_usd = Vt.Vec3fArray([Gf.Vec3f(*p) for p in modified])
@@ -135,8 +110,9 @@ def create_nut_variant(
 def create_all_variants():
     """Create nut0 through nut5 with progressive thickening."""
 
-    input_usd = "/home/harsh/y2r/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/y2r/assets/nut/nut.usd"
-    output_dir = "/home/harsh/y2r/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/y2r/assets/nut"
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    input_usd = os.path.join(script_dir, "nut.usd")
+    output_dir = script_dir
 
     # Configuration
     variants = [
@@ -150,13 +126,13 @@ def create_all_variants():
     ]
 
     # Chamfer settings (same for all variants)
-    CHAMFER_DEPTH = 0.0015     # 1.5mm from top/bottom edges
+    CHAMFER_DEPTH = 0.0025     # 2.5mm from bottom edge
     CHAMFER_EXPANSION = 0.25   # 25% expansion (always relative to original)
 
     print("=" * 70)
     print("Creating Nut Variants with Inner Hole Chamfering")
     print("=" * 70)
-    print(f"Chamfer: {CHAMFER_EXPANSION*100:.0f}% expansion over {CHAMFER_DEPTH*1000:.1f}mm depth (top & bottom)")
+    print(f"Chamfer: {CHAMFER_EXPANSION*100:.0f}% expansion over {CHAMFER_DEPTH*1000:.1f}mm depth (bottom only, linear)")
     print(f"Modifying BOTH visual and collision meshes")
     print()
 
@@ -182,9 +158,9 @@ def create_all_variants():
         print(f"  {name:12s} - Outer: {outer_radius:.1f}mm, Inner chamfered: ~{inner_chamfer:.1f}mm at edges")
 
     print("\n⚠ IMPORTANT: Test in Isaac Sim to verify:")
-    print("  1. Inner hole chamfer creates smooth entry funnel (20% wider at edges)")
-    print("  2. Threading is not affected (chamfer depth: 1.5mm)")
-    print("  3. Bolt inserts more easily from both top and bottom")
+    print("  1. Inner hole chamfer creates entry funnel at bottom (25% wider at edge)")
+    print("  2. Threading is not affected (chamfer depth: 2.5mm)")
+    print("  3. Bolt inserts more easily from bottom")
     print("  4. Collision mesh matches visual mesh (both were modified)")
 
 

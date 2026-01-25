@@ -16,7 +16,8 @@ trajectory:
     - name: "goal"
       type: "waypoint"
       pose: null              # Computed: goal_poses (push_t will replan)
-      duration: 3.5
+      duration: 7.0
+      hand_coupling: "position_only"
 
     - name: "release"
       type: "waypoint"

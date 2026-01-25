@@ -16,8 +16,8 @@ trajectory:
     - name: "hover_high"
       type: "waypoint"
       # First hover position: higher above bolt
-      pose: [-0.65, 0.0, 0.36, 1.0, 0.0, 0.0, 0.0]
-      duration: 5.0
+      pose: [-0.65, 0.0, 0.38, 1.0, 0.0, 0.0, 0.0]
+      duration: 6.0
       hand_coupling: "position_only"
 
     - name: "hover_low"
@@ -65,8 +65,8 @@ hand_trajectory:
 push_t:
   enabled: true
   object_usd: "assets/nut/nut4.usd"       # Nut = object (manipulated)
-  outline_usd: "{ISAACLAB_NUCLEUS_DIR}/Factory/factory_bolt_m16.usd"     # Bolt = outline (fixed target)
-  object_scale: 1.5                                      # 2.5x scaled (M16: 2mm pitch → 5mm/rotation)
+  outline_usd: "assets/bolt/bolt_chamfered.usd"     # Bolt = chamfered local bolt (fixed target)
+  object_scale: 1.46                                      # 2.5x scaled (M16: 2mm pitch → 5mm/rotation)
   outline_position: [-0.65, 0.0]                         # Bolt fixed position on table
   object_rotation: [1.0, 0.0, 0.0, 0.0]                  # Nut orientation (identity)
   outline_rotation: [1.0, 0.0, 0.0, 0.0]                 # Bolt orientation (identity)
@@ -84,7 +84,7 @@ goal:
 randomization:
   object:
     scale: [1.5, 1.5]           # Fixed scale for nut
-    mass_scale: [0.16, 0.16]
+    mass_scale: [0.12, 0.12]
     static_friction: [1.0, 1.0]
     dynamic_friction: [1.0, 1.0]
   reset:
