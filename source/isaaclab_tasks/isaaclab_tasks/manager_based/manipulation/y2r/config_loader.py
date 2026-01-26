@@ -107,10 +107,16 @@ class ModeConfig:
 
 @dataclass
 class HistoryConfig:
+    # Teacher observations
     policy: int
     proprio: int
-    perception: int
+    object_pc: int
+    poses: int
     targets: int
+    # Student observations
+    student_pc: int
+    student_targets: int
+    student_camera: int
 
 
 @dataclass

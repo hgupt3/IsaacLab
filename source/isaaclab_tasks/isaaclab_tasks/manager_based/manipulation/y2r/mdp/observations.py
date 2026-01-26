@@ -1633,6 +1633,25 @@ def target_sequence_poses_b(
     return target_poses_b.reshape(N, -1)
 
 
+def trajectory_timing(
+    env: ManagerBasedRLEnv,
+) -> torch.Tensor:
+    """Current segment progress (0-1) within target interval.
+
+    Provides temporal context for the policy: where it should be in the
+    current target interval. Use with lookahead_tracking timing_aware mode.
+
+    0.0 = just reached current target (target[0])
+    ~1.0 = about to reach next target (target[1])
+
+    Must be called AFTER target_sequence_obs_b which initializes the trajectory manager.
+
+    Returns:
+        (num_envs, 1) tensor with segment progress in [0, 1).
+    """
+    return env.trajectory_manager.get_segment_progress().unsqueeze(-1)
+
+
 def hand_pose_targets_b(
     env: ManagerBasedRLEnv,
     ref_asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),

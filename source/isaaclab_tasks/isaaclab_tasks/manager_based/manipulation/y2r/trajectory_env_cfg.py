@@ -316,7 +316,7 @@ def _build_observations_cfg(cfg: Y2RConfig):
             self.concatenate_dim = 0
             self.concatenate_terms = True
             self.flatten_history_dim = True
-            self.history_length = cfg.observations.history.perception
+            self.history_length = cfg.observations.history.object_pc
 
     @configclass
     class CurrentPosesTeacherCfg(ObsGroup):
@@ -335,7 +335,7 @@ def _build_observations_cfg(cfg: Y2RConfig):
             self.concatenate_dim = 0
             self.concatenate_terms = True
             self.flatten_history_dim = True
-            self.history_length = cfg.observations.history.perception
+            self.history_length = cfg.observations.history.poses
 
     @configclass
     class FuturePCObsCfg(ObsGroup):
@@ -364,6 +364,9 @@ def _build_observations_cfg(cfg: Y2RConfig):
             func=mdp.hand_pose_targets_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),
         )
+        timing = ObsTerm(
+            func=mdp.trajectory_timing,
+        )
 
         def __post_init__(self):
             self.enable_corruption = True
@@ -387,7 +390,7 @@ def _build_observations_cfg(cfg: Y2RConfig):
             self.concatenate_dim = 0
             self.concatenate_terms = True
             self.flatten_history_dim = True
-            self.history_length = cfg.observations.history.perception
+            self.history_length = cfg.observations.history.poses
 
     @configclass
     class FuturePosesStudentCfg(ObsGroup):
@@ -395,6 +398,9 @@ def _build_observations_cfg(cfg: Y2RConfig):
         hand_pose_targets = ObsTerm(
             func=mdp.hand_pose_targets_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),
+        )
+        timing = ObsTerm(
+            func=mdp.trajectory_timing,
         )
 
         def __post_init__(self):
@@ -421,7 +427,7 @@ def _build_observations_cfg(cfg: Y2RConfig):
             self.concatenate_dim = 0
             self.concatenate_terms = True
             self.flatten_history_dim = True
-            self.history_length = 1
+            self.history_length = cfg.observations.history.student_pc
 
     @configclass
     class StudentFuturePCObsCfg(ObsGroup):
@@ -437,7 +443,7 @@ def _build_observations_cfg(cfg: Y2RConfig):
             self.concatenate_dim = 0
             self.concatenate_terms = True
             self.flatten_history_dim = True
-            self.history_length = 1
+            self.history_length = cfg.observations.history.student_targets
 
     @configclass
     class StudentCameraObsCfg(ObsGroup):
@@ -450,7 +456,7 @@ def _build_observations_cfg(cfg: Y2RConfig):
         def __post_init__(self):
             self.enable_corruption = False  # No noise on raw camera
             self.concatenate_terms = True
-            self.history_length = 1  # No history for camera
+            self.history_length = cfg.observations.history.student_camera
 
     @configclass
     class ObservationsCfg:
@@ -701,6 +707,7 @@ def _build_rewards_cfg(cfg: Y2RConfig):
             params={
                 "phases": cfg.rewards.lookahead_tracking.params.get("phases"),
                 "path_mode": cfg.rewards.lookahead_tracking.params.get("path_mode"),
+                "timing_aware": cfg.rewards.lookahead_tracking.params.get("timing_aware"),
                 "use_hand_pose_gate": cfg.rewards.lookahead_tracking.params.get("use_hand_pose_gate"),
                 "use_contact_gating": cfg.rewards.lookahead_tracking.params.get("use_contact_gating"),
                 "std": cfg.rewards.lookahead_tracking.params["std"],

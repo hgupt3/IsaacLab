@@ -10,11 +10,11 @@
 # 
 # Inputs:
 #   - Wrist camera depth (64x64) → SmallResNet → 128-dim features
-#   - Visible point clouds (student_perception, student_targets)
+#   - Visible point clouds (student_current_pc, student_future_pc)
 #   - Proprioceptive observations (joint pos, vel, tips)
 #
 # Teacher uses: perception, targets (privileged full point clouds)
-# Student uses: student_perception, student_targets (visible point clouds only)
+# Student uses: student_current_pc, student_future_pc (visible point clouds only)
 #
 # Depth is packed into obs (appended at end) so standard train.py works.
 # The model slices depth from obs tail, applies optional DepthAug, and encodes.
@@ -30,8 +30,8 @@ params:
     
     # Observation groups for student policy
     obs_groups:
-      obs: ["policy", "proprio", "student_perception", "student_targets", "student_camera"]
-      states: ["policy", "proprio", "perception", "targets"]  # Teacher obs (privileged for asymmetric critic)
+      obs: ["policy", "proprio", "student_current_poses", "student_future_poses", "student_current_pc", "student_future_pc", "student_camera"]
+      states: ["policy", "proprio", "current_poses", "future_poses", "current_pc", "future_pc"]  
     concate_obs_groups: True
 
   algo:

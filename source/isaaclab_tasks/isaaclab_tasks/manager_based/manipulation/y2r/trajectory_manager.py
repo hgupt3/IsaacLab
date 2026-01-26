@@ -623,6 +623,17 @@ class TrajectoryManager:
         batch_idx = torch.arange(self.num_envs, device=self.device)
         return self.trajectory[batch_idx, self.current_idx]
 
+    def get_segment_progress(self) -> torch.Tensor:
+        """Get progress within current target interval [0, 1).
+
+        0.0 = just reached current target (target[0])
+        ~1.0 = about to reach next target (target[1])
+
+        Returns:
+            (num_envs,) tensor with values in [0, 1).
+        """
+        return (self.phase_time / self.target_dt) % 1.0
+
     def _sample_goal(self, env_ids: torch.Tensor, env_origins: torch.Tensor, start_poses: torch.Tensor):
         """Sample goal pose (on table).
         

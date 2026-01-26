@@ -12,7 +12,7 @@
 simulation:
   physics_dt: 0.01              # 1/100 seconds (100 Hz physics)
   decimation: 2                 # Control at 60 Hz (physics_dt * decimation)
-  num_envs: 16384
+  num_envs: 12288
   env_spacing: 3.0
   replicate_physics: false
 
@@ -49,10 +49,16 @@ observations:
 
   # History lengths for observation groups
   history:
+    # Teacher observations
     policy: 5                   # Action history
     proprio: 5                  # Joint pos/vel, hand tips, contact
-    perception: 5               # Object point cloud and pose history
+    object_pc: 1                # Object point cloud (high-dim, can be smaller)
+    poses: 5                    # Object + hand poses (kept linked)
     targets: 1                  # No history (targets already encode future)
+    # Student observations (when use_student_mode: true)
+    student_pc: 1               # Visible point cloud from pseudo-camera
+    student_targets: 1          # Visible target sequence
+    student_camera: 1           # Wrist depth camera
 
 # ==============================================================================
 # TRAJECTORY TIMING
@@ -61,7 +67,7 @@ observations:
 # TRAJECTORY (segment-based system)
 # ==============================================================================
 trajectory:
-  target_hz: 5                 # Target update rate
+  target_hz: 10                 # Target update rate
   window_size: 5                # Number of lookahead targets in observation
   easing_power: 1.5             # Ease curves for waypoint segments
   release_ease_power: 1.5       # Ease-in power for retreat (2.0 = quadratic, slow start)
@@ -218,6 +224,7 @@ rewards:
     params:
       phases: [grasp, manipulation]    # Active in manipulation phase
       path_mode: true              # Enable path segment tracking (true = smooth motion, false = discrete waypoints)
+      timing_aware: true           # Use temporal interpolation (where should object be NOW based on time)
       use_hand_pose_gate: true     # Apply hand pose gate from hand_pose_following
       use_contact_gating: true     # Enable/disable contact gating
       std: 0.03                    # Position/point cloud error std for positive reward
@@ -336,11 +343,11 @@ rewards:
       gate_in_grasp: true         # Gate during grasp phase
       gate_in_manipulation: true  # Gate during manipulation phase
       gate_in_release: true       # Gate during release phase
-      gate_pos_threshold: [0.04, 0.08]        # Position: [start dropping, reach minimum]
-      gate_rot_threshold: [0.6, 1.2]          # Rotation: [start dropping, reach minimum]
+      gate_pos_threshold: [0.04, 0.06]        # Position: [start dropping, reach minimum]
+      gate_rot_threshold: [0.4, 0.6]          # Rotation: [start dropping, reach minimum]
       # Manipulation-specific overrides (null = use default thresholds above)
-      manipulation_gate_pos_threshold: [0.06, 0.12]  # Looser position thresholds for manipulation
-      manipulation_gate_rot_threshold: [1.0, 2.0]    # Looser rotation thresholds for manipulation
+      manipulation_gate_pos_threshold: [0.04, 0.12]  # Looser position thresholds for manipulation
+      manipulation_gate_rot_threshold: [0.4, 1.2]    # Looser rotation thresholds for manipulation
       gate_floor: 0.05                        # Minimum gate value (prevents complete reward collapse)
   
   # Finger release reward - incentivizes opening hand during release phase
@@ -373,12 +380,12 @@ rewards:
 # Thresholds use [initial, final] format - curriculum interpolates between
 terminations:
   trajectory_deviation:
-    position_threshold: [0.4, 0.1] #[0.25, 0.05]        # meters - spatial error (pos in pose mode, mean PC distance in PC mode)
-    rotation_threshold: [3.0, 1.2] #[2.5, 0.5]          # radians (pose mode only) ~143° → ~29°
+    position_threshold: [0.2, 0.1]      # meters - spatial error (pos in pose mode, mean PC distance in PC mode)
+    rotation_threshold: [2.5, 1.2]      # radians (pose mode only) ~143° → ~29°
   
   hand_pose_deviation:
-    position_threshold: [0.4, 0.25]        # meters (lenient → strict)
-    rotation_threshold: [3.14, 3.14]          # radians ~180° → ~180°
+    position_threshold: [0.3, 0.15]        # meters (lenient → strict)
+    rotation_threshold: [3.14, 2.5]          # radians ~180° → ~180°
 
 # ==============================================================================
 # CURRICULUM (Adaptive Domain Randomization)

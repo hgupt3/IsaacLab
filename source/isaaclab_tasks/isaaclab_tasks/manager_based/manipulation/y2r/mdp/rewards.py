@@ -68,13 +68,19 @@ def _batched_slerp(
 
 def _compute_path_segment_errors_pose(
     env: ManagerBasedRLEnv,
+    use_temporal: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """FULLY VECTORIZED: Compute errors to current path segment (target[0]→target[1]).
 
     For each environment:
-    1. Projects object position onto line segment target[0]→target[1]
-    2. Interpolates rotation at projection parameter using SLERP
+    1. Gets interpolation parameter t (spatial projection or temporal progress)
+    2. Interpolates rotation at parameter using SLERP
     3. Computes position and rotation errors to interpolated pose
+
+    Args:
+        env: The environment.
+        use_temporal: If True, use time-based interpolation (segment progress).
+                      If False, use spatial projection onto segment.
 
     Returns:
         pos_error: (N,) position errors in meters
@@ -94,17 +100,23 @@ def _compute_path_segment_errors_pose(
     q0 = targets[:, 0, 3:7]  # (N, 4)
     q1 = targets[:, 1, 3:7]  # (N, 4)
 
-    # Project object position onto segment [p0, p1]
-    v = p1 - p0  # (N, 3)
-    v_len_sq = (v ** 2).sum(dim=-1, keepdim=True).clamp(min=1e-8)  # (N, 1)
-    t = ((obj_pos - p0) * v).sum(dim=-1, keepdim=True) / v_len_sq  # (N, 1)
-    t = t.clamp(0.0, 1.0).squeeze(-1)  # (N,) - parameter along segment
+    # Get interpolation parameter t
+    if use_temporal:
+        # Time-based: where should object be NOW based on elapsed time
+        t = tm.get_segment_progress()  # (N,) in [0, 1)
+    else:
+        # Spatial projection: closest point on segment to object
+        v = p1 - p0  # (N, 3)
+        v_len_sq = (v ** 2).sum(dim=-1, keepdim=True).clamp(min=1e-8)  # (N, 1)
+        t = ((obj_pos - p0) * v).sum(dim=-1, keepdim=True) / v_len_sq  # (N, 1)
+        t = t.clamp(0.0, 1.0).squeeze(-1)  # (N,) - parameter along segment
 
-    # Closest point on segment
-    closest_pos = p0 + t.unsqueeze(-1) * v  # (N, 3)
+    # Target position at parameter t
+    v = p1 - p0  # (N, 3)
+    target_pos = p0 + t.unsqueeze(-1) * v  # (N, 3)
 
     # Position error
-    pos_error = (obj_pos - closest_pos).norm(dim=-1)  # (N,)
+    pos_error = (obj_pos - target_pos).norm(dim=-1)  # (N,)
 
     # Interpolate rotation using SLERP
     interp_quat = _batched_slerp(q0, q1, t)  # (N, 4)
@@ -117,14 +129,20 @@ def _compute_path_segment_errors_pose(
 
 def _compute_path_segment_errors_pc(
     env: ManagerBasedRLEnv,
+    use_temporal: bool = False,
 ) -> torch.Tensor:
     """FULLY VECTORIZED: Point cloud errors to current path segment.
 
     Strategy:
-    1. Projects object CENTER onto position segment to get parameter t
+    1. Gets interpolation parameter t (spatial projection or temporal progress)
     2. Interpolates target pose (position + rotation) at parameter t
     3. Generates target point cloud at interpolated pose
     4. Computes mean point-to-point distance
+
+    Args:
+        env: The environment.
+        use_temporal: If True, use time-based interpolation (segment progress).
+                      If False, use spatial projection onto segment.
 
     Returns:
         mean_error: (N,) mean point distances
@@ -159,11 +177,16 @@ def _compute_path_segment_errors_pc(
     q0 = targets[:, 0, 3:7]  # (N, 4)
     q1 = targets[:, 1, 3:7]  # (N, 4)
 
-    # Project object center onto segment
+    # Get interpolation parameter t
     v = p1 - p0  # (N, 3)
-    v_len_sq = (v ** 2).sum(dim=-1, keepdim=True).clamp(min=1e-8)  # (N, 1)
-    t = ((obj_pos - p0) * v).sum(dim=-1, keepdim=True) / v_len_sq  # (N, 1)
-    t = t.clamp(0.0, 1.0).squeeze(-1)  # (N,)
+    if use_temporal:
+        # Time-based: where should object be NOW based on elapsed time
+        t = tm.get_segment_progress()  # (N,) in [0, 1)
+    else:
+        # Spatial projection: closest point on segment to object center
+        v_len_sq = (v ** 2).sum(dim=-1, keepdim=True).clamp(min=1e-8)  # (N, 1)
+        t = ((obj_pos - p0) * v).sum(dim=-1, keepdim=True) / v_len_sq  # (N, 1)
+        t = t.clamp(0.0, 1.0).squeeze(-1)  # (N,)
 
     # Interpolated pose at parameter t
     interp_pos = p0 + t.unsqueeze(-1) * v  # (N, 3)
@@ -570,6 +593,7 @@ def lookahead_tracking(
     std: float = 0.1,
     decay: float = 0.5,
     path_mode: bool = False,
+    timing_aware: bool = True,
     phases: list[str] | None = None,
     use_hand_pose_gate: bool = True,
     use_contact_gating: bool = True,
@@ -589,6 +613,13 @@ def lookahead_tracking(
     Supports two tracking strategies:
     - Waypoint mode (path_mode=False): Rewards proximity to discrete waypoints with decay
     - Path mode (path_mode=True): Rewards staying on current path segment (target[0]→target[1])
+
+    With timing_aware=True (default), path mode uses temporal interpolation:
+    - Object should be at position t along segment where t = segment_progress (time-based)
+    - Rewards being at the correct position FOR THE CURRENT TIME
+
+    With timing_aware=False, path mode uses spatial projection:
+    - Closest point on segment (ignores timing)
 
     And two error computation modes:
     - Point cloud mode: Uses _cached_mean_errors (point-to-point distance)
@@ -636,7 +667,7 @@ def lookahead_tracking(
         # ===== PATH MODE: Reward staying on current segment =====
         if not use_point_cloud:
             # Pose mode: compute errors to path segment
-            pos_error, rot_error = _compute_path_segment_errors_pose(env)  # (N,), (N,)
+            pos_error, rot_error = _compute_path_segment_errors_pose(env, use_temporal=timing_aware)  # (N,), (N,)
 
             # Positive reward: exp kernel (peaks at 1.0 when error=0)
             pos_pos_reward = torch.exp(-pos_error / std)
@@ -660,7 +691,7 @@ def lookahead_tracking(
             reward = pos_reward - neg_scale * combined_neg_penalty
         else:
             # Point cloud mode: compute errors to path segment
-            mean_error = _compute_path_segment_errors_pc(env)  # (N,)
+            mean_error = _compute_path_segment_errors_pc(env, use_temporal=timing_aware)  # (N,)
 
             # Positive reward: exp kernel
             pos_reward = torch.exp(-mean_error / std)

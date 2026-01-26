@@ -464,9 +464,9 @@ class PointTransformerBuilder(A2CBuilder):
         # Inject observation params into network params
         params['num_points'] = y2r_cfg.observations.num_points
 
-        # Calculate num_timesteps: current history + future trajectory
-        num_current = y2r_cfg.observations.history.perception
-        num_future = y2r_cfg.trajectory.window_size
+        # Calculate num_timesteps: current history + future trajectory history
+        num_current = y2r_cfg.observations.history.object_pc
+        num_future = y2r_cfg.trajectory.window_size * y2r_cfg.observations.history.targets
         params['num_timesteps'] = num_current + num_future
 
     def load(self, params):
@@ -524,10 +524,11 @@ class PointNetTNetBuilder(A2CBuilder):
                     f"({self.point_cloud_dim}). Check num_points and num_timesteps."
                 )
 
-            self.tnet1 = PointNetTNet(30, hidden_dim=16)
+            point_dim = self.num_timesteps * 3
+            self.tnet1 = PointNetTNet(point_dim, hidden_dim=16)
             self.tnet2 = PointNetTNet(32, hidden_dim=16)
             self.mlp1 = nn.Sequential(
-                nn.Linear(30, 32),
+                nn.Linear(point_dim, 32),
                 nn.ELU(),
             )
             self.mlp2 = nn.Sequential(
@@ -590,7 +591,7 @@ class PointNetTNetBuilder(A2CBuilder):
             B = obs.shape[0]
             point_obs, proprio_obs = self._split_obs(obs)
 
-            point_feat = point_obs.reshape(B, self.num_points, -1)  # (B, P, 30)
+            point_feat = point_obs.reshape(B, self.num_points, -1)  # (B, P, num_timesteps * 3)
             trans1 = self.tnet1(point_feat)
             point_feat = torch.bmm(point_feat, trans1)
 
@@ -624,8 +625,8 @@ class PointNetTNetBuilder(A2CBuilder):
         mode = os.getenv("Y2R_MODE")
         y2r_cfg = get_config(mode)
         params["num_points"] = y2r_cfg.observations.num_points
-        num_current = y2r_cfg.observations.history.perception
-        num_future = y2r_cfg.trajectory.window_size
+        num_current = y2r_cfg.observations.history.object_pc
+        num_future = y2r_cfg.trajectory.window_size * y2r_cfg.observations.history.targets
         params["num_timesteps"] = num_current + num_future
 
     def load(self, params):
