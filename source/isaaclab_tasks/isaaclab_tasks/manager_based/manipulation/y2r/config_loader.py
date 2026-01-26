@@ -329,11 +329,14 @@ class AdvancementTolerancesConfig:
 class NoiseConfig:
     joint_pos: tuple[float, float]
     joint_vel: tuple[float, float]
+    hand_eigen: tuple[float, float]
     hand_tips: tuple[float, float]
     object_point_cloud: tuple[float, float]
     object_pose: tuple[float, float]
+    hand_pose: tuple[float, float]
     target_point_clouds: tuple[float, float]
     target_poses: tuple[float, float]
+    hand_pose_targets: tuple[float, float]
 
 
 @dataclass

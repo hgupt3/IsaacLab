@@ -12,7 +12,7 @@
 simulation:
   physics_dt: 0.01              # 1/100 seconds (100 Hz physics)
   decimation: 2                 # Control at 60 Hz (physics_dt * decimation)
-  num_envs: 15360
+  num_envs: 16384
   env_spacing: 3.0
   replicate_physics: false
 
@@ -217,21 +217,22 @@ rewards:
     weight: 6.0
     params:
       phases: [grasp, manipulation]    # Active in manipulation phase
-      use_hand_pose_gate: true         # Apply hand pose gate from hand_pose_following
-      use_contact_gating: true         # Enable/disable contact gating
-      std: 0.03                   # Position/point cloud error std for positive reward
-      rot_std: 0.5                # Rotation error std (pose mode only) 
-      decay: 0.1                  # Exponential decay for lookahead weights
+      path_mode: true              # Enable path segment tracking (true = smooth motion, false = discrete waypoints)
+      use_hand_pose_gate: true     # Apply hand pose gate from hand_pose_following
+      use_contact_gating: true     # Enable/disable contact gating
+      std: 0.03                    # Position/point cloud error std for positive reward
+      rot_std: 0.5                 # Rotation error std (pose mode only)
+      decay: 0.1                   # Exponential decay for lookahead weights (ignored in path_mode)
       # Soft contact gating: scales tracking reward but never hard-zeros it.
-      contact_threshold: 1.0      # Force threshold for contact detection (N)
-      contact_ramp: 1.0           # Newtons; contact_factor ramps from 0→1 over this range
-      contact_min_factor: 0.05    # lower bound so reward doesn't fully collapse
+      contact_threshold: 1.0       # Force threshold for contact detection (N)
+      contact_ramp: 1.0            # Newtons; contact_factor ramps from 0→1 over this range
+      contact_min_factor: 0.05     # lower bound so reward doesn't fully collapse
       # Negative penalty zones (activates when error > threshold):
-      neg_scale: 0.1              # Max penalty magnitude (0.5 = can go to -0.5)
-      neg_threshold: 0.04         # Position error > 8cm triggers penalty
-      neg_std: 0.1                # How fast position penalty grows
-      rot_neg_threshold: 0.5      # Rotation error > 0.6 rad (~34°) triggers penalty
-      rot_neg_std: 1.0            # How fast rotation penalty grows
+      neg_scale: 0.1               # Max penalty magnitude (0.5 = can go to -0.5)
+      neg_threshold: 0.04          # Position error > 8cm triggers penalty
+      neg_std: 0.1                 # How fast position penalty grows
+      rot_neg_threshold: 0.5       # Rotation error > 0.6 rad (~34°) triggers penalty
+      rot_neg_std: 1.0             # How fast rotation penalty grows
     
   trajectory_success:
     weight: 10.0
@@ -384,13 +385,13 @@ terminations:
 # ==============================================================================
 curriculum:
   difficulty:
-    initial: 5                  # Starting difficulty
-    min: 5
+    initial: 0                  # Starting difficulty
+    min: 0
     max: 10
     
   # Step-based scheduler (set step_interval to null to disable)
-  scheduler:
-    step_interval: 90000       # Floor increases every 100k steps → max difficulty at 1M steps
+  scheduler: 
+    step_interval: 100000       # Floor increases every 100k steps → max difficulty at 1M steps
     use_performance: true       # Performance can still advance faster than floor
     
   # Tolerances to advance difficulty level
@@ -404,11 +405,14 @@ curriculum:
   noise:
     joint_pos: [0.0, 0.1]
     joint_vel: [0.0, 0.2]
+    hand_eigen: [0.0, 0.01]
     hand_tips: [0.0, 0.01]
     object_point_cloud: [0.0, 0.01]
     object_pose: [0.0, 0.01]
+    hand_pose: [0.0, 0.01]
     target_point_clouds: [0.0, 0.01]
     target_poses: [0.0, 0.01]
+    hand_pose_targets: [0.0, 0.01]
     
   # Gravity scheduling (m/s²)
   gravity:

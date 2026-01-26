@@ -297,9 +297,11 @@ def _build_observations_cfg(cfg: Y2RConfig):
             self.concatenate_terms = True
             self.history_length = cfg.observations.history.proprio
 
+    # ========== TEACHER GROUPS: Separated PC and Poses ==========
+
     @configclass
-    class PerceptionObsCfg(ObsGroup):
-        """Perception observations: current object point cloud and pose with history."""
+    class CurrentPCObsCfg(ObsGroup):
+        """Current object point cloud with history."""
         object_point_cloud = ObsTerm(
             func=mdp.object_point_cloud_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),
@@ -308,8 +310,23 @@ def _build_observations_cfg(cfg: Y2RConfig):
                 "flatten": True,
             },
         )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_dim = 0
+            self.concatenate_terms = True
+            self.flatten_history_dim = True
+            self.history_length = cfg.observations.history.perception
+
+    @configclass
+    class CurrentPosesTeacherCfg(ObsGroup):
+        """Current poses: object + hand (teacher sees both)."""
         object_pose = ObsTerm(
             func=mdp.object_pose_b,
+            noise=Unoise(n_min=-0.0, n_max=0.0),
+        )
+        hand_pose = ObsTerm(
+            func=mdp.hand_pose_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),
         )
 
@@ -319,15 +336,26 @@ def _build_observations_cfg(cfg: Y2RConfig):
             self.concatenate_terms = True
             self.flatten_history_dim = True
             self.history_length = cfg.observations.history.perception
-    
+
     @configclass
-    class TargetObsCfg(ObsGroup):
-        """Target observations: point clouds AND poses from trajectory."""
+    class FuturePCObsCfg(ObsGroup):
+        """Future point cloud trajectory targets."""
         target_point_clouds = ObsTerm(
             func=mdp.target_sequence_obs_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),
             params={},
         )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_dim = 0
+            self.concatenate_terms = True
+            self.flatten_history_dim = True
+            self.history_length = cfg.observations.history.targets
+
+    @configclass
+    class FuturePosesTeacherCfg(ObsGroup):
+        """Future poses: object + hand targets (teacher sees both)."""
         target_poses = ObsTerm(
             func=mdp.target_sequence_poses_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),
@@ -344,9 +372,41 @@ def _build_observations_cfg(cfg: Y2RConfig):
             self.flatten_history_dim = True
             self.history_length = cfg.observations.history.targets
 
+    # ========== STUDENT-SPECIFIC GROUPS ==========
+
     @configclass
-    class StudentPerceptionObsCfg(ObsGroup):
-        """Student perception: visible-only object point cloud from pseudo-camera viewpoint."""
+    class CurrentPosesStudentCfg(ObsGroup):
+        """Current poses: hand ONLY (student can't see object pose perfectly)."""
+        hand_pose = ObsTerm(
+            func=mdp.hand_pose_b,
+            noise=Unoise(n_min=-0.0, n_max=0.0),
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_dim = 0
+            self.concatenate_terms = True
+            self.flatten_history_dim = True
+            self.history_length = cfg.observations.history.perception
+
+    @configclass
+    class FuturePosesStudentCfg(ObsGroup):
+        """Future poses: hand targets ONLY (student can't see object targets perfectly)."""
+        hand_pose_targets = ObsTerm(
+            func=mdp.hand_pose_targets_b,
+            noise=Unoise(n_min=-0.0, n_max=0.0),
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_dim = 0
+            self.concatenate_terms = True
+            self.flatten_history_dim = True
+            self.history_length = cfg.observations.history.targets
+
+    @configclass
+    class StudentCurrentPCObsCfg(ObsGroup):
+        """Student visible point cloud from pseudo-camera."""
         visible_point_cloud = ObsTerm(
             func=mdp.visible_object_point_cloud_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),
@@ -364,16 +424,12 @@ def _build_observations_cfg(cfg: Y2RConfig):
             self.history_length = 1
 
     @configclass
-    class StudentTargetObsCfg(ObsGroup):
-        """Student targets: visible point clouds through target trajectory."""
+    class StudentFuturePCObsCfg(ObsGroup):
+        """Student visible target sequence."""
         visible_target_sequence = ObsTerm(
             func=mdp.visible_target_sequence_obs_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),
             params={},
-        )
-        hand_pose_targets = ObsTerm(
-            func=mdp.hand_pose_targets_b,
-            noise=Unoise(n_min=-0.0, n_max=0.0),
         )
 
         def __post_init__(self):
@@ -381,7 +437,7 @@ def _build_observations_cfg(cfg: Y2RConfig):
             self.concatenate_dim = 0
             self.concatenate_terms = True
             self.flatten_history_dim = True
-            self.history_length = cfg.observations.history.targets
+            self.history_length = 1
 
     @configclass
     class StudentCameraObsCfg(ObsGroup):
@@ -399,21 +455,35 @@ def _build_observations_cfg(cfg: Y2RConfig):
     @configclass
     class ObservationsCfg:
         """Observation specifications for the MDP."""
+        # Shared groups
         policy: PolicyCfg = PolicyCfg()
         proprio: ProprioObsCfg = ProprioObsCfg()
-        perception: PerceptionObsCfg = PerceptionObsCfg()
-        targets: TargetObsCfg = TargetObsCfg()
-        # Student groups (only when mode.use_student_mode is True)
-        student_perception: StudentPerceptionObsCfg | None = None
-        student_targets: StudentTargetObsCfg | None = None
+
+        # Teacher groups (always present)
+        current_pc: CurrentPCObsCfg = CurrentPCObsCfg()
+        current_poses: CurrentPosesTeacherCfg = CurrentPosesTeacherCfg()
+        future_pc: FuturePCObsCfg = FuturePCObsCfg()
+        future_poses: FuturePosesTeacherCfg = FuturePosesTeacherCfg()
+
+        # Student groups (only when student mode enabled)
+        student_current_pc: StudentCurrentPCObsCfg | None = None
+        student_current_poses: CurrentPosesStudentCfg | None = None
+        student_future_pc: StudentFuturePCObsCfg | None = None
+        student_future_poses: FuturePosesStudentCfg | None = None
         student_camera: StudentCameraObsCfg | None = None
 
     obs_cfg = ObservationsCfg()
+
+    # Add student groups if in student mode
     if cfg.mode.use_student_mode:
-        obs_cfg.student_perception = StudentPerceptionObsCfg()
-        obs_cfg.student_targets = StudentTargetObsCfg()
+        obs_cfg.student_current_pc = StudentCurrentPCObsCfg()
+        obs_cfg.student_current_poses = CurrentPosesStudentCfg()
+        obs_cfg.student_future_pc = StudentFuturePCObsCfg()
+        obs_cfg.student_future_poses = FuturePosesStudentCfg()
+
     if cfg.wrist_camera.enabled:
         obs_cfg.student_camera = StudentCameraObsCfg()
+
     return obs_cfg
 
 
@@ -630,6 +700,7 @@ def _build_rewards_cfg(cfg: Y2RConfig):
             weight=cfg.rewards.lookahead_tracking.weight,
             params={
                 "phases": cfg.rewards.lookahead_tracking.params.get("phases"),
+                "path_mode": cfg.rewards.lookahead_tracking.params.get("path_mode"),
                 "use_hand_pose_gate": cfg.rewards.lookahead_tracking.params.get("use_hand_pose_gate"),
                 "use_contact_gating": cfg.rewards.lookahead_tracking.params.get("use_contact_gating"),
                 "std": cfg.rewards.lookahead_tracking.params["std"],

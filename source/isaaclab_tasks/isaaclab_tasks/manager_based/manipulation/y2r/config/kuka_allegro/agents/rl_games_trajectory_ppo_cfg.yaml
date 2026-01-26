@@ -11,8 +11,8 @@ params:
     clip_observations: 100.0
     clip_actions: 100.0
     obs_groups:
-      obs: ["policy", "proprio", "perception", "targets"]
-      states: ["policy", "proprio", "perception", "targets"]
+      obs: ["policy", "proprio", "current_pc", "current_poses", "future_pc", "future_poses"]
+      states: ["policy", "proprio", "current_pc", "current_poses", "future_pc", "future_poses"]
     concate_obs_groups: True
 
   algo:

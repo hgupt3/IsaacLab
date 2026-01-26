@@ -40,6 +40,7 @@ gym.register(
         "rl_games_teacher_cfg_entry_point": f"{agents.__name__}:rl_games_trajectory_ppo_cfg.yaml",
         # Other frameworks
         "rl_games_point_transformer_cfg_entry_point": f"{agents.__name__}:rl_games_point_transformer_cfg.yaml",
+        "rl_games_pointnet_tnet_cfg_entry_point": f"{agents.__name__}:rl_games_pointnet_tnet_cfg.yaml",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Y2RKukaAllegroPPORunnerCfg",
     },
 )

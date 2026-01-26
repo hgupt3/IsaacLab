@@ -10,16 +10,17 @@ Import this module before creating the rl_games Runner to enable custom networks
 
 from rl_games.algos_torch.model_builder import register_network
 
-from .point_transformer import PointTransformerBuilder
+from .point_transformer import PointTransformerBuilder, PointNetTNetBuilder
 from .depth_resnet_student import DepthResNetStudentBuilder
 
 # Register Point-Transformer network with rl_games
 # This allows YAML config to use: network.name: point_transformer
 register_network('point_transformer', PointTransformerBuilder)
+register_network('pointnet_tnet', PointNetTNetBuilder)
 
 # Register Depth ResNet Student network for distillation
 # This allows YAML config to use: network.name: depth_resnet_student
 register_network('depth_resnet_student', DepthResNetStudentBuilder)
 
-__all__ = ["PointTransformerBuilder", "DepthResNetStudentBuilder"]
+__all__ = ["PointTransformerBuilder", "PointNetTNetBuilder", "DepthResNetStudentBuilder"]
 

@@ -196,10 +196,36 @@ def build_curriculum_cfg(cfg: Y2RConfig):
             },
         )
 
+        hand_eigen_unoise_min_adr = CurrTerm(
+            func=mdp.modify_term_cfg,
+            params={
+                "address": "observations.proprio.hand_eigen.noise.n_min",
+                "modify_fn": mdp.initial_final_interpolate_fn,
+                "modify_params": {
+                    "initial_value": 0.0,
+                    "final_value": -cfg.curriculum.noise.hand_eigen[1],
+                    "difficulty_term_str": "adr",
+                },
+            },
+        )
+
+        hand_eigen_unoise_max_adr = CurrTerm(
+            func=mdp.modify_term_cfg,
+            params={
+                "address": "observations.proprio.hand_eigen.noise.n_max",
+                "modify_fn": mdp.initial_final_interpolate_fn,
+                "modify_params": {
+                    "initial_value": 0.0,
+                    "final_value": cfg.curriculum.noise.hand_eigen[1],
+                    "difficulty_term_str": "adr",
+                },
+            },
+        )
+
         object_obs_unoise_min_adr = CurrTerm(
             func=mdp.modify_term_cfg,
             params={
-                "address": "observations.perception.object_point_cloud.noise.n_min",
+                "address": "observations.current_pc.object_point_cloud.noise.n_min",
                 "modify_fn": mdp.initial_final_interpolate_fn,
                 "modify_params": {
                     "initial_value": 0.0,
@@ -212,7 +238,7 @@ def build_curriculum_cfg(cfg: Y2RConfig):
         object_obs_unoise_max_adr = CurrTerm(
             func=mdp.modify_term_cfg,
             params={
-                "address": "observations.perception.object_point_cloud.noise.n_max",
+                "address": "observations.current_pc.object_point_cloud.noise.n_max",
                 "modify_fn": mdp.initial_final_interpolate_fn,
                 "modify_params": {
                     "initial_value": 0.0,
@@ -225,7 +251,7 @@ def build_curriculum_cfg(cfg: Y2RConfig):
         target_obs_unoise_min_adr = CurrTerm(
             func=mdp.modify_term_cfg,
             params={
-                "address": "observations.targets.target_point_clouds.noise.n_min",
+                "address": "observations.future_pc.target_point_clouds.noise.n_min",
                 "modify_fn": mdp.initial_final_interpolate_fn,
                 "modify_params": {
                     "initial_value": 0.0,
@@ -238,7 +264,7 @@ def build_curriculum_cfg(cfg: Y2RConfig):
         target_obs_unoise_max_adr = CurrTerm(
             func=mdp.modify_term_cfg,
             params={
-                "address": "observations.targets.target_point_clouds.noise.n_max",
+                "address": "observations.future_pc.target_point_clouds.noise.n_max",
                 "modify_fn": mdp.initial_final_interpolate_fn,
                 "modify_params": {
                     "initial_value": 0.0,
@@ -251,7 +277,7 @@ def build_curriculum_cfg(cfg: Y2RConfig):
         object_pose_unoise_min_adr = CurrTerm(
             func=mdp.modify_term_cfg,
             params={
-                "address": "observations.perception.object_pose.noise.n_min",
+                "address": "observations.current_poses.object_pose.noise.n_min",
                 "modify_fn": mdp.initial_final_interpolate_fn,
                 "modify_params": {
                     "initial_value": 0.0,
@@ -264,7 +290,7 @@ def build_curriculum_cfg(cfg: Y2RConfig):
         object_pose_unoise_max_adr = CurrTerm(
             func=mdp.modify_term_cfg,
             params={
-                "address": "observations.perception.object_pose.noise.n_max",
+                "address": "observations.current_poses.object_pose.noise.n_max",
                 "modify_fn": mdp.initial_final_interpolate_fn,
                 "modify_params": {
                     "initial_value": 0.0,
@@ -274,10 +300,36 @@ def build_curriculum_cfg(cfg: Y2RConfig):
             },
         )
 
+        hand_pose_unoise_min_adr = CurrTerm(
+            func=mdp.modify_term_cfg,
+            params={
+                "address": "observations.current_poses.hand_pose.noise.n_min",
+                "modify_fn": mdp.initial_final_interpolate_fn,
+                "modify_params": {
+                    "initial_value": 0.0,
+                    "final_value": -cfg.curriculum.noise.hand_pose[1],
+                    "difficulty_term_str": "adr",
+                },
+            },
+        )
+
+        hand_pose_unoise_max_adr = CurrTerm(
+            func=mdp.modify_term_cfg,
+            params={
+                "address": "observations.current_poses.hand_pose.noise.n_max",
+                "modify_fn": mdp.initial_final_interpolate_fn,
+                "modify_params": {
+                    "initial_value": 0.0,
+                    "final_value": cfg.curriculum.noise.hand_pose[1],
+                    "difficulty_term_str": "adr",
+                },
+            },
+        )
+
         target_poses_unoise_min_adr = CurrTerm(
             func=mdp.modify_term_cfg,
             params={
-                "address": "observations.targets.target_poses.noise.n_min",
+                "address": "observations.future_poses.target_poses.noise.n_min",
                 "modify_fn": mdp.initial_final_interpolate_fn,
                 "modify_params": {
                     "initial_value": 0.0,
@@ -290,11 +342,37 @@ def build_curriculum_cfg(cfg: Y2RConfig):
         target_poses_unoise_max_adr = CurrTerm(
             func=mdp.modify_term_cfg,
             params={
-                "address": "observations.targets.target_poses.noise.n_max",
+                "address": "observations.future_poses.target_poses.noise.n_max",
                 "modify_fn": mdp.initial_final_interpolate_fn,
                 "modify_params": {
                     "initial_value": 0.0,
                     "final_value": cfg.curriculum.noise.target_poses[1],
+                    "difficulty_term_str": "adr",
+                },
+            },
+        )
+
+        hand_pose_targets_unoise_min_adr = CurrTerm(
+            func=mdp.modify_term_cfg,
+            params={
+                "address": "observations.future_poses.hand_pose_targets.noise.n_min",
+                "modify_fn": mdp.initial_final_interpolate_fn,
+                "modify_params": {
+                    "initial_value": 0.0,
+                    "final_value": -cfg.curriculum.noise.hand_pose_targets[1],
+                    "difficulty_term_str": "adr",
+                },
+            },
+        )
+
+        hand_pose_targets_unoise_max_adr = CurrTerm(
+            func=mdp.modify_term_cfg,
+            params={
+                "address": "observations.future_poses.hand_pose_targets.noise.n_max",
+                "modify_fn": mdp.initial_final_interpolate_fn,
+                "modify_params": {
+                    "initial_value": 0.0,
+                    "final_value": cfg.curriculum.noise.hand_pose_targets[1],
                     "difficulty_term_str": "adr",
                 },
             },

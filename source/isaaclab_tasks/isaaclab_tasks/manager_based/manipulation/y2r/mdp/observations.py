@@ -116,6 +116,46 @@ def object_pose_b(
     return torch.cat([pos_b, quat_b], dim=-1)
 
 
+def hand_pose_b(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Hand (palm) pose in the robot's root frame.
+
+    Extracts the palm_link body pose and expresses it in the robot base frame.
+    Returns position + quaternion (7D) matching hand_pose_targets format.
+
+    Args:
+        env: The environment.
+        robot_cfg: Scene entity for the robot. Defaults to ``SceneEntityCfg("robot")``.
+
+    Returns:
+        Tensor of shape ``(num_envs, 7)``: [x, y, z, qw, qx, qy, qz] in robot root frame.
+    """
+    robot: Articulation = env.scene[robot_cfg.name]
+
+    # Find palm_link body index
+    palm_ids = robot.find_bodies("palm_link")[0]
+    if len(palm_ids) == 0:
+        raise RuntimeError("Could not find 'palm_link' body on robot!")
+    palm_idx = palm_ids[0]
+
+    # Get palm pose in world frame
+    palm_pos_w = robot.data.body_pos_w[:, palm_idx]  # (N, 3)
+    palm_quat_w = robot.data.body_quat_w[:, palm_idx]  # (N, 4)
+
+    # Get robot base frame
+    root_pos_w = robot.data.root_link_pos_w  # (N, 3)
+    root_quat_w = robot.data.root_link_quat_w  # (N, 4)
+
+    # Transform to robot base frame
+    palm_pos_b, palm_quat_b = subtract_frame_transforms(
+        root_pos_w, root_quat_w, palm_pos_w, palm_quat_w
+    )
+
+    return torch.cat([palm_pos_b, palm_quat_b], dim=-1)
+
+
 def body_state_b(
     env: ManagerBasedRLEnv,
     body_asset_cfg: SceneEntityCfg,

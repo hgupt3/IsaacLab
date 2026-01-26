@@ -11,8 +11,8 @@ params:
     clip_observations: 100.0
     clip_actions: 100.0
     obs_groups:
-      obs: ["policy", "proprio", "current_poses", "future_poses", "current_pc", "future_pc"]
-      states: ["policy", "proprio", "current_poses", "future_poses", "current_pc", "future_pc"]
+      obs: ["policy", "proprio", "current_pc", "current_poses", "future_pc", "future_poses"]
+      states: ["policy", "proprio", "current_pc", "current_poses", "future_pc", "future_poses"]
     concate_obs_groups: True
 
   algo:
@@ -22,14 +22,8 @@ params:
     name: continuous_a2c_logstd
 
   network:
-    name: point_transformer
-
-    # Cross-Attention Point Network architecture
-    # (Shared attention between actor/critic, separate final heads)
-    hidden_dim: 64            # Token embedding dimension
-    num_heads: 4              # Cross-attention heads
-    
-    # Action distribution config (same as original)
+    name: pointnet_tnet
+    separate: True
     space:
       continuous:
         mu_activation: None
@@ -40,12 +34,20 @@ params:
           name: const_initializer
           val: 0
         fixed_sigma: True
+    mlp:
+      units: [512, 256, 128]
+      activation: elu
+      d2rl: False
+      initializer:
+        name: default
+      regularizer:
+        name: None
 
   load_checkpoint: False # flag which sets whether to load the checkpoint
   load_path: '' # path to the checkpoint to load
 
   config:
-    name: trajectory_point_transformer
+    name: trajectory_pointnet_tnet
     env_name: rlgpu
     device: 'cuda:0'
     device_name: 'cuda:0'
@@ -92,7 +94,7 @@ pbt:
   objective: episode.Curriculum/adr
 
   # PBT hyperparams
-  interval_steps: 50000000
+  interval_steps: 10000000
   threshold_std: 0.1
   threshold_abs: 0.025
   mutation_rate: 0.25

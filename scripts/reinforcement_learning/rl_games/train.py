@@ -138,11 +138,17 @@ def log_y2r_config_files(mode: str, task: str):
     config_files = get_config_file_paths(mode, task)
 
     # Base path for relative paths in wandb
-    isaaclab_tasks_root = Path(__file__).parent.parent.parent / "isaaclab_tasks"
+    isaaclab_tasks_root = Path(__file__).parent.parent.parent / "source" / "isaaclab_tasks"
 
     # Upload all config files that are part of this run
     for yaml_path in config_files:
-        wandb.save(str(yaml_path), base_path=str(isaaclab_tasks_root), policy="now")
+        # Convert to Path and ensure it's relative to base
+        yaml_path = Path(yaml_path)
+        if yaml_path.is_relative_to(isaaclab_tasks_root):
+            wandb.save(str(yaml_path), base_path=str(isaaclab_tasks_root), policy="now")
+        else:
+            # File outside base path, upload without base path (will use absolute path)
+            wandb.save(str(yaml_path), policy="now")
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
