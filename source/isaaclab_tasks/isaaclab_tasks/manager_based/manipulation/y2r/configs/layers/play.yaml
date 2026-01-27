@@ -8,17 +8,17 @@
 # Start at max difficulty
 curriculum:
   difficulty:
-    initial: 10
+    initial: 3
 
 # Basic visualization
 visualization:
-  targets: false
-  current_object: false
+  targets: true
+  current_object: true
   pose_axes: false
   env_ids: null
   debug_print_rewards: false
-  hand_pose_targets: false
-  grasp_surface_point: false  # Debug: show selected grasp surface point (green)
+  hand_pose_targets: true
+  grasp_surface_point: false 
 
 # Fewer envs for visualization
 simulation:

@@ -133,6 +133,7 @@ trajectory:
 hand_trajectory:
   enabled: true                # Set true to enable hand pose trajectory generation
   grasp_rot_completion_fraction: 0.4  # Rotation completes at 25% of grasp duration
+  boundary_blend_time_s: 1.5   # Blend duration for position_only -> full (seconds)
   
   # Grasp region sampling (surface normal based)
   # Palm approaches from surface normal direction, Z axis (blue) faces object
@@ -343,11 +344,11 @@ rewards:
       gate_in_grasp: true         # Gate during grasp phase
       gate_in_manipulation: true  # Gate during manipulation phase
       gate_in_release: true       # Gate during release phase
-      gate_pos_threshold: [0.04, 0.06]        # Position: [start dropping, reach minimum]
-      gate_rot_threshold: [0.4, 0.6]          # Rotation: [start dropping, reach minimum]
+      gate_pos_threshold: [0.04, 0.08]        # Position: [start dropping, reach minimum]
+      gate_rot_threshold: [0.4, 0.8]          # Rotation: [start dropping, reach minimum]
       # Manipulation-specific overrides (null = use default thresholds above)
       manipulation_gate_pos_threshold: [0.04, 0.12]  # Looser position thresholds for manipulation
-      manipulation_gate_rot_threshold: [0.4, 1.2]    # Looser rotation thresholds for manipulation
+      manipulation_gate_rot_threshold: [0.4, 1.6]    # Looser rotation thresholds for manipulation
       gate_floor: 0.05                        # Minimum gate value (prevents complete reward collapse)
   
   # Finger release reward - incentivizes opening hand during release phase
@@ -380,12 +381,12 @@ rewards:
 # Thresholds use [initial, final] format - curriculum interpolates between
 terminations:
   trajectory_deviation:
-    position_threshold: [0.2, 0.1]      # meters - spatial error (pos in pose mode, mean PC distance in PC mode)
-    rotation_threshold: [2.5, 1.2]      # radians (pose mode only) ~143° → ~29°
+    position_threshold: [0.3, 0.1]      # meters - spatial error (pos in pose mode, mean PC distance in PC mode)
+    rotation_threshold: [3.0, 1.25]      # radians (pose mode only) ~143° → ~29°
   
   hand_pose_deviation:
-    position_threshold: [0.3, 0.15]        # meters (lenient → strict)
-    rotation_threshold: [3.14, 2.5]          # radians ~180° → ~180°
+    position_threshold: [0.3, 0.2]        # meters (lenient → strict)
+    rotation_threshold: [3.14, 3.14]          # radians ~180° → ~180°
 
 # ==============================================================================
 # CURRICULUM (Adaptive Domain Randomization)

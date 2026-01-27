@@ -291,9 +291,12 @@ class TrajectoryManager:
                             euler_all[..., 2].reshape(-1)
                         ).reshape(n, max_wp, 4)  # (n, max_wp, 4)
 
-                        # Apply to start orientation
-                        start_quat_expanded = start_poses[:, 3:7].unsqueeze(1).expand(-1, max_wp, -1)  # (n, max_wp, 4)
-                        quat_all = quat_mul(delta_quats.reshape(n * max_wp, 4), start_quat_expanded.reshape(n * max_wp, 4)).reshape(n, max_wp, 4)
+                        # Apply deltas incrementally so waypoint orientations are smooth
+                        quat_all = torch.zeros(n, max_wp, 4, device=self.device)
+                        prev_quat = start_poses[:, 3:7]
+                        for wp_idx in range(max_wp):
+                            prev_quat = quat_mul(delta_quats[:, wp_idx], prev_quat)
+                            quat_all[:, wp_idx] = prev_quat
                     else:
                         quat_all = start_poses[:, 3:7].unsqueeze(1).expand(-1, max_wp, -1)  # (n, max_wp, 4)
 
@@ -376,7 +379,9 @@ class TrajectoryManager:
                 # Hand orientation override
                 if hasattr(seg_config, 'hand_orientation') and seg_config.hand_orientation is not None:
                     self.segment_has_hand_orientation[global_env_idx, target_seg_idx] = True
-                    self.segment_hand_orientation[global_env_idx, target_seg_idx] = torch.tensor(seg_config.hand_orientation, dtype=torch.float32, device=self.device).unsqueeze(0).expand(n, 4)
+                    hand_quat = torch.tensor(seg_config.hand_orientation, dtype=torch.float32, device=self.device).unsqueeze(0).expand(n, 4)
+                    hand_quat = hand_quat / (hand_quat.norm(dim=-1, keepdim=True) + 1e-8)
+                    self.segment_hand_orientation[global_env_idx, target_seg_idx] = hand_quat
 
                 # Advance output index
                 output_seg_idx += 1
@@ -898,14 +903,16 @@ class TrajectoryManager:
         # Normalize target
         z = z_target / (z_target.norm(dim=-1, keepdim=True) + 1e-8)
         
-        # Choose an arbitrary perpendicular vector for X axis
-        # Use world up (0, 0, 1) unless z is parallel to it
-        world_up = torch.tensor([0.0, 0.0, 1.0], device=self.device).expand(n, 3)
-        
-        # If z is nearly parallel to world_up, use world_forward instead
-        dot = (z * world_up).sum(dim=-1, keepdim=True).abs()
-        alt_ref = torch.tensor([1.0, 0.0, 0.0], device=self.device).expand(n, 3)
-        ref = torch.where(dot > 0.9, alt_ref, world_up)
+        # Choose a stable perpendicular reference axis for X
+        # Use the most-orthogonal world axis to avoid discontinuous flips.
+        abs_z = z.abs()
+        world_x = torch.tensor([1.0, 0.0, 0.0], device=self.device).expand(n, 3)
+        world_y = torch.tensor([0.0, 1.0, 0.0], device=self.device).expand(n, 3)
+        world_z = torch.tensor([0.0, 0.0, 1.0], device=self.device).expand(n, 3)
+
+        use_x = (abs_z[:, 0] <= abs_z[:, 1]) & (abs_z[:, 0] <= abs_z[:, 2])
+        use_y = (abs_z[:, 1] < abs_z[:, 0]) & (abs_z[:, 1] <= abs_z[:, 2])
+        ref = torch.where(use_x.unsqueeze(1), world_x, torch.where(use_y.unsqueeze(1), world_y, world_z))
         
         # X = ref × Z (perpendicular to Z)
         x = torch.cross(ref, z, dim=-1)
@@ -1098,7 +1105,7 @@ class TrajectoryManager:
 
         # Find intersection of all feasible regions
         # Strategy: Sample N candidate rolls uniformly around circle, check which satisfy ALL constraints
-        num_samples = 32
+        num_samples = 128
         candidate_rolls = torch.linspace(-math.pi, math.pi, num_samples, device=device).unsqueeze(0).expand(n, num_samples)  # (n, num_samples)
 
         # Evaluate all constraints for all candidates
@@ -1418,8 +1425,20 @@ class TrajectoryManager:
             else:
                 valid_mask = dist_ok & normal_ok & height_ok & finger_ok & upward_ok
 
-            # ===== Sample from valid candidates =====
-            scores = torch.rand(n, pool_size, device=self.device)
+            # For scoring + fallback, compute palm_quat_world for prev values (might be invalid!)
+            prev_normals_world = quat_apply(obj_quat_at_kp, prev_normals)
+            prev_base_quat_world = self._quat_from_z_axis(-prev_normals_world)
+            prev_roll_quat = quat_from_euler_xyz(
+                torch.zeros(n, device=self.device),
+                torch.zeros(n, device=self.device),
+                prev_rolls
+            )
+            prev_palm_quat_world = quat_mul(prev_base_quat_world, prev_roll_quat)
+
+            # ===== Sample from valid candidates (favor minimal orientation change) =====
+            dot_sim = (palm_quat_world * prev_palm_quat_world.unsqueeze(1)).sum(dim=-1).abs()
+            dist_norm = distances / (cfg.max_surface_perturbation + 1e-6)
+            scores = dot_sim - dist_norm
             scores[~valid_mask] = -float('inf')
             selected_idx = scores.argmax(dim=1)  # (n,)
 
@@ -1433,16 +1452,6 @@ class TrajectoryManager:
             selected_points = pool_points[batch_idx, selected_idx]  # (n, 3)
             selected_normals = pool_normals[batch_idx, selected_idx]  # (n, 3)
             selected_rolls = candidate_rolls[batch_idx, selected_idx]  # (n,)
-
-            # For fallback, compute palm_quat_world for prev values (might be invalid!)
-            prev_normals_world = quat_apply(obj_quat_at_kp, prev_normals)
-            prev_base_quat_world = self._quat_from_z_axis(-prev_normals_world)
-            prev_roll_quat = quat_from_euler_xyz(
-                torch.zeros(n, device=self.device),
-                torch.zeros(n, device=self.device),
-                prev_rolls
-            )
-            prev_palm_quat_world = quat_mul(prev_base_quat_world, prev_roll_quat)
 
             # Apply fallback where no valid candidate
             new_palm_quat_world = torch.where(
@@ -1731,6 +1740,16 @@ class TrajectoryManager:
         # Use these pre-computed orientations for position_only coupling
         prev_hand_quat_per_seg = hand_quat_world  # (n, max_segs, 4)
 
+        # Apply per-segment orientation override (world frame) when provided
+        if self.segment_has_hand_orientation[env_ids].any():
+            override_mask = self.segment_has_hand_orientation[env_ids].unsqueeze(-1)
+            override_quat = self.segment_hand_orientation[env_ids]
+            prev_hand_quat_per_seg = torch.where(override_mask, override_quat, prev_hand_quat_per_seg)
+
+        # Blend window for transitions from position_only -> full coupling
+        boundary_blend_time_s = getattr(self.cfg.hand_trajectory, "boundary_blend_time_s", self.target_dt)
+        blend_duration = max(boundary_blend_time_s, self.target_dt)
+
         # Step 6: Process MANIPULATION segments (coupling mode 0 or 1) - ALL at once
         is_manip_3d = manip_mask_2d.unsqueeze(2).expand(-1, -1, self.total_targets)  # (n, max_segs, total_targets)
         coupling_full_or_pos = ((self.coupling_modes[env_ids] == 0) | (self.coupling_modes[env_ids] == 1)).unsqueeze(2).expand(-1, -1, self.total_targets)
@@ -1789,6 +1808,25 @@ class TrajectoryManager:
             if full_mask.any():
                 hand_pos_full = quat_apply(obj_quat_m[full_mask], interp_pos_local_m[full_mask]) + obj_pos_m[full_mask]
                 hand_quat_full = quat_mul(obj_quat_m[full_mask], interp_quat_local_m[full_mask])
+
+                # Smooth transition when coming from position_only segment
+                prev_seg_idx = seg_idx_m[full_mask] - 1
+                has_prev = prev_seg_idx >= 0
+                if has_prev.any():
+                    full_indices = torch.arange(hand_quat_full.shape[0], device=self.device)
+                    env_local = env_idx_m[full_mask][has_prev]
+                    prev_seg_idx_valid = prev_seg_idx[has_prev]
+                    prev_pos_only = self.coupling_modes[env_ids[env_local], prev_seg_idx_valid] == 1
+                    if prev_pos_only.any():
+                        blend_t = (local_t_within_seg[full_mask][has_prev] / blend_duration).clamp(0, 1)
+                        frozen_quat = prev_hand_quat_per_seg[env_local, prev_seg_idx_valid]
+                        target_indices = full_indices[has_prev][prev_pos_only]
+                        hand_quat_full[target_indices] = self._batched_slerp(
+                            frozen_quat[prev_pos_only],
+                            hand_quat_full[target_indices],
+                            blend_t[prev_pos_only],
+                        )
+
                 positions_all[env_idx_m[full_mask], time_idx_m[full_mask]] = hand_pos_full
                 orientations_all[env_idx_m[full_mask], time_idx_m[full_mask]] = hand_quat_full
 
@@ -1796,7 +1834,7 @@ class TrajectoryManager:
             pos_only_mask = coupling_m == 1
             if pos_only_mask.any():
                 hand_pos_posonly = quat_apply(obj_quat_m[pos_only_mask], interp_pos_local_m[pos_only_mask]) + obj_pos_m[pos_only_mask]
-                # Orientation: use previous segment's last orientation
+                # Orientation: use precomputed segment orientation (with override if provided)
                 hand_quat_posonly = prev_hand_quat_per_seg[env_idx_m[pos_only_mask], seg_idx_m[pos_only_mask]]
                 positions_all[env_idx_m[pos_only_mask], time_idx_m[pos_only_mask]] = hand_pos_posonly
                 orientations_all[env_idx_m[pos_only_mask], time_idx_m[pos_only_mask]] = hand_quat_posonly
@@ -2537,6 +2575,36 @@ class TrajectoryManager:
         full_mask = (coupling_modes_flat == 0)
         if full_mask.any():
             hand_quat_full = quat_mul(obj_quat_flat[full_mask], grasp_quat_flat[full_mask])
+
+            # Smooth transition when coming from position_only segment
+            boundary_blend_time_s = getattr(self.cfg.hand_trajectory, "boundary_blend_time_s", self.target_dt)
+            blend_duration = max(boundary_blend_time_s, self.target_dt)
+            prev_seg_idx_flat = seg_idx_flat[full_mask] - 1
+            has_prev = prev_seg_idx_flat >= 0
+            if has_prev.any():
+                full_indices = torch.arange(hand_quat_full.shape[0], device=self.device)
+                env_prev = env_idx_flat[full_mask][has_prev]
+                prev_seg_idx_valid = prev_seg_idx_flat[has_prev]
+                prev_pos_only = self.coupling_modes[env_prev, prev_seg_idx_valid] == 1
+                if prev_pos_only.any():
+                    times_flat = times.reshape(-1)
+                    seg_start_times_flat = self.segment_boundaries[env_idx_flat, seg_idx_flat]
+                    local_t_full = (times_flat[full_mask] - seg_start_times_flat[full_mask]).clamp(min=0)
+                    blend_t = (local_t_full[has_prev] / blend_duration).clamp(0, 1)
+
+                    frozen_quat = self.hand_pose_at_segment_boundary[env_prev, prev_seg_idx_valid, 3:7]
+                    has_override = self.segment_has_hand_orientation[env_prev, prev_seg_idx_valid]
+                    if has_override.any():
+                        override_quat = self.segment_hand_orientation[env_prev, prev_seg_idx_valid]
+                        frozen_quat = torch.where(has_override.unsqueeze(1), override_quat, frozen_quat)
+
+                    target_indices = full_indices[has_prev][prev_pos_only]
+                    hand_quat_full[target_indices] = self._batched_slerp(
+                        frozen_quat[prev_pos_only],
+                        hand_quat_full[target_indices],
+                        blend_t[prev_pos_only],
+                    )
+
             hand_quat.reshape(n * max_len, 4)[full_mask] = hand_quat_full
 
         # POSITION_ONLY coupling (mode 1): orientation frozen at segment start
@@ -2549,6 +2617,12 @@ class TrajectoryManager:
             # Get hand orientation at segment start (stored during initial trajectory generation)
             # hand_pose_at_segment_boundary[env, K] = hand pose at time when segment K starts
             frozen_quat = self.hand_pose_at_segment_boundary[pos_only_env_idx, pos_only_seg_idx, 3:7]  # (num_pos_only, 4)
+
+            # Apply per-segment orientation override (world frame) when provided
+            has_override = self.segment_has_hand_orientation[pos_only_env_idx, pos_only_seg_idx]
+            if has_override.any():
+                override_quat = self.segment_hand_orientation[pos_only_env_idx, pos_only_seg_idx]
+                frozen_quat = torch.where(has_override.unsqueeze(1), override_quat, frozen_quat)
 
             hand_quat.reshape(n * max_len, 4)[pos_only_mask] = frozen_quat
 
