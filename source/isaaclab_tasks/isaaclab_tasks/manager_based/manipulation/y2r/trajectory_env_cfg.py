@@ -971,10 +971,20 @@ class TrajectoryEnvCfg(ManagerBasedEnvCfg):
         
         # Compute max possible episode duration from segment config
         # Includes random_waypoint expansion (max count * (movement + pause))
+        def _max_count_from_curriculum(base_count: tuple[int, int], curriculum: dict | None) -> int:
+            max_count = int(base_count[1])
+            if isinstance(curriculum, dict):
+                overrides = curriculum.get("count")
+                if isinstance(overrides, dict):
+                    for value in overrides.values():
+                        max_count = max(max_count, int(value[1]))
+            return max_count
+
         max_duration = 0.0
         for seg in cfg.trajectory.segments:
             if getattr(seg, "type", None) == "random_waypoint":
-                max_duration += seg.count[1] * (seg.movement_duration + seg.pause_duration)
+                max_count = _max_count_from_curriculum(seg.count, seg.curriculum)
+                max_duration += max_count * (seg.movement_duration + seg.pause_duration)
             else:
                 max_duration += seg.duration
         self.episode_length_s = max_duration

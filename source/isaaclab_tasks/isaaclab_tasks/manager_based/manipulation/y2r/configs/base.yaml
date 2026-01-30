@@ -11,8 +11,8 @@
 # ==============================================================================
 simulation:
   physics_dt: 0.01              # 1/100 seconds (100 Hz physics)
-  decimation: 2                 # Control at 60 Hz (physics_dt * decimation)
-  num_envs: 12288
+  decimation: 2                 # Control at 50 Hz (physics_dt * decimation)
+  num_envs: 16384
   env_spacing: 3.0
   replicate_physics: false
 
@@ -28,24 +28,10 @@ mode:
 # OBSERVATIONS
 # ==============================================================================
 observations:
-  num_points: 64                # Points sampled per object surface (privileged)
-  student_num_points: 32        # Points for student observations (visible point cloud)
+  num_points: 32                # Points sampled per object surface (privileged)
+  student_num_points: 16        # Points for student observations (visible point cloud)
   point_pool_size: 256          # Pool size for surface sampling (must be > num_points)
-
-  # Point cloud regional filter (null = disabled, filters out specific regions)
   point_cloud_filter: null      # Set to filter config in task yaml to exclude regions
-  # Axis-based filter example (exclude pan handle - points with Z > 0.05):
-  #   enabled: true
-  #   type: "axis"              # Filter along single axis
-  #   axis: "z"                 # Filter along z-axis (x/y/z)
-  #   min: null                 # No minimum (include all below max)
-  #   max: 0.05                 # Exclude points above 0.05m in local frame
-  # Radial filter example (exclude inner 3cm sphere around origin):
-  #   enabled: true
-  #   type: "radial"            # Radial distance filter
-  #   origin: [0, 0, 0]         # Center point in object-local frame
-  #   min_radius: 0.03          # Exclude points within 3cm radius
-  #   max_radius: null          # No outer limit
 
   # History lengths for observation groups
   history:
@@ -71,7 +57,7 @@ trajectory:
   window_size: 5                # Number of lookahead targets in observation
   easing_power: 1.5             # Ease curves for waypoint segments
   release_ease_power: 1.5       # Ease-in power for retreat (2.0 = quadratic, slow start)
-  skip_manipulation_probability: 0.05  # Probability of grasp-only episodes
+  skip_manipulation_probability: 0.01  # Probability of grasp-only episodes
 
   # Segment-based trajectory composition
   segments:
@@ -84,6 +70,9 @@ trajectory:
     - name: "explore"
       type: "random_waypoint"
       count: [0, 1]          # Random 0-1 waypoints for training variation
+      curriculum:
+        count:
+          7: [0, 2]          # Difficulty >= 8: 0-2 waypoints
       movement_duration: 3.0  # Per waypoint
       pause_duration: 0.25    # Per waypoint
       position_range:
@@ -94,9 +83,12 @@ trajectory:
       max_rotation: 1.0      # radians (~57°)
       hand_coupling: "full"
 
-    - name: "explore"
+    - name: "explore_position"
       type: "random_waypoint"
-      count: [0, 1]          # Random 0-1 waypoints for training variation
+      count: [0, 0]          # Disabled at low difficulty
+      curriculum:
+        count:
+          5: [0, 1]          # Difficulty >= 6: 0-1 position-only waypoints
       movement_duration: 3.0  # Per waypoint
       pause_duration: 0.25    # Per waypoint
       position_range:
@@ -156,9 +148,13 @@ hand_trajectory:
   # Keypoints are sampled from nearby feasible surface points, ensuring the hand
   # can achieve the pose at each point in the trajectory.
   keypoints:
-    count: [0, 1]               # Random number of additional grasp keypoints
+    count: [0, 0]               # Disabled at low difficulty
+    curriculum:
+      count:
+        3: [0, 1]               # Difficulty >= 4: 0-1 keypoints
+        9: [0, 2]               # Difficulty >= 10: 0-2 keypoints
     max_surface_perturbation: 0.04  # Max distance to search for nearby surface points (meters)
-    roll_perturbation: 0.4      # Max roll perturbation around approach axis (radians, ~23°)
+    roll_perturbation: 0.3      # Max roll perturbation around approach axis (radians, ~23°)
     normal_similarity_threshold: -0.05  # Min dot product of normals (0.5 = ~60°, prevents flipping to opposite face)
 
   # Feasibility constraints for hand poses (checked at each keypoint)
@@ -202,12 +198,12 @@ rewards:
   action_l2:
     weight: -0.005
     params:
-      finger_scale: 0.2       
+      finger_scale: 0.125   
     
   action_rate_l2:
     weight: -0.005
     params:
-      finger_scale: 0.2    
+      finger_scale: 0.125    
     
   fingers_to_object:
     weight: 1.5
@@ -221,7 +217,7 @@ rewards:
       error_gate_rot_slope: 0.5        # radians
     
   lookahead_tracking:
-    weight: 6.0
+    weight: 8.0
     params:
       phases: [grasp, manipulation]    # Active in manipulation phase
       path_mode: true              # Enable path segment tracking (true = smooth motion, false = discrete waypoints)
@@ -243,7 +239,7 @@ rewards:
       rot_neg_std: 1.0             # How fast rotation penalty grows
     
   trajectory_success:
-    weight: 10.0
+    weight: 15.0
     params:
       phases: [release]               # Active only in release phase
       use_hand_pose_gate: true        # Apply hand pose gate from hand_pose_following
@@ -261,7 +257,7 @@ rewards:
       contact_gate_floor: 0.05        # Minimum gate when fingers touching
     
   early_termination:
-    weight: -20.0
+    weight: -50.0
     params:
       term_keys: ["trajectory_deviation", "hand_pose_deviation", "abnormal_robot"]
     
@@ -334,22 +330,22 @@ rewards:
     weight: 3.5                   # Medium weight - guiding signal, not strict
     params:
       # Phase-varying tolerances: exp(-pos_error/tol) + exp(-rot_error/tol) / 2
-      grasp_pos_tol: 0.04         # 4cm position tolerance during grasp
-      grasp_rot_tol: 0.5          # ~34° rotation tolerance during grasp
-      manipulation_pos_tol: 0.06  # 6cm (loose) during manipulation
-      manipulation_rot_tol: 0.8   # ~68° (loose) during manipulation
-      release_pos_tol: 0.04       # 4cm during release
-      release_rot_tol: 0.5        # ~34° during release
+      grasp_pos_tol: 0.03         # 4cm position tolerance during grasp
+      grasp_rot_tol: 0.3          # ~34° rotation tolerance during grasp
+      manipulation_pos_tol: 0.04  # 6cm (loose) during manipulation
+      manipulation_rot_tol: 0.4   # ~68° (loose) during manipulation
+      release_pos_tol: 0.03       # 4cm during release
+      release_rot_tol: 0.3        # ~34° during release
       # Per-phase gating - gate other rewards if hand deviates from target
       gate_in_grasp: true         # Gate during grasp phase
       gate_in_manipulation: true  # Gate during manipulation phase
       gate_in_release: true       # Gate during release phase
-      gate_pos_threshold: [0.04, 0.08]        # Position: [start dropping, reach minimum]
-      gate_rot_threshold: [0.4, 0.8]          # Rotation: [start dropping, reach minimum]
+      gate_pos_threshold: [0.04, 0.06]        # Position: [start dropping, reach minimum]
+      gate_rot_threshold: [0.4, 0.6]          # Rotation: [start dropping, reach minimum]
       # Manipulation-specific overrides (null = use default thresholds above)
-      manipulation_gate_pos_threshold: [0.04, 0.12]  # Looser position thresholds for manipulation
-      manipulation_gate_rot_threshold: [0.4, 1.6]    # Looser rotation thresholds for manipulation
-      gate_floor: 0.05                        # Minimum gate value (prevents complete reward collapse)
+      manipulation_gate_pos_threshold: [0.06, 0.12]  # Looser position thresholds for manipulation
+      manipulation_gate_rot_threshold: [0.6, 1.2]    # Looser rotation thresholds for manipulation
+      gate_floor: 0.1                        # Minimum gate value (prevents complete reward collapse)
   
   # Finger release reward - incentivizes opening hand during release phase
   finger_release:
@@ -381,11 +377,11 @@ rewards:
 # Thresholds use [initial, final] format - curriculum interpolates between
 terminations:
   trajectory_deviation:
-    position_threshold: [0.3, 0.1]      # meters - spatial error (pos in pose mode, mean PC distance in PC mode)
-    rotation_threshold: [3.0, 1.25]      # radians (pose mode only) ~143° → ~29°
+    position_threshold: [0.25, 0.1]      # meters - spatial error (pos in pose mode, mean PC distance in PC mode)
+    rotation_threshold: [2.5, 1.25]      # radians (pose mode only) ~143° → ~29°
   
   hand_pose_deviation:
-    position_threshold: [0.3, 0.2]        # meters (lenient → strict)
+    position_threshold: [0.3, 0.15]        # meters (lenient → strict)
     rotation_threshold: [3.14, 3.14]          # radians ~180° → ~180°
 
 # ==============================================================================

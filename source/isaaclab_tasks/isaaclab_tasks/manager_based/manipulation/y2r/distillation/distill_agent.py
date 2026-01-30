@@ -507,7 +507,11 @@ class DistillAgent(A2CAgent):
                 self.algo_observer.process_infos(infos, env_done_indices)
                 
                 # Accumulate per-term episode rewards (will be logged periodically)
-                max_ep_len = isaac_env.max_episode_length_s
+                # Use actual per-env episode lengths from trajectory_manager instead of max
+                tm = isaac_env.trajectory_manager
+                teacher_ep_lens = tm.t_episode_end[teacher_done_indices] if len(teacher_done_indices) > 0 else None
+                student_ep_lens = tm.t_episode_end[student_done_indices] if len(student_done_indices) > 0 else None
+                
                 for term_name in self.reward_term_names:
                     # Initialize accumulator lists if needed
                     if term_name not in self.teacher_term_accum:
@@ -518,7 +522,8 @@ class DistillAgent(A2CAgent):
                     # Teacher - accumulate instead of immediate log
                     if len(teacher_done_indices) > 0:
                         teacher_sums = self.teacher_episode_sums[term_name][teacher_done_indices]
-                        val = (teacher_sums.mean() / max_ep_len).item()
+                        # Normalize each env by its actual episode length, then average
+                        val = (teacher_sums / teacher_ep_lens.clamp(min=1e-6)).mean().item()
                         self.teacher_term_accum[term_name].append(val)
                         # Reset for done envs
                         self.teacher_episode_sums[term_name][teacher_done_indices] = 0
@@ -526,7 +531,8 @@ class DistillAgent(A2CAgent):
                     # Student - accumulate instead of immediate log
                     if len(student_done_indices) > 0:
                         student_sums = self.student_episode_sums[term_name][student_done_indices]
-                        val = (student_sums.mean() / max_ep_len).item()
+                        # Normalize each env by its actual episode length, then average
+                        val = (student_sums / student_ep_lens.clamp(min=1e-6)).mean().item()
                         self.student_term_accum[term_name].append(val)
                         # Reset for done envs
                         self.student_episode_sums[term_name][student_done_indices] = 0

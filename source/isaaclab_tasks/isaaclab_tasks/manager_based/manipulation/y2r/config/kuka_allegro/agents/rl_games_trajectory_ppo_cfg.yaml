@@ -47,7 +47,7 @@ params:
   load_path: '' # path to the checkpoint to load
 
   config:
-    name: trajectory
+    name: trajectory_point_transformer
     env_name: rlgpu
     device: 'cuda:0'
     device_name: 'cuda:0'
@@ -56,12 +56,12 @@ params:
     mixed_precision: True
     normalize_input: True
     normalize_value: True
-    value_bootstrap: False
+    value_bootstrap: True
     num_actors: -1
     reward_shaper:
       scale_value: 0.01
     normalize_advantage: True
-    gamma: 0.99
+    gamma: 0.998
     tau: 0.95
     learning_rate: 1e-3
     lr_schedule: adaptive

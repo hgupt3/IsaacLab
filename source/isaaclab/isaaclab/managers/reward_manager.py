@@ -112,11 +112,18 @@ class RewardManager(ManagerBase):
             env_ids = slice(None)
         # store information
         extras = {}
+        # Get actual episode lengths for resetting envs (in seconds)
+        # episode_length_buf is reset AFTER this function returns, so it still has the episode length
+        actual_ep_lens = self._env.episode_length_buf[env_ids].float() * self._env.step_dt
+        actual_ep_lens = actual_ep_lens.clamp(min=1e-6)  # Avoid division by zero
         for key in self._episode_sums.keys():
             # store information
-            # r_1 + r_2 + ... + r_n
-            episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
-            extras["Episode_Reward/" + key] = episodic_sum_avg / self._env.max_episode_length_s
+            episodic_sums = self._episode_sums[key][env_ids]
+            # Raw episode sum (total reward accumulated)
+            extras["Episode_Reward_Sum/" + key] = torch.mean(episodic_sums)
+            # Normalized by actual episode length (reward per second)
+            normalized_sums = episodic_sums / actual_ep_lens
+            extras["Episode_Reward/" + key] = torch.mean(normalized_sums)
             # reset episodic sum
             self._episode_sums[key][env_ids] = 0.0
         # reset all the reward terms

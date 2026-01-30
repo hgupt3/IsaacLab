@@ -63,6 +63,18 @@ def _load_yaml(name: str) -> dict:
     return config
 
 
+def _normalize_curriculum_keys(data: Any) -> Any:
+    """Ensure dict keys are strings for config serialization."""
+    if isinstance(data, dict):
+        normalized: dict = {}
+        for key, value in data.items():
+            normalized[str(key)] = _normalize_curriculum_keys(value)
+        return normalized
+    if isinstance(data, list):
+        return [_normalize_curriculum_keys(item) for item in data]
+    return data
+
+
 # ==============================================================================
 # AUTO-PARSER
 # ==============================================================================
@@ -156,6 +168,7 @@ class BaseSegmentConfig:
     type: str = "base"           # Segment type (overridden by children)
     hand_coupling: str = "full"  # Defaults to "full" - only specify if different
     hand_orientation: list[float] | None = None  # Optional fixed hand quat [qw,qx,qy,qz] for position_only mode
+    curriculum: dict | None = None  # Optional per-difficulty overrides (e.g., count ranges)
 
 
 @dataclass
@@ -212,6 +225,7 @@ class GraspKeypointsConfig:
     max_surface_perturbation: float  # Max distance to search for nearby surface points (meters)
     roll_perturbation: float         # Max roll perturbation around approach axis (radians)
     normal_similarity_threshold: float  # Min dot product of normals (prevents flipping to opposite face)
+    curriculum: dict | None = None  # Optional per-difficulty overrides for keypoint counts
 
 
 @dataclass
@@ -555,7 +569,7 @@ def _parse_segments(yaml_segments: list[dict]) -> list[BaseSegmentConfig]:
 
         if seg_type == "waypoint":
             # Validate fields
-            expected = {"type", "name", "duration", "pose", "hand_coupling", "hand_orientation"}
+            expected = {"type", "name", "duration", "pose", "hand_coupling", "hand_orientation", "curriculum"}
             _validate_segment_fields(seg_dict, expected, "waypoint")
 
             seg = WaypointSegmentConfig(
@@ -564,10 +578,11 @@ def _parse_segments(yaml_segments: list[dict]) -> list[BaseSegmentConfig]:
                 pose=seg_dict.get("pose"),  # Can be null
                 hand_coupling=seg_dict.get("hand_coupling", "full"),  # Has default in dataclass
                 hand_orientation=seg_dict.get("hand_orientation"),  # Optional fixed orientation
+                curriculum=seg_dict.get("curriculum"),
             )
         elif seg_type == "helical":
             # Validate fields
-            expected = {"type", "name", "duration", "axis", "angular_velocity", "translation", "hand_coupling", "hand_orientation"}
+            expected = {"type", "name", "duration", "axis", "angular_velocity", "translation", "hand_coupling", "hand_orientation", "curriculum"}
             _validate_segment_fields(seg_dict, expected, "helical")
 
             seg = HelicalSegmentConfig(
@@ -578,11 +593,12 @@ def _parse_segments(yaml_segments: list[dict]) -> list[BaseSegmentConfig]:
                 translation=seg_dict["translation"],
                 hand_coupling=seg_dict.get("hand_coupling", "full"),  # Has default in dataclass
                 hand_orientation=seg_dict.get("hand_orientation"),  # Optional fixed orientation
+                curriculum=seg_dict.get("curriculum"),
             )
         elif seg_type == "random_waypoint":
             # Validate fields
             expected = {"type", "name", "count", "movement_duration", "pause_duration", "position_range",
-                       "vary_orientation", "max_rotation", "hand_coupling"}
+                       "vary_orientation", "max_rotation", "hand_coupling", "curriculum"}
             _validate_segment_fields(seg_dict, expected, "random_waypoint")
 
             # Parse position_range if present
@@ -604,6 +620,7 @@ def _parse_segments(yaml_segments: list[dict]) -> list[BaseSegmentConfig]:
                 vary_orientation=seg_dict["vary_orientation"],
                 max_rotation=seg_dict["max_rotation"],
                 hand_coupling=seg_dict.get("hand_coupling", "full"),  # Has default in dataclass
+                curriculum=seg_dict.get("curriculum"),
             )
         else:
             raise ValueError(f"Unknown segment type: {seg_type}")
@@ -689,6 +706,8 @@ def get_config(mode: str = "train", task: str = "base") -> Y2RConfig:
     # Task layer (optional, applied last)
     if task != "base":
         cfg = _deep_merge(cfg, _load_yaml(f"layers/tasks/{task}"))
+
+    cfg = _normalize_curriculum_keys(cfg)
 
     # Parse segments from YAML dict to segment config objects
     if "trajectory" in cfg and "segments" in cfg["trajectory"]:

@@ -4,82 +4,26 @@
 
 """Cross-Attention Point Network for rl_games.
 
-This module implements a cross-attention policy that processes point cloud
-observations across time with sinusoidal time embeddings.
+This module implements a self+cross-attention policy that processes point cloud
+observations across time.
 
 Architecture:
     - 320 point tokens: 32 points × 10 timesteps (5 history + 5 targets)
-    - Each point: xyz → MLP → 64-dim → + sinusoidal_time_embed
+    - Each point: xyz → MLP → 64-dim
     - 1 proprio token: all other features → MLP → 64-dim (query)
+    - Self-attention on point tokens
     - Cross-attention: proprio queries point tokens
+    - Optional lightweight FFN on tokens
     - Policy/Value heads from updated proprio token
 """
 
 from __future__ import annotations
 
-import math
 import torch
 import torch.nn as nn
 from typing import Dict, Any
 
-from rl_games.algos_torch.network_builder import A2CBuilder
-
-
-class SinusoidalTimeEmbedding(nn.Module):
-    """Sinusoidal positional encoding for timesteps (cached).
-    
-    Precomputes embeddings for fixed number of timesteps and stores them
-    as a buffer for efficient lookup during forward pass.
-    """
-    
-    def __init__(self, dim: int, num_timesteps: int):
-        """Initialize sinusoidal time embeddings.
-        
-        Args:
-            dim: Embedding dimension (must be even)
-            num_timesteps: Number of timesteps to precompute (e.g., 10)
-        """
-        super().__init__()
-        assert dim % 2 == 0, f"Embedding dim must be even, got {dim}"
-        
-        self.dim = dim
-        self.num_timesteps = num_timesteps
-        
-        # Precompute embeddings: (num_timesteps, dim)
-        pe = self._compute_embeddings(num_timesteps, dim)
-        self.register_buffer('pe', pe)  # Cached, no gradients
-    
-    def _compute_embeddings(self, num_timesteps: int, dim: int) -> torch.Tensor:
-        """Compute sinusoidal embeddings for all timesteps.
-        
-        Args:
-            num_timesteps: Number of timesteps
-            dim: Embedding dimension
-            
-        Returns:
-            Tensor of shape (num_timesteps, dim)
-        """
-        position = torch.arange(num_timesteps).unsqueeze(1).float()  # (T, 1)
-        div_term = torch.exp(
-            torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim)
-        )  # (dim/2,)
-        
-        pe = torch.zeros(num_timesteps, dim)
-        pe[:, 0::2] = torch.sin(position * div_term)  # Even indices
-        pe[:, 1::2] = torch.cos(position * div_term)  # Odd indices
-        
-        return pe
-    
-    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
-        """Look up precomputed embeddings for given timesteps.
-        
-        Args:
-            timesteps: Tensor of timestep indices (any shape, values 0 to num_timesteps-1)
-            
-        Returns:
-            Embeddings with same shape as timesteps + (dim,)
-        """
-        return self.pe[timesteps]
+from rl_games.algos_torch.network_builder import A2CBuilder, NetworkBuilder
 
 
 class SelfAttentionBlock(nn.Module):
@@ -160,25 +104,32 @@ class CrossAttentionBlock(nn.Module):
         return query + self.out_proj(attn_out)
 
 
-class PointNetTNet(nn.Module):
-    """PointNet-style T-Net with a small hidden layer."""
+class FeedForwardBlock(nn.Module):
+    """Lightweight FFN block with pre-norm and residual."""
 
-    def __init__(self, k: int, hidden_dim: int = 16):
+    def __init__(self, dim: int, ratio: float, dropout: float = 0.0):
         super().__init__()
-        self.k = k
-        self.mlp = nn.Sequential(
-            nn.Linear(k, hidden_dim),
-            nn.ELU(),
-        )
-        self.fc = nn.Linear(hidden_dim, k * k)
+        self.ratio = ratio
+        if ratio <= 0:
+            self.enabled = False
+            return
+
+        self.enabled = True
+        hidden_dim = int(dim * ratio)
+        self.norm = nn.LayerNorm(dim)
+        self.fc1 = nn.Linear(dim, hidden_dim, bias=False)
+        self.act = nn.ELU()
+        self.dropout = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_dim, dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, P, k)
-        B, _, _ = x.shape
-        feat = self.mlp(x).max(dim=1).values  # (B, hidden_dim)
-        trans = self.fc(feat).view(B, self.k, self.k)
-        eye = torch.eye(self.k, device=x.device).unsqueeze(0)
-        return trans + eye
+        if not self.enabled:
+            return x
+        y = self.fc1(self.norm(x))
+        y = self.act(y)
+        y = self.dropout(y)
+        y = self.fc2(y)
+        return x + self.dropout(y)
 
 
 class PointTransformerBuilder(A2CBuilder):
@@ -214,6 +165,49 @@ class PointTransformerBuilder(A2CBuilder):
             6. Concat [raw_proprio, attn_out] → heads
         """
 
+        def load(self, params: Dict[str, Any]):
+            """Load network configuration from params."""
+            self.separate = params.get("separate", False)
+            mlp_cfg = params.get("mlp", {})
+            self.units = mlp_cfg.get("units", [])
+            self.activation = mlp_cfg.get("activation", "elu")
+            self.initializer = mlp_cfg.get("initializer", {"name": "default"})
+            self.is_d2rl = mlp_cfg.get("d2rl", False)
+            self.norm_only_first_layer = mlp_cfg.get("norm_only_first_layer", False)
+            self.normalization = params.get("normalization", None)
+            self.value_activation = params.get("value_activation", "None")
+            self.attn_dropout = params.get("attn_dropout", 0.0)
+            self.ffn_ratio = params.get("ffn_ratio", 0.0)
+            self.ffn_dropout = params.get("ffn_dropout", 0.0)
+            self.point_encoder_layers = params.get("point_encoder_layers", None)
+            self.point_encoder_norm = params.get("point_encoder_norm", False)
+            self.proprio_encoder_norm = params.get("proprio_encoder_norm", False)
+            self.proprio_encoder_layers = params.get("proprio_encoder_layers", None)
+
+            self.has_space = "space" in params
+            if self.has_space:
+                self.is_multi_discrete = "multi_discrete" in params["space"]
+                self.is_discrete = "discrete" in params["space"]
+                self.is_continuous = "continuous" in params["space"]
+                if self.is_continuous:
+                    self.space_config = params["space"]["continuous"]
+                    self.fixed_sigma = self.space_config.get("fixed_sigma", True)
+                elif self.is_discrete:
+                    self.space_config = params["space"]["discrete"]
+                elif self.is_multi_discrete:
+                    self.space_config = params["space"]["multi_discrete"]
+            else:
+                self.is_continuous = True
+                self.is_discrete = False
+                self.is_multi_discrete = False
+                self.fixed_sigma = True
+                self.space_config = {
+                    "mu_activation": "None",
+                    "sigma_activation": "None",
+                    "mu_init": {"name": "default"},
+                    "sigma_init": {"name": "const_initializer", "val": 0},
+                }
+
         def __init__(self, params, **kwargs):
             """Initialize Cross-Attention Point Network.
             
@@ -224,20 +218,20 @@ class PointTransformerBuilder(A2CBuilder):
                     - actions_num: Number of action dimensions
                     - value_size: Value output size (usually 1)
             """
-            nn.Module.__init__(self)
-            
-            # Extract config
+            NetworkBuilder.BaseNetwork.__init__(self)
+            self.load(params)
+
             self.params = params
-            self.actions_num = kwargs.get('actions_num')
-            self.value_size = kwargs.get('value_size', 1)
-            input_shape = kwargs.get('input_shape')
+            self.actions_num = kwargs.get("actions_num")
+            self.value_size = kwargs.get("value_size", 1)
+            input_shape = kwargs.get("input_shape")
             self.obs_dim = input_shape[0] if isinstance(input_shape, (tuple, list)) else input_shape
-            
+
             # Architecture params (from base.yaml via builder)
-            self.num_points = params['num_points']
-            self.num_timesteps = params['num_timesteps']
-            self.hidden_dim = params['hidden_dim']
-            self.num_heads = params['num_heads']
+            self.num_points = params["num_points"]
+            self.num_timesteps = params["num_timesteps"]
+            self.hidden_dim = params["hidden_dim"]
+            self.num_heads = params["num_heads"]
 
             # Point cloud dimension: num_points × num_timesteps × 3
             self.point_cloud_dim = self.num_points * self.num_timesteps * 3
@@ -255,29 +249,45 @@ class PointTransformerBuilder(A2CBuilder):
             self.point_encoder = self._build_point_encoder()
             # Proprio encoder: single linear layer
             self.proprio_encoder = self._build_proprio_encoder()
+            self.proprio_norm = nn.LayerNorm(self.hidden_dim) if self.proprio_encoder_norm else None
 
-            # Cross-attention: shared between actor/critic (separate heads after)
-            self.cross_attn = CrossAttentionBlock(self.hidden_dim, self.num_heads)
+            # Self-attention on point tokens, then cross-attention
+            self.self_attn = SelfAttentionBlock(self.hidden_dim, self.num_heads, dropout=self.attn_dropout)
+            self.self_ffn = FeedForwardBlock(self.hidden_dim, self.ffn_ratio, dropout=self.ffn_dropout)
+            self.cross_attn = CrossAttentionBlock(self.hidden_dim, self.num_heads, dropout=self.attn_dropout)
 
-            # Build separate trunks and output layers (match MLP style)
-            self.actor_trunk = self._build_actor_trunk()
-            self.critic_trunk = self._build_critic_trunk()
-            self.actor_output = self._build_actor_output()
-            self.critic_output = self._build_critic_output()
-            
+            # If separate, also build separate encoders/attention for critic (A2C parity)
+            if self.separate:
+                self.critic_point_encoder = self._build_point_encoder()
+                self.critic_proprio_encoder = self._build_proprio_encoder()
+                self.critic_self_attn = SelfAttentionBlock(self.hidden_dim, self.num_heads, dropout=self.attn_dropout)
+                self.critic_self_ffn = FeedForwardBlock(self.hidden_dim, self.ffn_ratio, dropout=self.ffn_dropout)
+                self.critic_cross_attn = CrossAttentionBlock(self.hidden_dim, self.num_heads, dropout=self.attn_dropout)
+
+            # Build trunks and output layers
+            trunk_input_dim = (self.proprio_dim + self.hidden_dim) if self.proprio_dim > 0 else self.hidden_dim
+            self.actor_trunk, trunk_output_dim = self._build_trunk(trunk_input_dim)
+            if self.separate:
+                self.critic_trunk, _ = self._build_trunk(trunk_input_dim)
+            else:
+                self.critic_trunk = self.actor_trunk
+
+            self.actor_output = nn.Linear(trunk_output_dim, self.actions_num)
+            self.critic_output = nn.Linear(trunk_output_dim, self.value_size)
+            self.value_act = self.activations_factory.create(self.value_activation)
+
             # Sigma (log std) for continuous actions
-            space_config = params.get('space', {}).get('continuous', {})
-            self.fixed_sigma = space_config.get('fixed_sigma', True)
-            
+            self.mu_act = self.activations_factory.create(self.space_config.get("mu_activation", "None"))
+            self.sigma_act = self.activations_factory.create(self.space_config.get("sigma_activation", "None"))
+
             if self.fixed_sigma:
-                sigma_init_val = space_config.get('sigma_init', {}).get('val', 0)
                 self.sigma = nn.Parameter(
-                    torch.zeros(self.actions_num) + sigma_init_val,
-                    requires_grad=True
+                    torch.zeros(self.actions_num, requires_grad=True, dtype=torch.float32),
+                    requires_grad=True,
                 )
             else:
-                self.sigma_head = nn.Linear(128, self.actions_num)
-            
+                self.sigma_head = nn.Linear(trunk_output_dim, self.actions_num)
+
             # Initialize weights
             self._init_weights()
 
@@ -288,63 +298,103 @@ class PointTransformerBuilder(A2CBuilder):
             Output: (B * num_points, hidden_dim)
             """
             input_dim = self.num_timesteps * 3
-            return nn.Linear(input_dim, self.hidden_dim)
+            layers = self.point_encoder_layers
+            if not layers:
+                layers = [self.hidden_dim]
+            if layers[-1] != self.hidden_dim:
+                raise ValueError(
+                    f"point_encoder_layers must end with hidden_dim ({self.hidden_dim}), got {layers[-1]}"
+                )
+
+            modules = []
+            in_dim = input_dim
+            for i, out_dim in enumerate(layers):
+                modules.append(nn.Linear(in_dim, out_dim))
+                if i < len(layers) - 1:
+                    modules.append(self.activations_factory.create(self.activation))
+                in_dim = out_dim
+            if self.point_encoder_norm:
+                modules.append(nn.LayerNorm(self.hidden_dim))
+            if len(modules) == 1:
+                return modules[0]
+            return nn.Sequential(*modules)
 
         def _build_proprio_encoder(self) -> nn.Module:
             """Build single linear encoder for proprioceptive features."""
             if self.proprio_dim == 0:
                 return nn.Identity()
-            return nn.Linear(self.proprio_dim, self.hidden_dim)
+            layers = self.proprio_encoder_layers
+            if not layers:
+                layers = [self.hidden_dim]
+            if layers[-1] != self.hidden_dim:
+                raise ValueError(
+                    f"proprio_encoder_layers must end with hidden_dim ({self.hidden_dim}), got {layers[-1]}"
+                )
 
-        def _build_actor_trunk(self) -> nn.Module:
-            """Build actor trunk: [raw_proprio + attn_out] → hidden.
+            modules = []
+            in_dim = self.proprio_dim
+            for i, out_dim in enumerate(layers):
+                modules.append(nn.Linear(in_dim, out_dim))
+                if i < len(layers) - 1:
+                    modules.append(self.activations_factory.create(self.activation))
+                in_dim = out_dim
+            if len(modules) == 1:
+                return modules[0]
+            return nn.Sequential(*modules)
 
-            Input is concat of raw proprio (proprio_dim) + cross-attn output (hidden_dim).
-            MLP: (proprio_dim + hidden_dim) → 512 → 256 → 128.
-            If no proprio features, input is just (hidden_dim).
-            """
-            input_dim = (self.proprio_dim + self.hidden_dim) if self.proprio_dim > 0 else self.hidden_dim
-            return nn.Sequential(
-                nn.Linear(input_dim, 512),
-                nn.ELU(),
-                nn.Linear(512, 256),
-                nn.ELU(),
-                nn.Linear(256, 128),
-                nn.ELU(),
-            )
+        def _build_trunk(self, input_dim: int) -> tuple[nn.Module, int]:
+            """Build MLP trunk and return (module, output_dim)."""
+            if len(self.units) == 0:
+                return nn.Identity(), input_dim
+            if self.is_d2rl:
+                return (
+                    self._build_mlp(
+                        input_size=input_dim,
+                        units=self.units,
+                        activation=self.activation,
+                        dense_func=nn.Linear,
+                        norm_only_first_layer=self.norm_only_first_layer,
+                        norm_func_name=self.normalization,
+                        d2rl=True,
+                    ),
+                    self.units[-1],
+                )
 
-        def _build_critic_trunk(self) -> nn.Module:
-            """Build critic trunk: [raw_proprio + attn_out] → hidden.
-
-            Input is concat of raw proprio (proprio_dim) + cross-attn output (hidden_dim).
-            MLP: (proprio_dim + hidden_dim) → 512 → 256 → 128.
-            If no proprio features, input is just (hidden_dim).
-            """
-            input_dim = (self.proprio_dim + self.hidden_dim) if self.proprio_dim > 0 else self.hidden_dim
-            return nn.Sequential(
-                nn.Linear(input_dim, 512),
-                nn.ELU(),
-                nn.Linear(512, 256),
-                nn.ELU(),
-                nn.Linear(256, 128),
-                nn.ELU(),
-            )
-
-        def _build_actor_output(self) -> nn.Module:
-            """Build actor output layer: 128 → actions."""
-            return nn.Linear(128, self.actions_num)
-
-        def _build_critic_output(self) -> nn.Module:
-            """Build critic output layer: 128 → value."""
-            return nn.Linear(128, self.value_size)
+            layers = []
+            in_size = input_dim
+            need_norm = True
+            for unit in self.units:
+                layers.append(nn.Linear(in_size, unit))
+                layers.append(self.activations_factory.create(self.activation))
+                if need_norm and self.normalization:
+                    if self.normalization == "layer_norm":
+                        layers.append(nn.LayerNorm(unit))
+                    elif self.normalization == "batch_norm":
+                        layers.append(nn.BatchNorm1d(unit))
+                    if self.norm_only_first_layer:
+                        need_norm = False
+                in_size = unit
+            return nn.Sequential(*layers), self.units[-1]
 
         def _init_weights(self):
             """Initialize network weights."""
+            mlp_init = self.init_factory.create(**self.initializer)
             for module in self.modules():
                 if isinstance(module, nn.Linear):
-                    nn.init.orthogonal_(module.weight, gain=1.0)
+                    mlp_init(module.weight)
                     if module.bias is not None:
                         nn.init.zeros_(module.bias)
+
+            if self.is_continuous:
+                mu_init = self.init_factory.create(**self.space_config.get("mu_init", {"name": "default"}))
+                sigma_init = self.init_factory.create(
+                    **self.space_config.get("sigma_init", {"name": "const_initializer", "val": 0})
+                )
+                mu_init(self.actor_output.weight)
+                if self.fixed_sigma:
+                    sigma_init(self.sigma)
+                else:
+                    sigma_init(self.sigma_head.weight)
 
         def _split_obs(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             """Split flat observation into point clouds and extended proprio.
@@ -377,10 +427,8 @@ class PointTransformerBuilder(A2CBuilder):
             extended_proprio = obs[:, :self.proprio_dim]  # (B, proprio_dim)
             point_flat = obs[:, self.proprio_dim:]        # (B, point_cloud_dim)
 
-            # Reshape point clouds to (B, num_timesteps, num_points, 3)
-            # Then permute to (B, num_points, num_timesteps, 3)
-            point_obs = point_flat.view(B, self.num_timesteps, self.num_points, 3)
-            point_obs = point_obs.permute(0, 2, 1, 3)  # (B, num_points, num_timesteps, 3)
+            # Reshape point clouds to (B, num_points, num_timesteps, 3)
+            point_obs = point_flat.view(B, self.num_points, self.num_timesteps, 3)
 
             return point_obs, extended_proprio
 
@@ -414,11 +462,15 @@ class PointTransformerBuilder(A2CBuilder):
             # Encode proprio: (B, proprio_dim) → (B, 1, hidden_dim)
             if self.proprio_dim > 0:
                 proprio_encoded = self.proprio_encoder(proprio_obs)  # (B, hidden_dim)
+                if self.proprio_norm is not None:
+                    proprio_encoded = self.proprio_norm(proprio_encoded)
                 proprio_token = proprio_encoded.unsqueeze(1)  # (B, 1, hidden_dim)
             else:
                 proprio_token = torch.zeros(B, 1, self.hidden_dim, device=obs.device)
             
-            # Cross-attention: shared between actor/critic
+            # Self-attention over point tokens, then cross-attention from proprio
+            point_tokens = self.self_attn(point_tokens)
+            point_tokens = self.self_ffn(point_tokens)
             attn_out = self.cross_attn(proprio_token, point_tokens)  # (B, 1, hidden_dim)
             attn_features = attn_out[:, 0]  # (B, hidden_dim)
 
@@ -428,21 +480,42 @@ class PointTransformerBuilder(A2CBuilder):
             else:
                 trunk_input = attn_features
 
-            # Separate trunks
-            actor_latent = self.actor_trunk(trunk_input)   # (B, 128)
-            critic_latent = self.critic_trunk(trunk_input)  # (B, 128)
+            # Trunks
+            actor_latent = self.actor_trunk(trunk_input)
+            if self.separate:
+                # Recompute critic features with separate encoders/attention
+                critic_point_encoded = self.critic_point_encoder(point_flat)
+                critic_point_tokens = critic_point_encoded.view(B, self.num_points, self.hidden_dim)
+                critic_point_tokens = self.critic_self_attn(critic_point_tokens)
+                critic_point_tokens = self.critic_self_ffn(critic_point_tokens)
+                if self.proprio_dim > 0:
+                    critic_proprio_encoded = self.critic_proprio_encoder(proprio_obs)
+                    if self.proprio_norm is not None:
+                        critic_proprio_encoded = self.proprio_norm(critic_proprio_encoded)
+                    critic_proprio_token = critic_proprio_encoded.unsqueeze(1)
+                else:
+                    critic_proprio_token = torch.zeros(B, 1, self.hidden_dim, device=obs.device)
+                critic_attn_out = self.critic_cross_attn(critic_proprio_token, critic_point_tokens)
+                critic_attn_features = critic_attn_out[:, 0]
+                if self.proprio_dim > 0:
+                    critic_trunk_input = torch.cat([proprio_obs, critic_attn_features], dim=-1)
+                else:
+                    critic_trunk_input = critic_attn_features
+                critic_latent = self.critic_trunk(critic_trunk_input)
+            else:
+                critic_latent = actor_latent
 
-            # Separate output layers
-            mu = self.actor_output(actor_latent)    # (B, actions_num)
-            value = self.critic_output(critic_latent)  # (B, value_size)
+            # Outputs
+            mu = self.mu_act(self.actor_output(actor_latent))
+            value = self.value_act(self.critic_output(critic_latent))
 
             # Sigma
             if self.fixed_sigma:
-                sigma = self.sigma.expand(B, -1)
+                sigma = self.sigma_act(self.sigma)
             else:
-                sigma = self.sigma_head(actor_latent)
-            
-            return mu, sigma, value, None
+                sigma = self.sigma_act(self.sigma_head(actor_latent))
+
+            return mu, mu * 0 + sigma, value, None
 
         def is_rnn(self) -> bool:
             """Return False - this is not a recurrent network."""
@@ -495,146 +568,3 @@ class PointTransformerBuilder(A2CBuilder):
         return self.Network(self.params, **kwargs)
 
 
-class PointNetTNetBuilder(A2CBuilder):
-    """Builder for PointNet+TNet encoder with standard actor/critic trunks."""
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.params = None
-
-    class Network(A2CBuilder.Network):
-        """PointNet-style network with two T-Nets and global max pooling."""
-
-        def __init__(self, params, **kwargs):
-            nn.Module.__init__(self)
-            self.params = params
-            self.actions_num = kwargs.get("actions_num")
-            self.value_size = kwargs.get("value_size", 1)
-            input_shape = kwargs.get("input_shape")
-            self.obs_dim = input_shape[0] if isinstance(input_shape, (tuple, list)) else input_shape
-
-            self.num_points = params["num_points"]
-            self.num_timesteps = params["num_timesteps"]
-
-            self.point_cloud_dim = self.num_points * self.num_timesteps * 3
-            self.proprio_dim = self.obs_dim - self.point_cloud_dim
-            if self.proprio_dim < 0:
-                raise ValueError(
-                    f"Observation dim ({self.obs_dim}) is smaller than point cloud dim "
-                    f"({self.point_cloud_dim}). Check num_points and num_timesteps."
-                )
-
-            point_dim = self.num_timesteps * 3
-            self.tnet1 = PointNetTNet(point_dim, hidden_dim=16)
-            self.tnet2 = PointNetTNet(32, hidden_dim=16)
-            self.mlp1 = nn.Sequential(
-                nn.Linear(point_dim, 32),
-                nn.ELU(),
-            )
-            self.mlp2 = nn.Sequential(
-                nn.Linear(32, 64),
-                nn.ELU(),
-            )
-
-            trunk_input_dim = self.proprio_dim + 64
-            self.actor_trunk = nn.Sequential(
-                nn.Linear(trunk_input_dim, 512),
-                nn.ELU(),
-                nn.Linear(512, 256),
-                nn.ELU(),
-                nn.Linear(256, 128),
-                nn.ELU(),
-            )
-            self.critic_trunk = nn.Sequential(
-                nn.Linear(trunk_input_dim, 512),
-                nn.ELU(),
-                nn.Linear(512, 256),
-                nn.ELU(),
-                nn.Linear(256, 128),
-                nn.ELU(),
-            )
-            self.actor_output = nn.Linear(128, self.actions_num)
-            self.critic_output = nn.Linear(128, self.value_size)
-
-            space_config = params.get("space", {}).get("continuous", {})
-            self.fixed_sigma = space_config.get("fixed_sigma", True)
-            if self.fixed_sigma:
-                sigma_init_val = space_config.get("sigma_init", {}).get("val", 0)
-                self.sigma = nn.Parameter(torch.zeros(self.actions_num) + sigma_init_val, requires_grad=True)
-            else:
-                self.sigma_head = nn.Linear(128, self.actions_num)
-
-            self._init_weights()
-
-        def _init_weights(self):
-            for module in self.modules():
-                if isinstance(module, nn.Linear):
-                    nn.init.orthogonal_(module.weight, gain=1.0)
-                    if module.bias is not None:
-                        nn.init.zeros_(module.bias)
-
-        def _split_obs(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            B = obs.shape[0]
-            obs_dim = obs.shape[1]
-            if obs_dim != self.proprio_dim + self.point_cloud_dim:
-                raise ValueError(
-                    "PointNet obs split mismatch: expected obs_dim="
-                    f"{self.proprio_dim + self.point_cloud_dim} but got {obs_dim}."
-                )
-            proprio_obs = obs[:, :self.proprio_dim]
-            point_flat = obs[:, self.proprio_dim:]
-            point_obs = point_flat.view(B, self.num_points, self.num_timesteps, 3)
-            return point_obs, proprio_obs
-
-        def forward(self, obs_dict: Dict[str, Any]):
-            obs = obs_dict["obs"]
-            B = obs.shape[0]
-            point_obs, proprio_obs = self._split_obs(obs)
-
-            point_feat = point_obs.reshape(B, self.num_points, -1)  # (B, P, num_timesteps * 3)
-            trans1 = self.tnet1(point_feat)
-            point_feat = torch.bmm(point_feat, trans1)
-
-            point_feat = self.mlp1(point_feat)  # (B, P, 64)
-            trans2 = self.tnet2(point_feat)
-            point_feat = torch.bmm(point_feat, trans2)
-
-            point_feat = self.mlp2(point_feat)  # (B, P, 64)
-            global_feat = point_feat.max(dim=1).values  # (B, 64)
-
-            trunk_input = torch.cat([proprio_obs, global_feat], dim=-1)
-            actor_latent = self.actor_trunk(trunk_input)
-            critic_latent = self.critic_trunk(trunk_input)
-            mu = self.actor_output(actor_latent)
-            value = self.critic_output(critic_latent)
-
-            if self.fixed_sigma:
-                sigma = self.sigma.expand(B, -1)
-            else:
-                sigma = self.sigma_head(actor_latent)
-
-            return mu, sigma, value, None
-
-        def is_rnn(self) -> bool:
-            return False
-
-    def _inject_params(self, params):
-        from ..config_loader import get_config
-        import os
-
-        mode = os.getenv("Y2R_MODE")
-        y2r_cfg = get_config(mode)
-        params["num_points"] = y2r_cfg.observations.num_points
-        num_current = y2r_cfg.observations.history.object_pc
-        num_future = y2r_cfg.trajectory.window_size * y2r_cfg.observations.history.targets
-        params["num_timesteps"] = num_current + num_future
-
-    def load(self, params):
-        self._inject_params(params)
-        self.params = params
-
-    def build(self, name: str, **kwargs) -> Network:
-        if self.params is None:
-            self.params = {}
-            self._inject_params(self.params)
-        return self.Network(self.params, **kwargs)

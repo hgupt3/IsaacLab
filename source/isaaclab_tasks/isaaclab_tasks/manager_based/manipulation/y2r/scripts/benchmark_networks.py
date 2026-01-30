@@ -13,6 +13,7 @@ from typing import Dict
 import sys
 import os
 import importlib.util
+import copy
 
 # Add parent directory to path to import modules
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../' * 6))
@@ -150,8 +151,8 @@ def create_mlp_network(obs_dim: int, action_dim: int, config: dict) -> torch.nn.
 def create_point_transformer(obs_dim: int, action_dim: int, config: dict) -> torch.nn.Module:
     """Create Point Transformer network."""
     # Manually set params to avoid config_loader dependency
-    config['num_points'] = 64
-    config['num_timesteps'] = 10
+    config['num_points'] = 32
+    config['num_timesteps'] = 6
 
     builder = PointTransformerBuilder()
     builder.params = config  # Skip load() to avoid config_loader
@@ -252,11 +253,34 @@ def main():
     mlp_params = sum(p.numel() for p in mlp_network.parameters())
     print(f"  Parameters: {mlp_params:,}")
 
-    print("Creating PointNet (T-Net) network...")
-    pt_base = create_point_transformer(args.obs_dim, args.action_dim, pt_cfg['network'])
-    pt_pointnet = PTPointNetWrapper(pt_base)
-    pt_pointnet_params = sum(p.numel() for p in pt_pointnet.parameters())
-    print(f"  PT (pointnet) parameters: {pt_pointnet_params:,}\n")
+    # Point Transformer variants
+    base_pt_cfg = pt_cfg['network']
+    hidden_dim = base_pt_cfg.get("hidden_dim", 64)
+
+    def _pt_cfg(**overrides):
+        cfg = copy.deepcopy(base_pt_cfg)
+        cfg.update(overrides)
+        return cfg
+
+    print("Creating Point Transformer networks...")
+    pt_baseline = create_point_transformer(args.obs_dim, args.action_dim, _pt_cfg())
+    pt_ffn1 = create_point_transformer(args.obs_dim, args.action_dim, _pt_cfg(ffn_ratio=1.0))
+    pt_ffn2 = create_point_transformer(args.obs_dim, args.action_dim, _pt_cfg(ffn_ratio=2.0))
+    pt_ffn2_enc2 = create_point_transformer(
+        args.obs_dim,
+        args.action_dim,
+        _pt_cfg(ffn_ratio=2.0, point_encoder_layers=[hidden_dim, hidden_dim]),
+    )
+
+    pt_baseline_params = sum(p.numel() for p in pt_baseline.parameters())
+    pt_ffn1_params = sum(p.numel() for p in pt_ffn1.parameters())
+    pt_ffn2_params = sum(p.numel() for p in pt_ffn2.parameters())
+    pt_ffn2_enc2_params = sum(p.numel() for p in pt_ffn2_enc2.parameters())
+
+    print(f"  PT baseline parameters: {pt_baseline_params:,}")
+    print(f"  PT ffn1 parameters:     {pt_ffn1_params:,}")
+    print(f"  PT ffn2 parameters:     {pt_ffn2_params:,}")
+    print(f"  PT ffn2+enc2 params:    {pt_ffn2_enc2_params:,}\n")
 
     use_cuda = args.device.startswith("cuda") and torch.cuda.is_available()
     if args.device.startswith("cuda") and not use_cuda:
@@ -268,35 +292,55 @@ def main():
         torch.cuda.reset_peak_memory_stats()
     mlp_stats = benchmark_network(mlp_network, obs, args.num_iters, device=args.device)
 
-    # Benchmark PointNet variant
-    print("Benchmarking PointNet (T-Net) network...")
+    # Benchmark Point Transformer variants
+    print("Benchmarking PT baseline...")
     if use_cuda:
         torch.cuda.reset_peak_memory_stats()
-    pt_pointnet_stats = benchmark_network(pt_pointnet, obs, args.num_iters, device=args.device)
+    pt_baseline_stats = benchmark_network(pt_baseline, obs, args.num_iters, device=args.device)
+
+    print("Benchmarking PT ffn1...")
+    if use_cuda:
+        torch.cuda.reset_peak_memory_stats()
+    pt_ffn1_stats = benchmark_network(pt_ffn1, obs, args.num_iters, device=args.device)
+
+    print("Benchmarking PT ffn2...")
+    if use_cuda:
+        torch.cuda.reset_peak_memory_stats()
+    pt_ffn2_stats = benchmark_network(pt_ffn2, obs, args.num_iters, device=args.device)
+
+    print("Benchmarking PT ffn2 + 2-layer encoder...")
+    if use_cuda:
+        torch.cuda.reset_peak_memory_stats()
+    pt_ffn2_enc2_stats = benchmark_network(pt_ffn2_enc2, obs, args.num_iters, device=args.device)
 
     # Print results
     print(f"\n{'='*60}")
     print("RESULTS")
     print(f"{'='*60}\n")
 
-    print(f"{'Metric':<30} {'MLP':<20} {'PT pointnet':<20}")
+    print(f"{'Metric':<30} {'MLP':<16} {'PT base':<16} {'PT ffn1':<16} {'PT ffn2':<16} {'PT ffn2+enc2':<16}")
     print(f"{'-'*75}")
 
     print(
-        f"{'Parameters':<30} {mlp_params:<20,} {pt_pointnet_params:<20,}"
+        f"{'Parameters':<30} {mlp_params:<16,} {pt_baseline_params:<16,} {pt_ffn1_params:<16,} "
+        f"{pt_ffn2_params:<16,} {pt_ffn2_enc2_params:<16,}"
     )
     print(
-        f"{'Mean Latency (ms)':<30} {mlp_stats['mean_ms']:<20.3f} {pt_pointnet_stats['mean_ms']:<20.3f}"
+        f"{'Mean Latency (ms)':<30} {mlp_stats['mean_ms']:<16.3f} {pt_baseline_stats['mean_ms']:<16.3f} "
+        f"{pt_ffn1_stats['mean_ms']:<16.3f} {pt_ffn2_stats['mean_ms']:<16.3f} {pt_ffn2_enc2_stats['mean_ms']:<16.3f}"
     )
     print(
-        f"{'Std Latency (ms)':<30} {mlp_stats['std_ms']:<20.3f} {pt_pointnet_stats['std_ms']:<20.3f}"
+        f"{'Std Latency (ms)':<30} {mlp_stats['std_ms']:<16.3f} {pt_baseline_stats['std_ms']:<16.3f} "
+        f"{pt_ffn1_stats['std_ms']:<16.3f} {pt_ffn2_stats['std_ms']:<16.3f} {pt_ffn2_enc2_stats['std_ms']:<16.3f}"
     )
     print(
-        f"{'Throughput (envs/sec)':<30} {mlp_stats['throughput_envs_per_sec']:<20,.0f} "
-        f"{pt_pointnet_stats['throughput_envs_per_sec']:<20,.0f}"
+        f"{'Throughput (envs/sec)':<30} {mlp_stats['throughput_envs_per_sec']:<16,.0f} "
+        f"{pt_baseline_stats['throughput_envs_per_sec']:<16,.0f} {pt_ffn1_stats['throughput_envs_per_sec']:<16,.0f} "
+        f"{pt_ffn2_stats['throughput_envs_per_sec']:<16,.0f} {pt_ffn2_enc2_stats['throughput_envs_per_sec']:<16,.0f}"
     )
     print(
-        f"{'GPU Memory (MB)':<30} {mlp_stats['memory_mb']:<20.1f} {pt_pointnet_stats['memory_mb']:<20.1f}"
+        f"{'GPU Memory (MB)':<30} {mlp_stats['memory_mb']:<16.1f} {pt_baseline_stats['memory_mb']:<16.1f} "
+        f"{pt_ffn1_stats['memory_mb']:<16.1f} {pt_ffn2_stats['memory_mb']:<16.1f} {pt_ffn2_enc2_stats['memory_mb']:<16.1f}"
     )
 
     print(f"\n{'='*60}\n")
@@ -318,7 +362,10 @@ def main():
         else:
             print(f"ℹ️  {label} memory comparison skipped (CPU run)")
 
-    _speed_msg("PT pointnet", pt_pointnet_stats)
+    _speed_msg("PT baseline", pt_baseline_stats)
+    _speed_msg("PT ffn1", pt_ffn1_stats)
+    _speed_msg("PT ffn2", pt_ffn2_stats)
+    _speed_msg("PT ffn2+enc2", pt_ffn2_enc2_stats)
 
     print()
 

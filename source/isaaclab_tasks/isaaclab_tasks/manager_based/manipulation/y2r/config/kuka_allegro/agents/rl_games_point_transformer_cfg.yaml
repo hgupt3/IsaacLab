@@ -23,11 +23,26 @@ params:
 
   network:
     name: point_transformer
-
+    separate: False
     # Cross-Attention Point Network architecture
     # (Shared attention between actor/critic, separate final heads)
     hidden_dim: 64            # Token embedding dimension
     num_heads: 4              # Cross-attention heads
+    ffn_ratio: 1.0            # Token FFN expansion ratio
+    ffn_dropout: 0.02         # FFN dropout (light regularization)
+    attn_dropout: 0.02        # Attention dropout (light regularization)
+    point_encoder_layers: [64, 64]  # 2-layer point encoder
+    point_encoder_norm: True  # LayerNorm on point tokens
+    proprio_encoder_layers: [64, 64]  # 2-layer proprio encoder
+    proprio_encoder_norm: True  # LayerNorm on proprio token
+    mlp:
+      units: [512, 256, 128]
+      activation: elu
+      d2rl: False
+      initializer:
+        name: default
+      regularizer:
+        name: None
     
     # Action distribution config (same as original)
     space:
@@ -54,24 +69,24 @@ params:
     mixed_precision: True
     normalize_input: True
     normalize_value: True
-    value_bootstrap: False
+    value_bootstrap: True
     num_actors: -1
     reward_shaper:
       scale_value: 0.01
     normalize_advantage: True
-    gamma: 0.99
+    gamma: 0.998
     tau: 0.95
     learning_rate: 1e-3
     lr_schedule: adaptive
     schedule_type: legacy
-    kl_threshold: 0.01
+    kl_threshold: 0.012
     score_to_win: 100000000
     max_epochs: 750000
     save_best_after: 100
     save_frequency: 50
     print_stats: True
     grad_norm: 1.0
-    entropy_coef: 0.002
+    entropy_coef: 0.003
     truncate_grads: True
     e_clip: 0.2
     horizon_length: 36

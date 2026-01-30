@@ -10,7 +10,8 @@ Import this module before creating the rl_games Runner to enable custom networks
 
 from rl_games.algos_torch.model_builder import register_network
 
-from .point_transformer import PointTransformerBuilder, PointNetTNetBuilder
+from .point_transformer import PointTransformerBuilder
+from .pointnet_tnet import PointNetTNetBuilder
 from .depth_resnet_student import DepthResNetStudentBuilder
 
 # Register Point-Transformer network with rl_games

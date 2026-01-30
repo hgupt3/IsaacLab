@@ -1326,8 +1326,23 @@ class target_sequence_obs_b(ManagerTermBase):
                 palm_quat = self.ref_asset.data.body_quat_w[reset_ids, self._palm_body_idx]
                 start_palm_poses = torch.cat([palm_pos, palm_quat], dim=-1)
             
+            difficulties = None
+            curriculum_manager = getattr(env, "curriculum_manager", None)
+            if curriculum_manager is not None:
+                adr_cfg = getattr(curriculum_manager, "cfg", None)
+                adr = getattr(adr_cfg, "adr", None) if adr_cfg is not None else None
+                scheduler = getattr(adr, "func", None) if adr is not None else None
+                if scheduler is not None and hasattr(scheduler, "current_adr_difficulties"):
+                    difficulties = scheduler.current_adr_difficulties[reset_ids]
+
             # Scales are read once at trajectory_manager init from USD prims
-            self.trajectory_manager.reset(reset_ids, start_poses, env_origins, start_palm_poses)
+            self.trajectory_manager.reset(
+                reset_ids,
+                start_poses,
+                env_origins,
+                start_palm_poses,
+                difficulties,
+            )
         
         # Step trajectory (advance time)
         # For push-T mode: pass current object poses for replanning

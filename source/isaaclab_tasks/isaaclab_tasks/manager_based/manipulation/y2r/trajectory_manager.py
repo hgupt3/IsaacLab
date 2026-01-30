@@ -65,7 +65,8 @@ class TrajectoryManager:
         max_duration = 0.0
         for seg in traj.segments:
             if seg.type == "random_waypoint":
-                max_duration += seg.count[1] * (seg.movement_duration + seg.pause_duration)
+                max_count = self._get_max_count_from_curriculum(seg.count, seg.curriculum)
+                max_duration += max_count * (seg.movement_duration + seg.pause_duration)
             else:
                 max_duration += seg.duration
 
@@ -107,7 +108,10 @@ class TrajectoryManager:
         self.grasp_standoff = torch.zeros(num_envs, device=device)
         self.grasp_surface_idx = torch.zeros(num_envs, dtype=torch.long, device=device)
 
-        max_keypoints = hand_cfg.keypoints.count[1]
+        max_keypoints = self._get_max_count_from_curriculum(
+            hand_cfg.keypoints.count,
+            hand_cfg.keypoints.curriculum,
+        )
         self.keypoint_surface_points = torch.zeros(num_envs, max_keypoints, 3, device=device)
         self.keypoint_surface_normals = torch.zeros(num_envs, max_keypoints, 3, device=device)
         self.keypoint_rolls = torch.zeros(num_envs, max_keypoints, device=device)
@@ -124,7 +128,9 @@ class TrajectoryManager:
         # Segment-based trajectory
         # Max segments after random_waypoint expansion (each becomes movement + pause)
         max_segments_after_expansion = sum(
-            seg.count[1] * 2 if seg.type == "random_waypoint" else 1
+            self._get_max_count_from_curriculum(seg.count, seg.curriculum) * 2
+            if seg.type == "random_waypoint"
+            else 1
             for seg in cfg.trajectory.segments
         )
         self.segment_poses = torch.zeros(num_envs, max_segments_after_expansion, 7, device=device)
@@ -191,7 +197,76 @@ class TrajectoryManager:
                     scale=1.0,  # Base z_offset at unit scale
                 )
 
-    def _expand_segments(self, env_ids: torch.Tensor, start_poses: torch.Tensor, env_origins: torch.Tensor):
+    @staticmethod
+    def _get_curriculum_count_overrides(curriculum: dict | None) -> list[tuple[float, tuple[int, int]]]:
+        """Return sorted (level, (min,max)) override list from curriculum dict."""
+        if not isinstance(curriculum, dict):
+            return []
+        count_overrides = curriculum.get("count")
+        if not isinstance(count_overrides, dict):
+            return []
+        overrides: list[tuple[float, tuple[int, int]]] = []
+        for level, value in count_overrides.items():
+            try:
+                level_value = float(level)
+            except (TypeError, ValueError):
+                continue
+            if value is None:
+                continue
+            overrides.append((level_value, (int(value[0]), int(value[1]))))
+        return sorted(overrides, key=lambda item: item[0])
+
+    def _get_max_count_from_curriculum(self, base_count: tuple[int, int], curriculum: dict | None) -> int:
+        """Get worst-case max count across base and curriculum overrides."""
+        max_count = int(base_count[1])
+        for _, override in self._get_curriculum_count_overrides(curriculum):
+            max_count = max(max_count, int(override[1]))
+        return max_count
+
+    def _resolve_curriculum_count(
+        self,
+        base_count: tuple[int, int],
+        curriculum: dict | None,
+        difficulties: torch.Tensor | None,
+        num_envs: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Resolve per-env [min,max] count range based on difficulty."""
+        min_default = int(base_count[0])
+        max_default = int(base_count[1])
+        min_counts = torch.full((num_envs,), min_default, device=self.device, dtype=torch.long)
+        max_counts = torch.full((num_envs,), max_default, device=self.device, dtype=torch.long)
+
+        overrides = self._get_curriculum_count_overrides(curriculum)
+        if difficulties is None or not overrides:
+            return min_counts, max_counts
+
+        levels = torch.tensor([item[0] for item in overrides], device=self.device, dtype=torch.float32)
+        override_min = torch.tensor([item[1][0] for item in overrides], device=self.device, dtype=torch.long)
+        override_max = torch.tensor([item[1][1] for item in overrides], device=self.device, dtype=torch.long)
+
+        diffs = difficulties.to(self.device).float().view(-1)
+        if diffs.numel() != num_envs:
+            diffs = diffs[:num_envs]
+
+        mask = diffs.unsqueeze(1) >= levels.unsqueeze(0)
+        idx_range = torch.arange(levels.numel(), device=self.device).unsqueeze(0).expand(num_envs, -1)
+        invalid = torch.full_like(idx_range, -1)
+        selected_idx = torch.where(mask, idx_range, invalid).max(dim=1).values
+        has_override = selected_idx >= 0
+        selected_idx = selected_idx.clamp(min=0)
+
+        min_counts = torch.where(has_override, override_min[selected_idx], min_counts)
+        max_counts = torch.where(has_override, override_max[selected_idx], max_counts)
+
+        return min_counts, max_counts
+
+    def _expand_segments(
+        self,
+        env_ids: torch.Tensor,
+        start_poses: torch.Tensor,
+        env_origins: torch.Tensor,
+        difficulties: torch.Tensor | None = None,
+    ):
         """FULLY VECTORIZED: Expand segment configs (random_waypoint → N waypoint segments).
 
         Process ALL envs in parallel - ZERO LOOPS!
@@ -200,6 +275,7 @@ class TrajectoryManager:
             env_ids: Environment indices to expand for
             start_poses: Starting object poses (n, 7)
             env_origins: World origin offset for each env (n, 3)
+            difficulties: Optional per-env difficulty levels for curriculum overrides
         """
         from isaaclab.utils.math import quat_mul, quat_from_euler_xyz
 
@@ -225,12 +301,16 @@ class TrajectoryManager:
         for seg_config in self.cfg.trajectory.segments:
             if seg_config.type == "random_waypoint":
                 # Each waypoint becomes two segments: movement + pause
-                num_wp_per_env = torch.randint(
-                    seg_config.count[0],
-                    seg_config.count[1] + 1,
-                    (n,),
-                    device=self.device
+                min_counts, max_counts = self._resolve_curriculum_count(
+                    seg_config.count,
+                    seg_config.curriculum,
+                    difficulties,
+                    n,
                 )
+                range_sizes = (max_counts - min_counts + 1).clamp(min=1)
+                num_wp_per_env = min_counts + torch.floor(
+                    torch.rand(n, device=self.device) * range_sizes
+                ).long()
 
                 max_wp = num_wp_per_env.max().item()
 
@@ -396,6 +476,7 @@ class TrajectoryManager:
         start_poses: torch.Tensor,
         env_origins: torch.Tensor,
         start_palm_poses: torch.Tensor | None = None,
+        difficulties: torch.Tensor | None = None,
     ):
         """
         Reset trajectory for specified environments.
@@ -407,6 +488,7 @@ class TrajectoryManager:
             start_poses: Starting object poses (n, 7) - pos(3) + quat(4).
             env_origins: World origin offset for each env (n, 3).
             start_palm_poses: Starting palm poses (n, 7) - optional, for hand trajectory.
+            difficulties: Optional per-env difficulty levels for curriculum overrides.
         """
         if len(env_ids) == 0:
             return
@@ -414,7 +496,7 @@ class TrajectoryManager:
         n = len(env_ids)
 
         # Expand segments (random_waypoint → N waypoints)
-        self._expand_segments(env_ids, start_poses, env_origins)
+        self._expand_segments(env_ids, start_poses, env_origins, difficulties)
         
         # Reset timing
         self.phase_time[env_ids] = 0.0
@@ -547,7 +629,7 @@ class TrajectoryManager:
         # Sample grasp keypoints (perturbed from grasp pose)
         # Must be AFTER trajectory generation so we can look up object poses at keypoint times
         if self.cfg.hand_trajectory.enabled:
-            self._sample_grasp_keypoints(env_ids)
+            self._sample_grasp_keypoints(env_ids, difficulties)
         
         # For push_t: initialize tracking for manipulation phase replanning
         if self.cfg.push_t.enabled:
@@ -1073,6 +1155,19 @@ class TrajectoryManager:
         n = base_quat.shape[0]
         device = base_quat.device
 
+        # Chunk large batches to avoid huge (n x num_samples) allocations.
+        max_batch = 65536
+        if n > max_batch:
+            results = torch.empty_like(desired_roll)
+            for start in range(0, n, max_batch):
+                end = min(start + max_batch, n)
+                results[start:end] = self._compute_feasible_roll_multi_constraint(
+                    base_quat[start:end],
+                    desired_roll[start:end],
+                    constraints,
+                )
+            return results
+
         # Get X and Y axes of palm frame in world coordinates
         x_axis = torch.tensor([1.0, 0.0, 0.0], device=device)
         y_axis = torch.tensor([0.0, 1.0, 0.0], device=device)
@@ -1183,8 +1278,7 @@ class TrajectoryManager:
             (n, 7) object poses at keypoint time.
         """
         n = len(env_ids)
-        cfg = self.cfg
-        max_kp = cfg.hand_trajectory.keypoints.count[1]
+        max_kp = self.keypoint_surface_points.shape[1]
 
         # Keypoints are distributed through manipulation phase
         # kp_idx=0 is near start of manipulation, kp_idx=max_kp-1 is near end
@@ -1267,7 +1361,7 @@ class TrajectoryManager:
 
         return palm_pos_world, palm_quat_world
 
-    def _sample_grasp_keypoints(self, env_ids: torch.Tensor):
+    def _sample_grasp_keypoints(self, env_ids: torch.Tensor, difficulties: torch.Tensor | None = None):
         """Sample feasibility-checked keypoints from nearby surface points.
 
         Each keypoint is a perturbed surface point with perturbed roll that results
@@ -1280,17 +1374,24 @@ class TrajectoryManager:
 
         Args:
             env_ids: Environment indices.
+            difficulties: Optional per-env difficulty levels for curriculum overrides.
         """
         from .mdp.utils import get_point_cloud_cache
 
         n = len(env_ids)
         cfg = self.cfg.hand_trajectory.keypoints
-        max_kp = cfg.count[1]
+        max_kp = self.keypoint_surface_points.shape[1]
 
-        # Random number of keypoints per env
-        self.num_grasp_keypoints[env_ids] = torch.randint(
-            cfg.count[0], cfg.count[1] + 1, (n,), device=self.device
+        min_counts, max_counts = self._resolve_curriculum_count(
+            cfg.count,
+            cfg.curriculum,
+            difficulties,
+            n,
         )
+        range_sizes = (max_counts - min_counts + 1).clamp(min=1)
+        self.num_grasp_keypoints[env_ids] = min_counts + torch.floor(
+            torch.rand(n, device=self.device) * range_sizes
+        ).long()
 
         if max_kp == 0:
             return
