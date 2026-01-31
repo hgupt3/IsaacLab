@@ -198,12 +198,12 @@ rewards:
   action_l2:
     weight: -0.005
     params:
-      finger_scale: 0.125   
+      finger_scale: 0.1
     
   action_rate_l2:
     weight: -0.005
     params:
-      finger_scale: 0.125    
+      finger_scale: 0.1    
     
   fingers_to_object:
     weight: 1.5
@@ -212,7 +212,7 @@ rewards:
       use_hand_pose_gate: true        # Optional hand pose gating
       std: 0.4
       error_gate_pos_threshold: 0.10   # meters (pose mode) / mean error (pc mode)
-      error_gate_pos_slope: 0.02       # meters; smaller = sharper gate
+      error_gate_pos_slope: 0.05       # meters; smaller = sharper gate
       error_gate_rot_threshold: 1.0    # radians (pose mode only); set null to ignore rotation
       error_gate_rot_slope: 0.5        # radians
     
@@ -262,7 +262,7 @@ rewards:
       term_keys: ["trajectory_deviation", "hand_pose_deviation", "abnormal_robot"]
     
   arm_table_penalty:
-    weight: -0.5
+    weight: -0.3
     params:
       table_z: 0.255
       threshold_mid: 0.1         # Safe height above table for links 3,4,5
@@ -270,23 +270,23 @@ rewards:
     
   # Robot-specific (Kuka Allegro)
   good_finger_contact:
-    weight: 1.0
+    weight: 2.0
     params:
       phases: [manipulation, release]  # Active in all phases
-      use_hand_pose_gate: false         # Apply hand pose gate from hand_pose_following
+      use_hand_pose_gate: true         # Apply hand pose gate from hand_pose_following
       invert_in_release: true          # Invert reward in release (reward NO contact)
       threshold: 1.0                   # Contact force threshold (Newtons)
     
   finger_manipulation:
-    weight: 4.0
+    weight: 5.0
     params:
       phases: [manipulation]    # Active in grasp and manipulation phases
-      use_hand_pose_gate: false         # Apply hand pose gate from hand_pose_following
+      use_hand_pose_gate: true         # Apply hand pose gate from hand_pose_following
       pos_std: 0.02               # Position change threshold (meters)
       rot_std: 0.2                # Rotation change threshold (radians)
     
   distal_joint3_penalty:
-    weight: -0.4
+    weight: -0.3
     params:
       phases: [grasp, manipulation, release]  # Active in all phases (no phase restriction)
       std: 1.5                    # (rad) larger = more lenient
@@ -295,7 +295,7 @@ rewards:
       contact_threshold: 1.0
     
   palm_velocity_penalty:
-    weight: 0.5
+    weight: 0.0
     params:
       angular_std: 0.7            # Angular velocity threshold (rad/s) - stricter
       linear_std: 1.0             # Linear velocity threshold (m/s)
@@ -308,14 +308,14 @@ rewards:
 
   # Penalize being too close to joint soft limits (encourages "comfort zone" postures)
   joint_limits_margin:
-    weight: -0.1
+    weight: 0.0
     params:
       threshold: 0.95             # in (0,1): 0.9 means penalize last 10% near either limit
       power: 2.0                  # >=1: higher = sharper penalty near limits
 
   # Rewards *reducing* current target error (helps recovery if policy freezes).
   tracking_progress:
-    weight: 3.0
+    weight: 4.0
     params:
       phases: [grasp, manipulation, release]  # Active in all phases
       use_hand_pose_gate: false         # Apply hand pose gate from hand_pose_following
@@ -356,7 +356,7 @@ rewards:
   
   # Finger regularizer - penalizes deviation from neutral/default finger pose
   finger_regularizer:
-    weight: -0.3                  # Negative = penalty
+    weight: -0.1                  # Negative = penalty
     params:
       phases: [grasp, release]    # Active in grasp and release phases
       # Default finger joint positions (Allegro hand - 16 joints)
@@ -365,7 +365,7 @@ rewards:
   
   # Object stillness - penalizes object movement during grasp/release
   object_stillness:
-    weight: -1.0                  # Negative = penalty
+    weight: -0.3                  # Negative = penalty
     params:
       phases: [release]    # Active in grasp and release phases
       lin_std: 0.02               # Scaling for linear velocity penalty (m/s)

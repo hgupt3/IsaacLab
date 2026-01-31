@@ -183,6 +183,9 @@ class PointTransformerBuilder(A2CBuilder):
             self.point_encoder_norm = params.get("point_encoder_norm", False)
             self.proprio_encoder_norm = params.get("proprio_encoder_norm", False)
             self.proprio_encoder_layers = params.get("proprio_encoder_layers", None)
+            self.partial_separate = params.get("partial_separate", False)
+            if self.separate and self.partial_separate:
+                self.partial_separate = False
 
             self.has_space = "space" in params
             if self.has_space:
@@ -267,7 +270,7 @@ class PointTransformerBuilder(A2CBuilder):
             # Build trunks and output layers
             trunk_input_dim = (self.proprio_dim + self.hidden_dim) if self.proprio_dim > 0 else self.hidden_dim
             self.actor_trunk, trunk_output_dim = self._build_trunk(trunk_input_dim)
-            if self.separate:
+            if self.separate or self.partial_separate:
                 self.critic_trunk, _ = self._build_trunk(trunk_input_dim)
             else:
                 self.critic_trunk = self.actor_trunk
@@ -501,6 +504,12 @@ class PointTransformerBuilder(A2CBuilder):
                     critic_trunk_input = torch.cat([proprio_obs, critic_attn_features], dim=-1)
                 else:
                     critic_trunk_input = critic_attn_features
+                critic_latent = self.critic_trunk(critic_trunk_input)
+            elif self.partial_separate:
+                if self.proprio_dim > 0:
+                    critic_trunk_input = torch.cat([proprio_obs, attn_features.detach()], dim=-1)
+                else:
+                    critic_trunk_input = attn_features.detach()
                 critic_latent = self.critic_trunk(critic_trunk_input)
             else:
                 critic_latent = actor_latent
