@@ -65,7 +65,7 @@ class DifficultyScheduler(ManagerTermBase):
     - Performance-based logic can still push difficulty higher than floor
     
     Performance-based advancement:
-    - Advances when object is at goal during release phase
+    - Advances when episode timed out (full trajectory completed) and object is at goal
     - Can be disabled by setting use_performance=False
 
     The normalized average difficulty is exposed as `difficulty_frac` for curriculum interpolation.
@@ -157,8 +157,9 @@ class DifficultyScheduler(ManagerTermBase):
                 rot_errors = quat_error_magnitude(object_quat_w, goal_quat)  # (n,)
                 at_goal = (pos_errors < effective_pos_tol) & (rot_errors < effective_rot_tol)
             
-            # Promote if at goal
-            move_up = at_goal
+            # Promote only if episode timed out (completed full trajectory) AND object is at goal
+            timed_out = env.reset_time_outs[env_ids]
+            move_up = timed_out & at_goal
             
             demot = self.current_adr_difficulties[env_ids] if promotion_only else self.current_adr_difficulties[env_ids] - 1
             perf_difficulties = torch.where(
