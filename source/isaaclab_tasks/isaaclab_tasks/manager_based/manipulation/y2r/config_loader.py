@@ -372,6 +372,7 @@ class CurriculumConfig:
     advancement_tolerances: AdvancementTolerancesConfig
     noise: NoiseConfig
     gate_floor: tuple[float, float]
+    grasp_scale: tuple[float, float]
     gravity: GravityConfig
 
 

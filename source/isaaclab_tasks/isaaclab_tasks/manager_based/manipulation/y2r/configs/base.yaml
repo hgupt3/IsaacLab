@@ -12,7 +12,7 @@
 simulation:
   physics_dt: 0.01              # 1/100 seconds (100 Hz physics)
   decimation: 2                 # Control at 50 Hz (physics_dt * decimation)
-  num_envs: 16384
+  num_envs: 18432
   env_spacing: 3.0
   replicate_physics: false
 
@@ -219,7 +219,7 @@ rewards:
   lookahead_tracking:
     weight: 6.0
     params:
-      phases: [manipulation]            # Active in manipulation phase only
+      phases: [grasp, manipulation]      # Active in grasp and manipulation phases
       path_mode: true              # Enable path segment tracking (true = smooth motion, false = discrete waypoints)
       timing_aware: true           # Use temporal interpolation (where should object be NOW based on time)
       use_hand_pose_gate: true     # Apply hand pose gate from hand_pose_following
@@ -381,7 +381,7 @@ terminations:
   
   hand_pose_deviation:
     position_threshold: [0.3, 0.1]         # meters (lenient → strict)
-    rotation_threshold: [3.14, 1.0]        # radians ~180° → ~57°
+    rotation_threshold: [3.14, 2.5]        # radians ~180° → ~143°
 
 # ==============================================================================
 # CURRICULUM (Adaptive Domain Randomization)
@@ -419,6 +419,9 @@ curriculum:
     
   # Hand pose gate floor: [initial (lenient), final (strict)]
   gate_floor: [0.9, 0.1]
+
+  # Grasp phase scaling for lookahead tracking: [initial, final]
+  grasp_scale: [1.0, 0.0]
     
   # Gravity scheduling (m/s²)
   gravity:

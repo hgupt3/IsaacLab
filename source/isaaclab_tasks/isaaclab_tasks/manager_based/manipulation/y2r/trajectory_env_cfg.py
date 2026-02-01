@@ -721,6 +721,7 @@ def _build_rewards_cfg(cfg: Y2RConfig):
                 "neg_scale": cfg.rewards.lookahead_tracking.params["neg_scale"],
                 "rot_neg_threshold": cfg.rewards.lookahead_tracking.params["rot_neg_threshold"],
                 "rot_neg_std": cfg.rewards.lookahead_tracking.params["rot_neg_std"],
+                "grasp_scale": cfg.curriculum.grasp_scale[0],
             },
         )
 

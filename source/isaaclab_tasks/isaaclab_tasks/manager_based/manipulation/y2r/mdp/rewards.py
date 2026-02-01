@@ -606,6 +606,7 @@ def lookahead_tracking(
     neg_scale: float = 0.5,
     rot_neg_threshold: float = 0.6,
     rot_neg_std: float = 0.4,
+    grasp_scale: float = 1.0,
 ) -> torch.Tensor:
     """
     Reward tracking trajectory targets with positive and negative zones.
@@ -772,8 +773,22 @@ def lookahead_tracking(
 
             reward = pos_reward - neg_scale * neg_penalty
 
-    # Apply phase filter and optional hand pose gate
-    reward = _apply_phase_filter(env, reward, phases)
+    # Apply per-phase scaling with grasp_scale
+    if phases is not None and len(phases) > 0 and hasattr(env, 'trajectory_manager') and env.trajectory_manager is not None:
+        phase = env.trajectory_manager.get_phase()  # (N,) - 0=grasp, 1=manip, 2=release
+        scale = torch.zeros(env.num_envs, dtype=reward.dtype, device=env.device)
+        for p in phases:
+            if p in PHASE_MAP:
+                mask = phase == PHASE_MAP[p]
+                if p == "grasp":
+                    scale = torch.where(mask, torch.full_like(scale, grasp_scale), scale)
+                else:
+                    scale = torch.where(mask, torch.ones_like(scale), scale)
+        reward = reward * scale
+    elif phases is not None and len(phases) > 0:
+        # No trajectory manager — fall through without filtering
+        pass
+
     reward = _apply_hand_pose_gate(env, reward, use_hand_pose_gate)
 
     return reward

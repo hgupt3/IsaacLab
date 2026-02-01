@@ -404,6 +404,19 @@ def build_curriculum_cfg(cfg: Y2RConfig):
             },
         )
 
+        lookahead_grasp_scale_adr = CurrTerm(
+            func=mdp.modify_term_cfg,
+            params={
+                "address": "rewards.lookahead_tracking.params.grasp_scale",
+                "modify_fn": mdp.initial_final_interpolate_fn,
+                "modify_params": {
+                    "initial_value": cfg.curriculum.grasp_scale[0],
+                    "final_value": cfg.curriculum.grasp_scale[1],
+                    "difficulty_term_str": "adr",
+                },
+            },
+        )
+
     return TrajectoryCurriculumCfg()
 
 
