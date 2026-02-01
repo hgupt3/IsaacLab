@@ -672,7 +672,7 @@ def lookahead_tracking(
             # Positive reward: exp kernel (peaks at 1.0 when error=0)
             pos_pos_reward = torch.exp(-pos_error / std)
             pos_rot_reward = torch.exp(-rot_error / rot_std)
-            pos_reward = (pos_pos_reward + pos_rot_reward * 2) / 3.0
+            pos_reward = (pos_pos_reward + pos_rot_reward) / 2.0
 
             # Soft contact gating (prevents reward collapse when contact is weak)
             if use_contact_gating:
@@ -726,7 +726,7 @@ def lookahead_tracking(
             # Positive reward: exp kernel (peaks at 1.0 when error=0)
             pos_pos_reward = torch.exp(-weighted_pos_error / std)
             pos_rot_reward = torch.exp(-weighted_rot_error / rot_std)
-            pos_reward = (pos_pos_reward + pos_rot_reward * 2) / 3.0
+            pos_reward = (pos_pos_reward + pos_rot_reward) / 2.0
 
             # Soft contact gating (prevents reward collapse when contact is weak)
             if use_contact_gating:
