@@ -90,6 +90,7 @@ from isaaclab_rl.rl_games import MultiObserver, PbtAlgoObserver, RlGamesGpuEnv, 
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils.hydra import hydra_task_config
+from isaaclab_tasks.manager_based.manipulation.y2r.rl_games_checkpoint import Y2RCheckpointObserver
 
 # Register custom networks for y2r tasks (must be before Runner.load)
 import isaaclab_tasks.manager_based.manipulation.y2r.networks  # noqa: F401
@@ -272,10 +273,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # create runner from rl-games
 
     if "pbt" in agent_cfg and agent_cfg["pbt"]["enabled"]:
-        observers = MultiObserver([IsaacAlgoObserver(), PbtAlgoObserver(agent_cfg, args_cli)])
-        runner = Runner(observers)
+        runner = Runner(MultiObserver([IsaacAlgoObserver(), PbtAlgoObserver(agent_cfg, args_cli), Y2RCheckpointObserver()]))
     else:
-        runner = Runner(IsaacAlgoObserver())
+        runner = Runner(MultiObserver([IsaacAlgoObserver(), Y2RCheckpointObserver()]))
 
     runner.load(agent_cfg)
 

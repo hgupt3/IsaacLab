@@ -12,7 +12,7 @@
 simulation:
   physics_dt: 0.01              # 1/100 seconds (100 Hz physics)
   decimation: 2                 # Control at 50 Hz (physics_dt * decimation)
-  num_envs: 18432
+  num_envs: 19456
   env_spacing: 3.0
   replicate_physics: false
 
@@ -206,7 +206,7 @@ rewards:
       finger_scale: 0.1    
     
   fingers_to_object:
-    weight: 1.0
+    weight: 1.5
     params:
       phases: [grasp, manipulation]    # Active in grasp and manipulation phases
       use_hand_pose_gate: true        # Optional hand pose gating
@@ -217,7 +217,7 @@ rewards:
       error_gate_rot_slope: 0.5        # radians
     
   lookahead_tracking:
-    weight: 6.0
+    weight: 8.0
     params:
       phases: [grasp, manipulation]      # Active in grasp and manipulation phases
       path_mode: true              # Enable path segment tracking (true = smooth motion, false = discrete waypoints)
@@ -225,7 +225,7 @@ rewards:
       use_hand_pose_gate: true     # Apply hand pose gate from hand_pose_following
       use_contact_gating: true     # Enable/disable contact gating
       std: 0.03                    # Position/point cloud error std for positive reward
-      rot_std: 0.5                 # Rotation error std (pose mode only)
+      rot_std: 0.3                 # Rotation error std (pose mode only)
       decay: 0.1                   # Exponential decay for lookahead weights (ignored in path_mode)
       # Soft contact gating: scales tracking reward but never hard-zeros it.
       contact_threshold: 1.0       # Force threshold for contact detection (N)
@@ -262,7 +262,7 @@ rewards:
       term_keys: ["trajectory_deviation", "hand_pose_deviation", "abnormal_robot"]
     
   arm_table_penalty:
-    weight: -0.5
+    weight: -0.3
     params:
       table_z: 0.255
       threshold_mid: 0.1         # Safe height above table for links 3,4,5
@@ -286,7 +286,7 @@ rewards:
       rot_std: 0.2                # Rotation change threshold (radians)
     
   distal_joint3_penalty:
-    weight: -0.5
+    weight: -0.3  
     params:
       phases: [grasp, manipulation, release]  # Active in all phases (no phase restriction)
       std: 1.5                    # (rad) larger = more lenient
@@ -327,7 +327,7 @@ rewards:
   # Hand pose following reward (when hand_trajectory.enabled)
   # Guides hand to follow palm pose trajectory through grasp/manipulation/release
   hand_pose_following:
-    weight: 4.0                   # Medium weight - guiding signal, not strict
+    weight: 3.5                   # Medium weight - guiding signal, not strict
     params:
       # Phase-varying tolerances: exp(-pos_error/tol) + exp(-rot_error/tol) / 2
       grasp_pos_tol: 0.03         # 4cm position tolerance during grasp
@@ -355,7 +355,7 @@ rewards:
   
   # Finger regularizer - penalizes deviation from neutral/default finger pose
   finger_regularizer:
-    weight: -0.5                  # Negative = penalty
+    weight: -0.3                  # Negative = penalty
     params:
       phases: [grasp, release]    # Active in grasp and release phases
       # Default finger joint positions (Allegro hand - 16 joints)
@@ -364,7 +364,7 @@ rewards:
   
   # Object stillness - penalizes object movement during grasp/release
   object_stillness:
-    weight: -0.5                  # Negative = penalty
+    weight: -0.3                  # Negative = penalty
     params:
       phases: [release]    # Active in grasp and release phases
       lin_std: 0.02               # Scaling for linear velocity penalty (m/s)
@@ -377,7 +377,7 @@ rewards:
 terminations:
   trajectory_deviation:
     position_threshold: [0.25, 0.1]      # meters - spatial error (pos in pose mode, mean PC distance in PC mode)
-    rotation_threshold: [2.5, 1.25]      # radians (pose mode only) ~143° → ~29°
+    rotation_threshold: [2.5, 1.2]      # radians (pose mode only) ~143° → ~29°
   
   hand_pose_deviation:
     position_threshold: [0.3, 0.1]         # meters (lenient → strict)
@@ -417,11 +417,8 @@ curriculum:
     target_poses: [0.0, 0.01]
     hand_pose_targets: [0.0, 0.01]
     
-  # Hand pose gate floor: [initial (lenient), final (strict)]
-  gate_floor: [0.9, 0.1]
-
-  # Grasp phase scaling for lookahead tracking: [initial, final]
-  grasp_scale: [1.0, 0.0]
+  gate_floor: [0.9, 0.1] # Hand pose gate floor: [initial (lenient), final (strict)]
+  grasp_scale: [0.9, 0.0] # Grasp phase scaling for lookahead tracking: [initial, final]
     
   # Gravity scheduling (m/s²)
   gravity:
