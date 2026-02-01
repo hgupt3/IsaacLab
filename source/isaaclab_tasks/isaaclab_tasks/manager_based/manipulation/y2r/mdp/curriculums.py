@@ -158,7 +158,10 @@ class DifficultyScheduler(ManagerTermBase):
                 at_goal = (pos_errors < effective_pos_tol) & (rot_errors < effective_rot_tol)
             
             # Promote only if episode timed out (completed full trajectory) AND object is at goal
-            timed_out = env.reset_time_outs[env_ids]
+            if hasattr(env, 'reset_time_outs') and env.reset_time_outs is not None:
+                timed_out = env.reset_time_outs[env_ids]
+            else:
+                timed_out = torch.zeros(len(env_ids), dtype=torch.bool, device=env.device)
             move_up = timed_out & at_goal
             
             demot = self.current_adr_difficulties[env_ids] if promotion_only else self.current_adr_difficulties[env_ids] - 1
