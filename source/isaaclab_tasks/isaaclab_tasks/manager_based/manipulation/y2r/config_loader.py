@@ -371,6 +371,7 @@ class CurriculumConfig:
     scheduler: SchedulerConfig
     advancement_tolerances: AdvancementTolerancesConfig
     noise: NoiseConfig
+    gate_floor: tuple[float, float]
     gravity: GravityConfig
 
 

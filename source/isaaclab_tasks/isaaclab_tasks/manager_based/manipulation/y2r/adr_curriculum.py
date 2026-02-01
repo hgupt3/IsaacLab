@@ -391,6 +391,19 @@ def build_curriculum_cfg(cfg: Y2RConfig):
             },
         )
 
+        gate_floor_adr = CurrTerm(
+            func=mdp.modify_term_cfg,
+            params={
+                "address": "rewards.hand_pose_following.params.gate_floor",
+                "modify_fn": mdp.initial_final_interpolate_fn,
+                "modify_params": {
+                    "initial_value": cfg.curriculum.gate_floor[0],
+                    "final_value": cfg.curriculum.gate_floor[1],
+                    "difficulty_term_str": "adr",
+                },
+            },
+        )
+
     return TrajectoryCurriculumCfg()
 
 

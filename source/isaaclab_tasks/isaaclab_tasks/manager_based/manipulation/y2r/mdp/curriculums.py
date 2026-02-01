@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from isaaclab.envs import mdp
 from isaaclab.managers import ManagerTermBase
+from isaaclab.utils.math import quat_error_magnitude, quat_apply
 
 from .rewards import contacts as y2r_contacts
 
@@ -126,21 +127,38 @@ class DifficultyScheduler(ManagerTermBase):
             effective_rot_tol = rot_tol if rot_tol is not None else current_rot_threshold
             effective_pc_tol = pc_tol if pc_tol is not None else current_pos_threshold
             
-            # Check if in release phase
-            in_release = trajectory_manager.is_in_release_phase()[env_ids]
+            # Compare object pose against FINAL GOAL (not current lookahead target)
+            goal_poses = trajectory_manager.goal_poses[env_ids]  # (n, 7) world frame
+            goal_pos = goal_poses[:, :3]  # (n, 3)
+            goal_quat = goal_poses[:, 3:7]  # (n, 4)
+            
+            # Object current pose (world frame)
+            object_pos_w = env.scene["object"].data.root_pos_w[env_ids]  # (n, 3)
+            object_quat_w = env.scene["object"].data.root_quat_w[env_ids]  # (n, 4)
             
             if use_point_cloud:
-                # Point cloud mode: use cached mean errors
-                mean_errors = env._cached_mean_errors[env_ids, 0]  # Current target error
-                at_goal = mean_errors < effective_pc_tol
+                # Point cloud mode: compute mean point error against goal point cloud
+                points_local = trajectory_manager.points_local  # (num_envs, P, 3)
+                if points_local is not None:
+                    pts = points_local[env_ids]  # (n, P, 3)
+                    goal_pts_w = quat_apply(
+                        goal_quat.unsqueeze(1).expand_as(pts), pts
+                    ) + goal_pos.unsqueeze(1)  # (n, P, 3)
+                    curr_pts_w = quat_apply(
+                        object_quat_w.unsqueeze(1).expand_as(pts), pts
+                    ) + object_pos_w.unsqueeze(1)  # (n, P, 3)
+                    mean_errors = (curr_pts_w - goal_pts_w).norm(dim=-1).mean(dim=-1)  # (n,)
+                    at_goal = mean_errors < effective_pc_tol
+                else:
+                    at_goal = torch.zeros(len(env_ids), dtype=torch.bool, device=env.device)
             else:
-                # Pose mode: check both position AND rotation
-                pos_errors = env._cached_pose_errors['pos'][env_ids, 0]
-                rot_errors = env._cached_pose_errors['rot'][env_ids, 0]
+                # Pose mode: position + rotation error against final goal
+                pos_errors = (object_pos_w - goal_pos).norm(dim=-1)  # (n,)
+                rot_errors = quat_error_magnitude(object_quat_w, goal_quat)  # (n,)
                 at_goal = (pos_errors < effective_pos_tol) & (rot_errors < effective_rot_tol)
             
-            # Promote if in release AND at goal
-            move_up = in_release & at_goal 
+            # Promote if at goal
+            move_up = at_goal
             
             demot = self.current_adr_difficulties[env_ids] if promotion_only else self.current_adr_difficulties[env_ids] - 1
             perf_difficulties = torch.where(

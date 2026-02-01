@@ -251,7 +251,7 @@ rewards:
       # Dense shaping (fixed, provides gradient toward goal)
       pos_std: 0.05                   # meters - exp kernel std for dense shaping
       rot_std: 0.5                    # radians - exp kernel std for dense shaping
-      sparse_weight: 1.0              # 90% sparse bonus, 10% dense shaping
+      sparse_weight: 0.9              # 90% sparse bonus, 10% dense shaping
       contact_gate_threshold: 1.0    # Finger force at which gate = floor (Newtons)
       contact_gate_ramp: 1.0         # Ramp range: gate rises from floor→1.0 as force drops to 0
       contact_gate_floor: 0.05        # Minimum gate when fingers touching
@@ -270,7 +270,7 @@ rewards:
     
   # Robot-specific (Kuka Allegro)
   good_finger_contact:
-    weight: 2.0
+    weight: 1.0
     params:
       phases: [manipulation, release]  # Active in all phases
       use_hand_pose_gate: true         # Apply hand pose gate from hand_pose_following
@@ -345,7 +345,6 @@ rewards:
       # Manipulation-specific overrides (null = use default thresholds above)
       manipulation_gate_pos_threshold: [0.06, 0.12]  # Looser position thresholds for manipulation
       manipulation_gate_rot_threshold: [0.6, 1.2]    # Looser rotation thresholds for manipulation
-      gate_floor: 0.1                        # Minimum gate value (prevents complete reward collapse)
   
   # Finger release reward - incentivizes opening hand during release phase
   finger_release:
@@ -356,7 +355,7 @@ rewards:
   
   # Finger regularizer - penalizes deviation from neutral/default finger pose
   finger_regularizer:
-    weight: -0.1                  # Negative = penalty
+    weight: -0.3                  # Negative = penalty
     params:
       phases: [grasp, release]    # Active in grasp and release phases
       # Default finger joint positions (Allegro hand - 16 joints)
@@ -418,6 +417,9 @@ curriculum:
     target_poses: [0.0, 0.01]
     hand_pose_targets: [0.0, 0.01]
     
+  # Hand pose gate floor: [initial (lenient), final (strict)]
+  gate_floor: [0.9, 0.1]
+    
   # Gravity scheduling (m/s²)
   gravity:
     initial: [0.0, 0.0, -0.0981]
@@ -476,7 +478,7 @@ robot:
   action_scale: 0.1
   arm_joint_count: 7
   hand_joint_count: 16
-  eigen_dim: 5                  # PCA dimensions for eigen grasp (1..5 supported)
+  eigen_dim: 1                  # PCA dimensions for eigen grasp (1..5 supported)
 
 # ==============================================================================
 # PUSH-T MODE (disabled by default)
