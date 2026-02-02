@@ -12,7 +12,7 @@
 simulation:
   physics_dt: 0.01              # 1/100 seconds (100 Hz physics)
   decimation: 2                 # Control at 50 Hz (physics_dt * decimation)
-  num_envs: 19456
+  num_envs: 18432
   env_spacing: 3.0
   replicate_physics: false
 

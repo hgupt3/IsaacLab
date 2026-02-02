@@ -38,8 +38,10 @@ class Y2RCheckpointObserver(AlgoObserver):
         _orig_set = algo.set_full_state_weights
 
         def _set_with_counter(weights, set_epoch=True):
-            _orig_set(weights, set_epoch=set_epoch)
             if "common_step_counter" in weights:
-                env.common_step_counter = int(weights["common_step_counter"])
+                # Strip custom key before handing off to rl_games internals.
+                weights = dict(weights)
+                env.common_step_counter = int(weights.pop("common_step_counter"))
+            _orig_set(weights, set_epoch=set_epoch)
 
         algo.set_full_state_weights = _set_with_counter
