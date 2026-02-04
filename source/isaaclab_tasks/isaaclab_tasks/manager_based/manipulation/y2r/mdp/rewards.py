@@ -1245,10 +1245,9 @@ def hand_pose_following(
     palm_quat_w = robot.data.body_quat_w[:, palm_idx]  # (N, 4)
     
     # Get aligned hand target pose (cached during observations)
-    if hasattr(env, "_cached_aligned_hand_target"):
-        hand_target = env._cached_aligned_hand_target  # (N, 7)
-    else:
-        hand_target = trajectory_manager.get_current_hand_target()  # (N, 7)
+    if not hasattr(env, "_cached_aligned_hand_target"):
+        raise RuntimeError("Aligned hand target cache missing; ensure observations run before rewards.")
+    hand_target = env._cached_aligned_hand_target  # (N, 7)
     target_pos_w = hand_target[:, :3]  # (N, 3)
     target_quat_w = hand_target[:, 3:7]  # (N, 4)
     
