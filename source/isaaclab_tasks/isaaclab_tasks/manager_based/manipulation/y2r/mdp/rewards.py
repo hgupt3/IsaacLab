@@ -14,7 +14,7 @@ from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 import isaaclab.utils.math as math_utils
-from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_inv, quat_mul, quat_error_magnitude
+from isaaclab.utils.math import quat_apply_inverse, quat_inv, quat_mul, quat_error_magnitude
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -22,189 +22,6 @@ if TYPE_CHECKING:
 
 # Phase name to index mapping
 PHASE_MAP = {"grasp": 0, "manipulation": 1, "release": 2}
-
-
-def _batched_slerp(
-    q0: torch.Tensor,
-    q1: torch.Tensor,
-    t: torch.Tensor,
-) -> torch.Tensor:
-    """Batched SLERP (Spherical Linear Interpolation) between quaternions.
-
-    Args:
-        q0: (N, 4) starting quaternions (w, x, y, z)
-        q1: (N, 4) ending quaternions (w, x, y, z)
-        t: (N,) interpolation parameters in [0, 1]
-
-    Returns:
-        (N, 4) interpolated quaternions
-    """
-    # Ensure shortest path
-    dot = (q0 * q1).sum(dim=-1)  # (N,)
-    q1 = torch.where(dot.unsqueeze(-1) < 0, -q1, q1)
-    dot = dot.abs().clamp(max=1.0)
-
-    # SLERP formula
-    theta = torch.acos(dot)  # (N,)
-    sin_theta = torch.sin(theta)  # (N,)
-
-    # Handle near-parallel quaternions (use LERP)
-    near_parallel = sin_theta < 1e-6
-
-    # SLERP weights
-    w0 = torch.sin((1 - t) * theta) / sin_theta  # (N,)
-    w1 = torch.sin(t * theta) / sin_theta  # (N,)
-
-    # LERP fallback for near-parallel
-    w0 = torch.where(near_parallel, 1 - t, w0)
-    w1 = torch.where(near_parallel, t, w1)
-
-    # Interpolate
-    result = w0.unsqueeze(-1) * q0 + w1.unsqueeze(-1) * q1
-
-    # Normalize
-    return result / result.norm(dim=-1, keepdim=True)
-
-
-def _compute_path_segment_errors_pose(
-    env: ManagerBasedRLEnv,
-    use_temporal: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """FULLY VECTORIZED: Compute errors to current path segment (target[0]→target[1]).
-
-    For each environment:
-    1. Gets interpolation parameter t (spatial projection or temporal progress)
-    2. Interpolates rotation at parameter using SLERP
-    3. Computes position and rotation errors to interpolated pose
-
-    Args:
-        env: The environment.
-        use_temporal: If True, use time-based interpolation (segment progress).
-                      If False, use spatial projection onto segment.
-
-    Returns:
-        pos_error: (N,) position errors in meters
-        rot_error: (N,) rotation errors in radians
-    """
-    tm = env.trajectory_manager
-    targets = tm.get_window_targets()  # (N, W, 7)
-    N = targets.shape[0]
-
-    object: RigidObject = env.scene["object"]
-    obj_pos = object.data.root_pos_w  # (N, 3)
-    obj_quat = object.data.root_quat_w  # (N, 4)
-
-    # Current segment: target[0] → target[1]
-    p0 = targets[:, 0, :3]  # (N, 3)
-    p1 = targets[:, 1, :3]  # (N, 3)
-    q0 = targets[:, 0, 3:7]  # (N, 4)
-    q1 = targets[:, 1, 3:7]  # (N, 4)
-
-    # Get interpolation parameter t
-    if use_temporal:
-        # Time-based: where should object be NOW based on elapsed time
-        t = tm.get_segment_progress()  # (N,) in [0, 1)
-    else:
-        # Spatial projection: closest point on segment to object
-        v = p1 - p0  # (N, 3)
-        v_len_sq = (v ** 2).sum(dim=-1, keepdim=True).clamp(min=1e-8)  # (N, 1)
-        t = ((obj_pos - p0) * v).sum(dim=-1, keepdim=True) / v_len_sq  # (N, 1)
-        t = t.clamp(0.0, 1.0).squeeze(-1)  # (N,) - parameter along segment
-
-    # Target position at parameter t
-    v = p1 - p0  # (N, 3)
-    target_pos = p0 + t.unsqueeze(-1) * v  # (N, 3)
-
-    # Position error
-    pos_error = (obj_pos - target_pos).norm(dim=-1)  # (N,)
-
-    # Interpolate rotation using SLERP
-    interp_quat = _batched_slerp(q0, q1, t)  # (N, 4)
-
-    # Rotation error
-    rot_error = quat_error_magnitude(obj_quat, interp_quat)  # (N,)
-
-    return pos_error, rot_error
-
-
-def _compute_path_segment_errors_pc(
-    env: ManagerBasedRLEnv,
-    use_temporal: bool = False,
-) -> torch.Tensor:
-    """FULLY VECTORIZED: Point cloud errors to current path segment.
-
-    Strategy:
-    1. Gets interpolation parameter t (spatial projection or temporal progress)
-    2. Interpolates target pose (position + rotation) at parameter t
-    3. Generates target point cloud at interpolated pose
-    4. Computes mean point-to-point distance
-
-    Args:
-        env: The environment.
-        use_temporal: If True, use time-based interpolation (segment progress).
-                      If False, use spatial projection onto segment.
-
-    Returns:
-        mean_error: (N,) mean point distances
-    """
-    tm = env.trajectory_manager
-    targets = tm.get_window_targets()  # (N, W, 7)
-    N = targets.shape[0]
-
-    object: RigidObject = env.scene["object"]
-    obj_pos = object.data.root_pos_w  # (N, 3)
-    obj_quat = object.data.root_quat_w  # (N, 4)
-
-    # Get point cloud from observation term
-    pc_term = env.observation_manager._terms.get("target_point_clouds")
-    if pc_term is None or not hasattr(pc_term, "points_local"):
-        raise RuntimeError(
-            "target_point_clouds observation term with points_local is required "
-            "for point cloud path tracking."
-        )
-    points_local = pc_term.points_local  # (P, 3)
-    P = points_local.shape[0]
-
-    # Current object points in world frame
-    current_points_w = quat_apply(
-        obj_quat.unsqueeze(1).expand(-1, P, -1),
-        points_local.unsqueeze(0).expand(N, -1, -1)
-    ) + obj_pos.unsqueeze(1)  # (N, P, 3)
-
-    # Current segment: target[0] → target[1]
-    p0 = targets[:, 0, :3]  # (N, 3)
-    p1 = targets[:, 1, :3]  # (N, 3)
-    q0 = targets[:, 0, 3:7]  # (N, 4)
-    q1 = targets[:, 1, 3:7]  # (N, 4)
-
-    # Get interpolation parameter t
-    v = p1 - p0  # (N, 3)
-    if use_temporal:
-        # Time-based: where should object be NOW based on elapsed time
-        t = tm.get_segment_progress()  # (N,) in [0, 1)
-    else:
-        # Spatial projection: closest point on segment to object center
-        v_len_sq = (v ** 2).sum(dim=-1, keepdim=True).clamp(min=1e-8)  # (N, 1)
-        t = ((obj_pos - p0) * v).sum(dim=-1, keepdim=True) / v_len_sq  # (N, 1)
-        t = t.clamp(0.0, 1.0).squeeze(-1)  # (N,)
-
-    # Interpolated pose at parameter t
-    interp_pos = p0 + t.unsqueeze(-1) * v  # (N, 3)
-    interp_quat = _batched_slerp(q0, q1, t)  # (N, 4)
-
-    # Generate interpolated target point cloud
-    target_points_w = quat_apply(
-        interp_quat.unsqueeze(1).expand(-1, P, -1),
-        points_local.unsqueeze(0).expand(N, -1, -1)
-    ) + interp_pos.unsqueeze(1)  # (N, P, 3)
-
-    # Point-to-point distances
-    point_errors = (current_points_w - target_points_w).norm(dim=-1)  # (N, P)
-
-    # Mean over points
-    mean_error = point_errors.mean(dim=-1)  # (N,)
-
-    return mean_error
 
 
 def _apply_phase_filter(
@@ -420,15 +237,15 @@ def object_ee_distance(
     if error_gate_pos_threshold is not None:
         cfg = env.cfg.y2r_cfg
         if not cfg.mode.use_point_cloud:
-            pos_err = env._cached_pose_errors["pos"][:, 0]  # (N,)
+            pos_err = env._cached_aligned_pose_errors["pos"]  # (N,)
             # gate in [0,1], ~1 when pos_err << threshold, ~0 when pos_err >> threshold
             gate = torch.sigmoid((error_gate_pos_threshold - pos_err) / max(error_gate_pos_slope, 1e-6))
             if error_gate_rot_threshold is not None:
-                rot_err = env._cached_pose_errors["rot"][:, 0]
+                rot_err = env._cached_aligned_pose_errors["rot"]
                 gate_rot = torch.sigmoid((error_gate_rot_threshold - rot_err) / max(error_gate_rot_slope, 1e-6))
                 gate = gate * gate_rot
         else:
-            mean_err = env._cached_mean_errors[:, 0]  # (N,)
+            mean_err = env._cached_aligned_mean_error  # (N,)
             gate = torch.sigmoid((error_gate_pos_threshold - mean_err) / max(error_gate_pos_slope, 1e-6))
 
         reward = reward * gate
@@ -592,8 +409,6 @@ def lookahead_tracking(
     env: ManagerBasedRLEnv,
     std: float = 0.1,
     decay: float = 0.5,
-    path_mode: bool = False,
-    timing_aware: bool = True,
     phases: list[str] | None = None,
     use_hand_pose_gate: bool = True,
     use_contact_gating: bool = True,
@@ -611,20 +426,17 @@ def lookahead_tracking(
     """
     Reward tracking trajectory targets with positive and negative zones.
 
-    Supports two tracking strategies:
-    - Waypoint mode (path_mode=False): Rewards proximity to discrete waypoints with decay
-    - Path mode (path_mode=True): Rewards staying on current path segment (target[0]→target[1])
+    Supports two tracking strategies based on trajectory config:
+    - Waypoint mode (trajectory.path_mode=False): Rewards proximity to discrete waypoints with decay
+    - Path mode (trajectory.path_mode=True): Rewards staying on current path segment (target[0]→target[1])
 
-    With timing_aware=True (default), path mode uses temporal interpolation:
-    - Object should be at position t along segment where t = segment_progress (time-based)
-    - Rewards being at the correct position FOR THE CURRENT TIME
-
-    With timing_aware=False, path mode uses spatial projection:
-    - Closest point on segment (ignores timing)
+    In path mode, timing is controlled by trajectory.timing_aware:
+    - True: time-based interpolation using segment progress
+    - False: spatial projection to closest point on segment
 
     And two error computation modes:
-    - Point cloud mode: Uses _cached_mean_errors (point-to-point distance)
-    - Pose mode: Uses _cached_pose_errors (position + rotation errors)
+    - Point cloud mode: Uses aligned mean error (point-to-point distance)
+    - Pose mode: Uses aligned position + rotation errors
 
     Two-kernel reward structure:
     - Positive reward: exp(-error/std) for being close to target/path
@@ -635,7 +447,6 @@ def lookahead_tracking(
         env: The environment.
         std: Standard deviation for positive position reward exp kernel.
         decay: Exponential decay factor (0-1). Lower = focus on current target. (Ignored in path_mode)
-        path_mode: If True, rewards staying on path segment. If False, rewards proximity to waypoints.
         phases: List of phases to be active in, e.g. ["manipulation"]. None = all phases.
         use_hand_pose_gate: If True, apply hand pose gate from hand_pose_following.
         use_contact_gating: If True, scale reward by finger contact factor.
@@ -653,6 +464,7 @@ def lookahead_tracking(
     # Check which mode via env config
     cfg = env.cfg.y2r_cfg
     use_point_cloud = cfg.mode.use_point_cloud
+    path_mode = getattr(cfg.trajectory, "path_mode", False)
 
     # DEBUG: Print all rewards for env 0 every 10 steps (controlled by config visualization.debug_print_rewards)
     step = env.episode_length_buf[0].item()
@@ -667,8 +479,9 @@ def lookahead_tracking(
     if path_mode:
         # ===== PATH MODE: Reward staying on current segment =====
         if not use_point_cloud:
-            # Pose mode: compute errors to path segment
-            pos_error, rot_error = _compute_path_segment_errors_pose(env, use_temporal=timing_aware)  # (N,), (N,)
+            # Pose mode: use aligned current errors
+            pos_error = env._cached_aligned_pose_errors["pos"]  # (N,)
+            rot_error = env._cached_aligned_pose_errors["rot"]  # (N,)
 
             # Positive reward: exp kernel (peaks at 1.0 when error=0)
             pos_pos_reward = torch.exp(-pos_error / std)
@@ -691,8 +504,8 @@ def lookahead_tracking(
 
             reward = pos_reward - neg_scale * combined_neg_penalty
         else:
-            # Point cloud mode: compute errors to path segment
-            mean_error = _compute_path_segment_errors_pc(env, use_temporal=timing_aware)  # (N,)
+            # Point cloud mode: use aligned current errors
+            mean_error = env._cached_aligned_mean_error  # (N,)
 
             # Positive reward: exp kernel
             pos_reward = torch.exp(-mean_error / std)
@@ -805,9 +618,9 @@ def tracking_progress(
 ) -> torch.Tensor:
     """Reward improvement in tracking error over ~1/target_hz seconds (relative).
 
-    Uses cached errors produced by the target observation term:
-    - Pose mode: combines position + rotation error of the *current* target (index 0).
-    - Point cloud mode: uses mean point error of the current target (index 0).
+    Uses cached aligned errors produced by the target observation term:
+    - Pose mode: combines aligned position + rotation error.
+    - Point cloud mode: uses aligned mean point error.
 
     This is meant to be **off by default** (weight=0) and turned on only if needed.
     
@@ -817,11 +630,11 @@ def tracking_progress(
     """
     cfg = env.cfg.y2r_cfg
     if not cfg.mode.use_point_cloud:
-        pos_err = env._cached_pose_errors["pos"][:, 0]
-        rot_err = env._cached_pose_errors["rot"][:, 0]
+        pos_err = env._cached_aligned_pose_errors["pos"]
+        rot_err = env._cached_aligned_pose_errors["rot"]
         cur_err = pos_weight * pos_err + rot_weight * rot_err
     else:
-        cur_err = env._cached_mean_errors[:, 0]
+        cur_err = env._cached_aligned_mean_error
 
     # Compare against the error from approximately 1/target_hz seconds ago
     # (same cadence as the trajectory targets / finger_manipulation).
@@ -900,9 +713,9 @@ def trajectory_success(
     - Big reward only when actually placed (sparse bonus optionally gated by finger release)
     - Prevents "hold object at goal" exploit - must release onto table
     
-    Supports two modes based on cached errors:
-    - Point cloud mode: Uses _cached_mean_errors (position only)
-    - Pose mode: Uses _cached_pose_errors (position + rotation)
+    Supports two modes based on cached aligned errors:
+    - Point cloud mode: Uses aligned mean error (position only)
+    - Pose mode: Uses aligned position + rotation errors
     
     Args:
         env: The environment.
@@ -930,8 +743,8 @@ def trajectory_success(
     
     if not use_point_cloud:
         # Pose mode: position + rotation
-        pos_error = env._cached_pose_errors['pos'][:, 0]  # (N,)
-        rot_error = env._cached_pose_errors['rot'][:, 0]  # (N,)
+        pos_error = env._cached_aligned_pose_errors['pos']  # (N,)
+        rot_error = env._cached_aligned_pose_errors['rot']  # (N,)
         
         # Dense component: exp kernel shaping (always provides gradient)
         pos_dense = torch.exp(-pos_error / pos_std)
@@ -944,8 +757,7 @@ def trajectory_success(
         sparse = (pos_ok & rot_ok).float()
     else:
         # Point cloud mode: position only
-        mean_errors = env._cached_mean_errors  # (N, W)
-        current_error = mean_errors[:, 0]  # (N,)
+        current_error = env._cached_aligned_mean_error  # (N,)
         
         # Dense component
         dense = torch.exp(-current_error / pos_std)
@@ -1098,15 +910,15 @@ def finger_manipulation(
     # Orientation: object_quat in palm frame = inv(palm_quat) * object_quat
     object_quat_palm = quat_mul(quat_inv(palm_quat_w), object_quat_w)  # (N, 4)
     
-    # Get current tracking error (use cached errors from observation computation)
+    # Get current tracking error (use cached aligned errors from observation computation)
     use_point_cloud = cfg.mode.use_point_cloud
     if use_point_cloud:
         # Point cloud mode: use mean error of current target
-        current_error = env._cached_mean_errors[:, 0]  # (N,)
+        current_error = env._cached_aligned_mean_error  # (N,)
     else:
         # Pose mode: combine position and rotation errors
-        pos_error = env._cached_pose_errors['pos'][:, 0]  # (N,)
-        rot_error = env._cached_pose_errors['rot'][:, 0]  # (N,)
+        pos_error = env._cached_aligned_pose_errors['pos']  # (N,)
+        rot_error = env._cached_aligned_pose_errors['rot']  # (N,)
         current_error = pos_error + rot_error * 0.1  # Weighted combination
     
     # Initialize on first call: compute update interval and cache
@@ -1432,8 +1244,11 @@ def hand_pose_following(
     palm_pos_w = robot.data.body_pos_w[:, palm_idx]  # (N, 3)
     palm_quat_w = robot.data.body_quat_w[:, palm_idx]  # (N, 4)
     
-    # Get target palm pose from trajectory
-    hand_target = trajectory_manager.get_current_hand_target()  # (N, 7)
+    # Get aligned hand target pose (cached during observations)
+    if hasattr(env, "_cached_aligned_hand_target"):
+        hand_target = env._cached_aligned_hand_target  # (N, 7)
+    else:
+        hand_target = trajectory_manager.get_current_hand_target()  # (N, 7)
     target_pos_w = hand_target[:, :3]  # (N, 3)
     target_quat_w = hand_target[:, 3:7]  # (N, 4)
     

@@ -706,8 +706,6 @@ def _build_rewards_cfg(cfg: Y2RConfig):
             weight=cfg.rewards.lookahead_tracking.weight,
             params={
                 "phases": cfg.rewards.lookahead_tracking.params.get("phases"),
-                "path_mode": cfg.rewards.lookahead_tracking.params.get("path_mode"),
-                "timing_aware": cfg.rewards.lookahead_tracking.params.get("timing_aware"),
                 "use_hand_pose_gate": cfg.rewards.lookahead_tracking.params.get("use_hand_pose_gate"),
                 "use_contact_gating": cfg.rewards.lookahead_tracking.params.get("use_contact_gating"),
                 "std": cfg.rewards.lookahead_tracking.params["std"],
@@ -1109,5 +1107,3 @@ class TrajectoryEnvCfg(ManagerBasedEnvCfg):
                 "asset_cfg": SceneEntityCfg("object"),
             },
         )
-
-

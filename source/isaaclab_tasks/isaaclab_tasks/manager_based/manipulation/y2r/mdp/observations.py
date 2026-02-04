@@ -46,6 +46,72 @@ def zeros_placeholder(
     return torch.zeros(env.num_envs, size, device=env.device)
 
 
+def _batched_slerp(
+    q0: torch.Tensor,
+    q1: torch.Tensor,
+    t: torch.Tensor,
+) -> torch.Tensor:
+    """Batched SLERP between quaternions.
+
+    Args:
+        q0: (N, 4) start quaternions
+        q1: (N, 4) end quaternions
+        t: (N,) interpolation parameters in [0, 1]
+
+    Returns:
+        (N, 4) interpolated quaternions
+    """
+    dot = (q0 * q1).sum(dim=-1)
+    q1 = torch.where(dot.unsqueeze(-1) < 0, -q1, q1)
+    dot = dot.abs().clamp(max=1.0)
+
+    theta = torch.acos(dot)
+    sin_theta = torch.sin(theta)
+    near_parallel = sin_theta < 1e-6
+
+    w0 = torch.sin((1 - t) * theta) / sin_theta
+    w1 = torch.sin(t * theta) / sin_theta
+    w0 = torch.where(near_parallel, 1 - t, w0)
+    w1 = torch.where(near_parallel, t, w1)
+
+    result = w0.unsqueeze(-1) * q0 + w1.unsqueeze(-1) * q1
+    return result / result.norm(dim=-1, keepdim=True)
+
+
+def _compute_aligned_hand_target(
+    trajectory_manager: TrajectoryManager,
+    path_mode: bool,
+    timing_aware: bool,
+    palm_pos_w: torch.Tensor,
+) -> torch.Tensor:
+    """Compute aligned hand target pose (pos+quat) for the current segment.
+
+    Uses trajectory.path_mode + trajectory.timing_aware to optionally interpolate
+    between the current and next hand target. Falls back to current target if
+    the window is too small.
+    """
+    hand_window = trajectory_manager.get_hand_window_targets()  # (N, W, 7)
+    if not path_mode or hand_window.shape[1] < 2:
+        return hand_window[:, 0, :]
+
+    p0 = hand_window[:, 0, :3]
+    p1 = hand_window[:, 1, :3]
+    q0 = hand_window[:, 0, 3:7]
+    q1 = hand_window[:, 1, 3:7]
+
+    if timing_aware:
+        t = trajectory_manager.get_segment_progress()
+    else:
+        v = p1 - p0
+        v_len_sq = (v ** 2).sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        t = ((palm_pos_w - p0) * v).sum(dim=-1, keepdim=True) / v_len_sq
+        t = t.clamp(0.0, 1.0).squeeze(-1)
+
+    interp_pos = p0 + t.unsqueeze(-1) * (p1 - p0)
+    interp_quat = _batched_slerp(q0, q1, t)
+    return torch.cat([interp_pos, interp_quat], dim=-1)
+
+
 def object_pos_b(
     env: ManagerBasedRLEnv,
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -835,8 +901,8 @@ class target_sequence_obs_b(ManagerTermBase):
       Returns (num_envs, window_size * 7).
     
     Also caches errors for reward/termination functions:
-    - Point cloud mode: env._cached_mean_errors (N, W) - point-to-point mean error
-    - Pose mode: env._cached_pose_errors dict with 'pos' (N, W) and 'rot' (N, W)
+    - Raw window errors: env._cached_mean_errors (N, W) and env._cached_pose_errors
+    - Aligned current errors: env._cached_aligned_mean_error and env._cached_aligned_pose_errors
     
     Args (from ``cfg.params``):
         object_cfg: Scene entity for the object. Defaults to ``SceneEntityCfg("object")``.
@@ -1366,8 +1432,8 @@ class target_sequence_obs_b(ManagerTermBase):
         ref_pos_w = self.ref_asset.data.root_pos_w   # (N, 3)
         ref_quat_w = self.ref_asset.data.root_quat_w  # (N, 4)
         
-        # Always compute point cloud observations and cache BOTH error types
-        # use_point_cloud flag only affects which errors are used in rewards/terminations
+        # Always compute point cloud observations and cache BOTH error types.
+        # Rewards/terminations use aligned errors (path-aware if enabled).
         return self._compute_observations(
             env, N, W, window_targets, object_pos_w, object_quat_w, ref_pos_w, ref_quat_w
         )
@@ -1383,10 +1449,10 @@ class target_sequence_obs_b(ManagerTermBase):
         ref_pos_w: torch.Tensor,
         ref_quat_w: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute point cloud observations and cache BOTH point cloud and pose errors.
+        """Compute point cloud observations and cache errors used by rewards/terminations.
         
-        Always outputs point clouds. Caches both error types for rewards/terminations
-        to use based on use_point_cloud flag.
+        Always outputs point clouds. Caches both point cloud and pose errors, plus a
+        shared aligned current error (path-aware if enabled).
         """
         P = self.num_points
         
@@ -1441,6 +1507,67 @@ class target_sequence_obs_b(ManagerTermBase):
             'pos': pos_errors,  # (N, W) position error in meters
             'rot': rot_errors,  # (N, W) rotation error in radians
         }
+
+        # === Cache aligned current errors (shared across rewards/terminations) ===
+        cfg: Y2RConfig = env.cfg.y2r_cfg
+        path_mode = getattr(cfg.trajectory, "path_mode", False)
+        timing_aware = getattr(cfg.trajectory, "timing_aware", True)
+
+        if path_mode and W >= 2:
+            # Current segment: target[0] -> target[1]
+            p0 = target_pos_w[:, 0, :]  # (N, 3)
+            p1 = target_pos_w[:, 1, :]  # (N, 3)
+            q0 = target_quat_w[:, 0, :]  # (N, 4)
+            q1 = target_quat_w[:, 1, :]  # (N, 4)
+
+            if timing_aware:
+                t = self.trajectory_manager.get_segment_progress()  # (N,) in [0,1)
+            else:
+                v = p1 - p0
+                v_len_sq = (v ** 2).sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                t = ((object_pos_w - p0) * v).sum(dim=-1, keepdim=True) / v_len_sq
+                t = t.clamp(0.0, 1.0).squeeze(-1)
+
+            interp_pos = p0 + t.unsqueeze(-1) * (p1 - p0)
+            interp_quat = _batched_slerp(q0, q1, t)
+
+            aligned_pos_error = (object_pos_w - interp_pos).norm(dim=-1)
+            aligned_rot_error = quat_error_magnitude(object_quat_w, interp_quat)
+            env._cached_aligned_pose_errors = {
+                "pos": aligned_pos_error,
+                "rot": aligned_rot_error,
+            }
+
+            points_local = self.points_local
+            if points_local.dim() == 2:
+                points_local = points_local.unsqueeze(0).expand(N, -1, -1)
+            elif points_local.shape[0] != N:
+                points_local = points_local.expand(N, -1, -1)
+
+            target_points_w = quat_apply(
+                interp_quat.unsqueeze(1).expand(-1, P, -1),
+                points_local,
+            ) + interp_pos.unsqueeze(1)
+            aligned_point_errors = (current_points_w - target_points_w).norm(dim=-1)
+            env._cached_aligned_mean_error = aligned_point_errors.mean(dim=-1)
+        else:
+            env._cached_aligned_pose_errors = {
+                "pos": pos_errors[:, 0],
+                "rot": rot_errors[:, 0],
+            }
+            env._cached_aligned_mean_error = env._cached_mean_errors[:, 0]
+
+        # Cache aligned hand target (pose in world frame)
+        if self._palm_body_idx is not None:
+            palm_pos_w = self.ref_asset.data.body_pos_w[:, self._palm_body_idx]  # (N, 3)
+        else:
+            palm_pos_w = self.ref_asset.data.root_pos_w  # Fallback (N, 3)
+        env._cached_aligned_hand_target = _compute_aligned_hand_target(
+            self.trajectory_manager,
+            path_mode=path_mode,
+            timing_aware=timing_aware,
+            palm_pos_w=palm_pos_w,
+        )
         
         # Visualization (point clouds every frame)
         if (self.visualize or self.visualize_current) and self.markers is not None:
@@ -1654,7 +1781,7 @@ def trajectory_timing(
     """Current segment progress (0-1) within target interval.
 
     Provides temporal context for the policy: where it should be in the
-    current target interval. Use with lookahead_tracking timing_aware mode.
+    current target interval. Use with trajectory.timing_aware path tracking.
 
     0.0 = just reached current target (target[0])
     ~1.0 = about to reach next target (target[1])

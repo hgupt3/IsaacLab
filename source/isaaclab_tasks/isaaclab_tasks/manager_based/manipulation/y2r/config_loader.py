@@ -145,6 +145,8 @@ class TrajectoryConfig:
     target_hz: float
     window_size: int
     easing_power: float
+    path_mode: bool = False
+    timing_aware: bool = True
     skip_manipulation_probability: float = 0.0  # Probability of grasp-only episodes
     segments: list[dict] = field(default_factory=list)  # List of segment configs (REQUIRED)
 

@@ -2,7 +2,7 @@
 # Insertion Task Layer - Nut/Bolt Assembly
 # ==============================================================================
 # Task definition only - no play/mode settings.
-# Phase 1: Grasp nut from above, hover over fixed bolt (basic setup).
+# Phase: Grasp nut from above, hover over fixed bolt (basic setup).
 # Uses push-T infrastructure: nut=object, bolt=outline (kinematic + contacts).
 # ==============================================================================
 
@@ -15,21 +15,21 @@ trajectory:
 
     - name: "hover_high"
       type: "waypoint"
-      # First hover position: higher above bolt
+      # Hover above bolt
       pose: [-0.65, 0.0, 0.38, 1.0, 0.0, 0.0, 0.0]
       duration: 6.0
       hand_coupling: "position_only"
 
     - name: "hover_low"
       type: "waypoint"
-      # First hover position: higher above bolt
+      # Lower hover above bolt
       pose: [-0.65, 0.0, 0.32, 1.0, 0.0, 0.0, 0.0]
       duration: 2.0
       hand_coupling: "position_only"
 
     - name: "insert"
       type: "waypoint"
-      # Second hover position: closer to bolt, ready for threading
+      # Pre-threading position
       pose: [-0.65, 0.0, 0.29, 1.0, 0.0, 0.0, 0.0]
       duration: 7.0
       hand_coupling: "position_only"
@@ -37,10 +37,10 @@ trajectory:
     - name: "thread"
       type: "helical"
       axis: [0, 0, -1]           # Rotate around Z-axis (vertical)
-      angular_velocity: 0.628    # 3 full rotations over 30s (3*2π/30 ≈ 0.628 rad/s)
-      translation: [0, 0, -0.005]  # Descend 7.5cm onto bolt
+      angular_velocity: 0.628    # Threading angular speed (rad/s)
+      translation: [0, 0, -0.005]  # Threading descent (meters)
       duration: 40.0
-      hand_coupling: "position_only"  # Palm descends with nut, wrist orientation FROZEN
+      hand_coupling: "position_only"  # Palm descends with nut, wrist orientation fixed
       # hand_orientation: null will use orientation from previous segment (hover_low)
 
     - name: "release"
@@ -65,11 +65,11 @@ hand_trajectory:
 push_t:
   enabled: true
   object_usd: "assets/nut/nut4.usd"       # Nut = object (manipulated)
-  outline_usd: "assets/bolt/bolt_chamfered.usd"     # Bolt = chamfered local bolt (fixed target)
-  object_scale: 1.46                                      # 2.5x scaled (M16: 2mm pitch → 5mm/rotation)
+  outline_usd: "assets/bolt/bolt_chamfered.usd"     # Bolt = outline (fixed target)
+  object_scale: 1.46                                      # Nut scale
   outline_position: [-0.65, 0.0]                         # Bolt fixed position on table
-  object_rotation: [1.0, 0.0, 0.0, 0.0]                  # Nut orientation (identity)
-  outline_rotation: [1.0, 0.0, 0.0, 0.0]                 # Bolt orientation (identity)
+  object_rotation: [1.0, 0.0, 0.0, 0.0]                  # Nut orientation
+  outline_rotation: [1.0, 0.0, 0.0, 0.0]                 # Bolt orientation
   outline_has_contacts: true      # Enable collisions on bolt
   outline_is_kinematic: true      # Bolt is fixed/unmovable
   outline_has_gravity: false      # No gravity on bolt
@@ -83,23 +83,23 @@ goal:
 
 randomization:
   object:
-    scale: [1.5, 1.5]           # Fixed scale for nut
+    scale: [1.5, 1.5]           # Fixed scale
     mass_scale: [0.12, 0.12]
     static_friction: [1.0, 1.0]
     dynamic_friction: [1.0, 1.0]
   reset:
-    object_x: [0.05, 0.1]       # Nut spawns with X randomization
-    object_y: [0.1, 0.2]     # Nut spawns with Y randomization
-    object_yaw: [0.0, 0.0]     # Full rotation randomization
+    object_x: [0.05, 0.1]       # X randomization
+    object_y: [0.1, 0.2]     # Y randomization
+    object_yaw: [0.0, 0.0]     # Yaw randomization
 
 terminations:
   trajectory_deviation:
-    position_threshold: [1.0, 1.0]     # Generous thresholds for Phase 1
+    position_threshold: [1.0, 1.0]     # Generous thresholds for early phase
     rotation_threshold: [3.0, 3.0]
 
   hand_pose_deviation:
-    position_threshold: [0.25, 0.25]        # meters (lenient → strict)
-    rotation_threshold: [2.5, 2.5]          # radians ~180° → ~180°
+    position_threshold: [0.25, 0.25]        # Position threshold (meters)
+    rotation_threshold: [2.5, 2.5]          # Rotation threshold (radians)
 
 procedural_objects:
   generation:

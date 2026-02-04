@@ -70,7 +70,7 @@ params:
     mixed_precision: True
     normalize_input: True
     normalize_value: True
-    value_bootstrap: False
+    value_bootstrap: True
     num_actors: -1
     reward_shaper:
       scale_value: 0.01

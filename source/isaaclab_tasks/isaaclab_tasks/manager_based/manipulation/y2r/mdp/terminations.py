@@ -59,8 +59,8 @@ def trajectory_deviation(
     """Terminate if object deviates too far from current trajectory target.
     
     Uses use_point_cloud flag from trajectory config to decide which error metric:
-    - Point cloud mode: Uses _cached_mean_errors (point-to-point distance)
-    - Pose mode: Uses _cached_pose_errors (position + rotation errors)
+    - Point cloud mode: Uses aligned mean error (point-to-point distance)
+    - Pose mode: Uses aligned position + rotation errors
     
     Args:
         env: The environment.
@@ -74,15 +74,13 @@ def trajectory_deviation(
     
     if not use_point_cloud:
         # Pose mode: check both position AND rotation thresholds
-        pos_error = env._cached_pose_errors['pos'][:, 0]  # (N,)
-        rot_error = env._cached_pose_errors['rot'][:, 0]  # (N,)
+        pos_error = env._cached_aligned_pose_errors['pos']  # (N,)
+        rot_error = env._cached_aligned_pose_errors['rot']  # (N,)
         # Terminate if EITHER threshold exceeded
         return (pos_error > threshold) | (rot_error > rot_threshold)
     
     # Point cloud mode: use mean errors
-    mean_errors = env._cached_mean_errors  # (N, W)
-    current_error = mean_errors[:, 0]  # (N,)
-    return current_error > threshold
+    return env._cached_aligned_mean_error > threshold
 
 
 def hand_pose_deviation(

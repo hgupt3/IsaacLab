@@ -9,13 +9,13 @@
 hand_trajectory:
   grasp_sampling:
     # Fixed direction grasp: approach from +Y side of bottle
-    fixed_origin_offset: [0, 0, -0.05]  # Slightly above bottle center (Z offset)
+    fixed_origin_offset: [0, 0, -0.05]  # Offset above bottle center (Z)
     fixed_direction: [-1, 0, 0]         # Look from -Y direction to find surface point
-    fixed_hand_roll: 0.0               # 180° roll - fingers pointing up (+Z)
-    exclude_toward_robot: false         # Disable constraint to allow full 180° roll
+    fixed_hand_roll: 0.0               # Roll for side grasp
+    exclude_toward_robot: false         # Disable constraint to allow full roll range
     # Pre-grasp approach
-    approach_distance: 0.15   # 30cm pre-grasp distance
-    align_fraction: 0.7      # 70% of grasp phase to reach pre-grasp
+    approach_distance: 0.15   # Pre-grasp distance (meters)
+    align_fraction: 0.7      # Fraction of grasp phase to reach pre-grasp
 
   keypoints:
     count: [0, 0]               # Random number of additional grasp keypoints
@@ -29,7 +29,7 @@ trajectory:
 
     - name: "pour"
       type: "waypoint"
-      # Pour position: above cup, tilted 90 degrees to pour
+      # Pour position: above cup with pour tilt
       pose: [-0.55, 0.12, 0.423, 0.707, -0.707, 0.0, 0.0]
       duration: 4.5
 
@@ -71,8 +71,8 @@ terminations:
     position_threshold: [1.0, 1.0]
     rotation_threshold: [3.14, 3.14]
   hand_pose_deviation:
-    position_threshold: [1.0, 1.0]         # meters (lenient → strict)
-    rotation_threshold: [3.14, 3.14]          # radians ~180° → ~180°
+    position_threshold: [1.0, 1.0]         # Position threshold (meters)
+    rotation_threshold: [3.14, 3.14]          # Rotation threshold (radians)
 
 procedural_objects:
   generation:
