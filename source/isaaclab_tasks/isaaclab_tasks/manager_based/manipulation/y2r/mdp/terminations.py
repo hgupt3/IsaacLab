@@ -115,7 +115,7 @@ def hand_pose_deviation(
     
     # Get palm body index (cache it)
     if not hasattr(env, '_term_palm_body_idx'):
-        palm_ids = robot.find_bodies("palm_link")[0]
+        palm_ids = robot.find_bodies(env.cfg.y2r_cfg.robot.palm_body_name)[0]
         if len(palm_ids) == 0:
             return torch.zeros(N, dtype=torch.bool, device=env.device)
         env._term_palm_body_idx = palm_ids[0]

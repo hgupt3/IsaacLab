@@ -5,17 +5,17 @@
 """Configuration loader for Y2R task with layer-based YAML composition.
 
 YAML is the single source of truth - all values must be defined in configs/base.yaml.
-Layers (mode, task) are composed on top of base config at runtime.
+Layers (robot, mode, task) are composed on top of base config at runtime.
+
+Layer order: base → robot → mode → task
+
+All parameters default to env vars (Y2R_MODE, Y2R_TASK, Y2R_ROBOT),
+with fallback defaults defined in _DEFAULT_* constants below.
 
 Usage:
-    cfg = get_config()                                   # train mode, base task
-    cfg = get_config(mode="distill")                     # distill mode (student training)
-    cfg = get_config(mode="play", task="push")           # teacher play on task
-    cfg = get_config(mode="play_student", task="cup")    # student play on task
-
-To add a new task:
-    1. Create configs/layers/tasks/<name>.yaml with task-specific overrides
-    2. Run: ./scripts/play.sh --task <name> --continue
+    cfg = get_config()                                          # reads all from env vars
+    cfg = get_config(robot="kuka_allegro")                      # override robot only
+    cfg = get_config(mode="play", task="push")                  # override mode+task
 """
 
 from __future__ import annotations
@@ -25,7 +25,25 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, get_origin, get_type_hints
 
+import os
+
 import yaml
+
+# ==============================================================================
+# DEFAULTS (single source of truth for env var fallbacks)
+# ==============================================================================
+_DEFAULT_MODE = "train"
+_DEFAULT_TASK = "base"
+_DEFAULT_ROBOT = "ur5e_leap"
+
+
+def _resolve_defaults(mode: str | None, task: str | None, robot: str | None) -> tuple[str, str, str]:
+    """Resolve None parameters from environment variables, falling back to defaults."""
+    return (
+        mode if mode is not None else os.environ.get("Y2R_MODE", _DEFAULT_MODE),
+        task if task is not None else os.environ.get("Y2R_TASK", _DEFAULT_TASK),
+        robot if robot is not None else os.environ.get("Y2R_ROBOT", _DEFAULT_ROBOT),
+    )
 
 
 # ==============================================================================
@@ -53,8 +71,8 @@ def _load_yaml(name: str) -> dict:
         raise FileNotFoundError(f"Config file not found: {config_path}")
     
     with open(config_path) as f:
-        config = yaml.safe_load(f)
-    
+        config = yaml.safe_load(f) or {}
+
     if "_base_" in config:
         base_name = config.pop("_base_").replace(".yaml", "")
         base_config = _load_yaml(base_name)
@@ -445,6 +463,7 @@ class RobotConfig:
     arm_joint_count: int
     hand_joint_count: int
     eigen_dim: int
+    palm_body_name: str
 
 
 @dataclass
@@ -634,21 +653,29 @@ def _parse_segments(yaml_segments: list[dict]) -> list[BaseSegmentConfig]:
     return segments
 
 
-def get_config_file_paths(mode: str = "train", task: str = "base") -> list[Path]:
-    """Return list of YAML files that will be loaded for given mode/task.
+def get_config_file_paths(mode: str | None = None, task: str | None = None, robot: str | None = None) -> list[Path]:
+    """Return list of YAML files that will be loaded for given mode/task/robot.
 
     This ensures wandb logging matches actual config composition by maintaining
     a single source of truth for which files are loaded.
 
     Args:
-        mode: One of "train", "distill", "play", "play_student", "keyboard"
-        task: Task name - "base" or any YAML file in configs/layers/tasks/
+        mode: One of "train", "distill", "play", "play_student", "keyboard" (None = Y2R_MODE env var)
+        task: Task name - "base" or any YAML file in configs/layers/tasks/ (None = Y2R_TASK env var)
+        robot: Robot name - "ur5e_leap" or "kuka_allegro" (None = Y2R_ROBOT env var)
 
     Returns:
         List of Path objects for YAML files that will be loaded
     """
+    mode, task, robot = _resolve_defaults(mode, task, robot)
+
     config_dir = Path(__file__).parent / "configs"
     files = [config_dir / "base.yaml"]
+
+    # Robot layer (applied first, before mode/task)
+    robot_layer = config_dir / "layers" / "robots" / f"{robot}.yaml"
+    if robot_layer.exists():
+        files.append(robot_layer)
 
     # Mode layers (mirrors get_config() logic exactly)
     if mode == "distill":
@@ -672,28 +699,29 @@ def get_config_file_paths(mode: str = "train", task: str = "base") -> list[Path]
     return files
 
 
-def get_config(mode: str = "train", task: str = "base") -> Y2RConfig:
+def get_config(mode: str | None = None, task: str | None = None, robot: str | None = None) -> Y2RConfig:
     """Load Y2R config with layer-based composition.
-    
+
+    Layer order: base → robot → mode → task
+    All parameters default to their respective env vars (Y2R_MODE, Y2R_TASK, Y2R_ROBOT).
+
     Args:
-        mode: One of "train", "distill", "play", "play_student"
-            - train: Base config only (teacher training, 16k envs)
-            - distill: Base + student layer (student distillation, 4k envs)
-            - play: Base + play layer (teacher evaluation, 32 envs)
-            - play_student: Base + student + play + student_play layers (4 envs)
-        task: Task name - "base" or any YAML file in configs/layers/tasks/
-            - base: Uses base config (random objects)
-            - <name>: Loads configs/layers/tasks/<name>.yaml
-            
+        mode: One of "train", "distill", "play", "play_student" (None = Y2R_MODE env var)
+        task: Task name - "base" or tasks YAML name (None = Y2R_TASK env var)
+        robot: Robot name - "ur5e_leap" or "kuka_allegro" (None = Y2R_ROBOT env var)
+
     Returns:
         Y2RConfig instance with layers composed
-        
-    To add a new task:
-        1. Create configs/layers/tasks/<name>.yaml with task-specific overrides
-        2. Run: ./scripts/play.sh --task <name> --continue
     """
+    mode, task, robot = _resolve_defaults(mode, task, robot)
+
     cfg = _load_yaml("base")
-    
+
+    # Robot layer (applied first, before mode/task)
+    robot_layer = Path(__file__).parent / "configs" / "layers" / "robots" / f"{robot}.yaml"
+    if robot_layer.exists():
+        cfg = _deep_merge(cfg, _load_yaml(f"layers/robots/{robot}"))
+
     # Mode layers (mutually exclusive paths)
     if mode == "distill":
         cfg = _deep_merge(cfg, _load_yaml("layers/student"))
@@ -706,7 +734,7 @@ def get_config(mode: str = "train", task: str = "base") -> Y2RConfig:
     elif mode == "keyboard":
         cfg = _deep_merge(cfg, _load_yaml("layers/keyboard"))
     # mode == "train" uses base only
-    
+
     # Task layer (optional, applied last)
     if task != "base":
         cfg = _deep_merge(cfg, _load_yaml(f"layers/tasks/{task}"))

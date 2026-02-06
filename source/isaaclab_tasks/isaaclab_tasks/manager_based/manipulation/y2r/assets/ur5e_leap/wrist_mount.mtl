@@ -1,0 +1,7 @@
+# Black mount
+newmtl mount_black
+Ka 0.0 0.0 0.0
+Kd 0.01 0.01 0.01
+Ks 0.01 0.01 0.01
+Ns 0
+d 1.0

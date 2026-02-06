@@ -438,20 +438,20 @@ randomization:
     restitution: [0.0, 0.0]
     
   robot:
-    static_friction: [0.5, 1.0]
-    dynamic_friction: [0.5, 1.0]
+    static_friction: [0.8, 1.2]
+    dynamic_friction: [0.8, 1.2]
     restitution: [0.0, 0.0]
-    stiffness_scale: [0.5, 2.0]
-    damping_scale: [0.5, 2.0]
-    joint_friction_scale: [0.0, 5.0]
+    stiffness_scale: [0.8, 1.2]
+    damping_scale: [0.8, 1.2]
+    joint_friction_scale: [0.8, 1.2]
     
   reset:
-    table_xy: [-0.05, 0.05]     # Table position randomization
+    table_xy: [0.0, 0.0]     # Table position randomization
     object_x: [-0.25, 0.25]     # Object X relative to init
     object_y: [-0.3, 0.3]       # Object Y relative to init
     object_yaw: [-3.14, 3.14]   # Object yaw rotation
     robot_joints: [-0.5, 0.5]   # Joint position offset
-    robot_wrist: [-3.0, 3.0]    # Wrist joint offset (larger range)
+    robot_wrist: [-1.0, 1.0]    # Wrist joint offset (larger range)
     z_offset: 0.005             # Safety margin above table (meters)
 
 # ==============================================================================
@@ -479,6 +479,7 @@ robot:
   arm_joint_count: 7
   hand_joint_count: 16
   eigen_dim: 1                  # PCA dimensions for eigen grasp
+  palm_body_name: "palm_frame"  # Body used for palm pose tracking (Kuka overrides to palm_link)
 
 # ==============================================================================
 # PUSH-T MODE (disabled by default)

@@ -200,10 +200,11 @@ def hand_pose_b(
     """
     robot: Articulation = env.scene[robot_cfg.name]
 
-    # Find palm_link body index
-    palm_ids = robot.find_bodies("palm_link")[0]
+    # Find palm body index
+    palm_name = env.cfg.y2r_cfg.robot.palm_body_name
+    palm_ids = robot.find_bodies(palm_name)[0]
     if len(palm_ids) == 0:
-        raise RuntimeError("Could not find 'palm_link' body on robot!")
+        raise RuntimeError(f"Could not find '{palm_name}' body on robot!")
     palm_idx = palm_ids[0]
 
     # Get palm pose in world frame
@@ -1003,9 +1004,43 @@ class target_sequence_obs_b(ManagerTermBase):
             self._init_region_visualizer()
         
         # Cache palm body index for hand trajectory
-        palm_ids = self.ref_asset.find_bodies("palm_link")[0]
+        palm_name = y2r_cfg.robot.palm_body_name
+        palm_ids = self.ref_asset.find_bodies(palm_name)[0]
         self._palm_body_idx = palm_ids[0] if len(palm_ids) > 0 else None
+
+        # Expose render_debug on the env so external scripts (keyboard, etc.) can call it
+        env.render_debug = self.render_debug
     
+    def render_debug(self):
+        """Draw debug visualizations (pose axes, regions) using current scene state.
+
+        Can be called independently of __call__ — e.g., from keyboard debug scripts
+        that bypass env.step(). Reads all data from scene/trajectory_manager directly.
+        """
+        N = self.env.num_envs
+
+        # Debug draw (pose axes + regions)
+        if self._debug_draw is not None and (
+            self.visualize_pose_axes or self.visualize_hand_pose_targets
+            or self.visualize_waypoint_region or self.visualize_goal_region
+        ):
+            self._debug_draw.clear_lines()
+
+            if self.visualize_pose_axes or self.visualize_hand_pose_targets:
+                object_pos_w = self.object.data.root_pos_w
+                object_quat_w = self.object.data.root_quat_w
+                window_targets = self.trajectory_manager.get_window_targets()
+                target_pos_w = window_targets[:, :, :3]
+                target_quat_w = window_targets[:, :, 3:7]
+                self._visualize_pose_axes(object_pos_w, object_quat_w, target_pos_w, target_quat_w, N)
+
+            if self.visualize_waypoint_region or self.visualize_goal_region:
+                self._visualize_regions(self.env.scene.env_origins, self.trajectory_manager.start_poses[:, :3])
+
+        # Grasp surface point (marker-based)
+        if self.visualize_grasp_surface_point and self.grasp_point_marker is not None:
+            self._visualize_grasp_surface_point(N)
+
     def _init_visualizer(self):
         """Initialize visualization markers for targets + current object."""
         import isaaclab.sim as sim_utils
@@ -1569,26 +1604,12 @@ class target_sequence_obs_b(ManagerTermBase):
             palm_pos_w=palm_pos_w,
         )
         
-        # Visualization (point clouds every frame)
+        # Visualization (point clouds every frame — depends on computed data)
         if (self.visualize or self.visualize_current) and self.markers is not None:
             self._visualize(all_points_w, current_points_w, N)
-        
-        # Grasp surface point visualization (green sphere)
-        if self.visualize_grasp_surface_point and self.grasp_point_marker is not None:
-            self._visualize_grasp_surface_point(N)
-        
-        # Debug draw visualizations (lines) - must redraw every frame after clear
-        if self._debug_draw is not None and (self.visualize_pose_axes or self.visualize_hand_pose_targets or self.visualize_waypoint_region or self.visualize_goal_region):
-            # Clear previous frame's lines first
-            self._debug_draw.clear_lines()
-            
-            # Pose axes visualization (current + targets + hand targets)
-            if self.visualize_pose_axes or self.visualize_hand_pose_targets:
-                self._visualize_pose_axes(object_pos_w, object_quat_w, target_pos_w, target_quat_w, N)
-            
-            # Region boxes (waypoint/goal)
-            if self.visualize_waypoint_region or self.visualize_goal_region:
-                self._visualize_regions(self.env.scene.env_origins, self.trajectory_manager.start_poses[:, :3])
+
+        # Debug draw visualizations (pose axes, regions, grasp point)
+        self.render_debug()
         
         # Flatten: (N, W * P * 3)
         return all_points_b.reshape(N, -1)

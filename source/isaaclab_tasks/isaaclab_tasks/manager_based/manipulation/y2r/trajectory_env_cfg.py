@@ -889,36 +889,26 @@ def _build_terminations_cfg(cfg: Y2RConfig):
 # MAIN ENV CONFIG
 # ==============================================================================
 
-import os as _os
-_Y2R_MODE = _os.environ.get("Y2R_MODE", "train")
-_Y2R_TASK = _os.environ.get("Y2R_TASK", "base")
-
 @configclass
 class TrajectoryEnvCfg(ManagerBasedEnvCfg):
     """Trajectory following task definition.
 
     The robot must follow a sequence of point cloud targets along a smooth Bezier trajectory.
     Includes pickup from table, variable-speed manipulation, and place-back phases.
-    
+
     All config values are loaded dynamically in __post_init__ from the YAML file.
-    Config is determined by Y2R_MODE and Y2R_TASK environment variables.
-    
-    Y2R_MODE: train | distill | play | play_student
-    Y2R_TASK: base | push | cup
-    
+    Config is determined by Y2R_MODE, Y2R_TASK, and Y2R_ROBOT environment variables.
+    Defaults are defined in config_loader._DEFAULT_*.
+
     Example: Y2R_MODE=play Y2R_TASK=cup ./scripts/play.sh --continue
     """
 
-    # Config parameters - read from env vars at module load time
-    _config_mode: str = _Y2R_MODE
-    _config_task: str = _Y2R_TASK
-    
     # Static settings
     viewer: ViewerCfg = ViewerCfg(eye=(-2.25, 0.0, 0.75), lookat=(0.0, 0.0, 0.45), origin_type="env")
-    
+
     # Scene - configured in __post_init__
     scene: TrajectorySceneCfg = TrajectorySceneCfg(num_envs=1, env_spacing=3.0)
-    
+
     # Built dynamically in __post_init__
     observations = None
     actions: ActionsCfg = ActionsCfg()
@@ -927,13 +917,13 @@ class TrajectoryEnvCfg(ManagerBasedEnvCfg):
     terminations = None
     events = None
     curriculum = None
-    
+
     # Config reference (set in __post_init__)
     y2r_cfg: Y2RConfig = None
 
     def __post_init__(self):
         """Build all config-dependent managers."""
-        cfg = get_config(mode=self._config_mode, task=self._config_task)
+        cfg = get_config()
         self.y2r_cfg = cfg
         
         # Build scene

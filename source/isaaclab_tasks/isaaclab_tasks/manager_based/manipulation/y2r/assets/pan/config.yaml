@@ -1,5 +1,5 @@
-asset_path: /home/harsh/y2r/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/y2r/assets/pan/pan_outline_temp.obj
-usd_dir: /home/harsh/y2r/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/y2r/assets/pan
+asset_path: pan_outline_temp.obj
+usd_dir: .
 usd_file_name: pan_outline.usd
 force_usd_conversion: true
 make_instanceable: false

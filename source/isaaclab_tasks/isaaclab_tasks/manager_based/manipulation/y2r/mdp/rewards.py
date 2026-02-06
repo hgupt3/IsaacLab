@@ -887,7 +887,7 @@ def finger_manipulation(
     
     # Get palm body index (cache on first call)
     if not hasattr(env, '_palm_body_idx'):
-        palm_ids = robot.find_bodies("palm_link")[0]
+        palm_ids = robot.find_bodies(env.cfg.y2r_cfg.robot.palm_body_name)[0]
         if len(palm_ids) == 0:
             # Fallback: no palm_link found, return zero reward
             return torch.zeros(env.num_envs, device=env.device)
@@ -1006,7 +1006,7 @@ def palm_velocity_penalty(
     
     # Get palm body index (reuse cached value if available from finger_manipulation)
     if not hasattr(env, '_palm_body_idx'):
-        palm_ids = robot.find_bodies("palm_link")[0]
+        palm_ids = robot.find_bodies(env.cfg.y2r_cfg.robot.palm_body_name)[0]
         if len(palm_ids) == 0:
             return torch.zeros(env.num_envs, device=env.device)
         env._palm_body_idx = palm_ids[0]
@@ -1065,7 +1065,7 @@ def palm_orientation_penalty(
     
     # Get palm body index (reuse cached if available)
     if not hasattr(env, '_palm_body_idx'):
-        palm_ids = robot.find_bodies("palm_link")[0]
+        palm_ids = robot.find_bodies(env.cfg.y2r_cfg.robot.palm_body_name)[0]
         if len(palm_ids) == 0:
             return torch.zeros(env.num_envs, device=env.device)
         env._palm_body_idx = palm_ids[0]
@@ -1232,7 +1232,7 @@ def hand_pose_following(
     
     # Get palm body index (cache it)
     if not hasattr(env, '_palm_body_idx'):
-        palm_ids = robot.find_bodies("palm_link")[0]
+        palm_ids = robot.find_bodies(env.cfg.y2r_cfg.robot.palm_body_name)[0]
         if len(palm_ids) == 0:
             env.hand_pose_gate = torch.ones(N, device=env.device)
             return torch.zeros(N, device=env.device)

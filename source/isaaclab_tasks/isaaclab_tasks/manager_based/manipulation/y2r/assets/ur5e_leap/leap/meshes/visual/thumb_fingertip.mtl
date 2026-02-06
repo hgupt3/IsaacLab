@@ -1,0 +1,14 @@
+# Black plastic + white rubber tip
+newmtl black_metal
+Ka 0.0 0.0 0.0
+Kd 0.01 0.01 0.01
+Ks 0.01 0.01 0.01
+Ns 0
+d 1.0
+
+newmtl White_tip
+Ka 0.15 0.15 0.15
+Kd 0.9 0.9 0.9
+Ks 0.05 0.05 0.05
+Ns 10
+d 1.0

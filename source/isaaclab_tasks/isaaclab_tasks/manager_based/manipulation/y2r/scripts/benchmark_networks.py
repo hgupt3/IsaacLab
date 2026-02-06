@@ -225,9 +225,9 @@ def main():
     parser.add_argument('--obs_dim', type=int, default=2890, help='Observation dimension')
     parser.add_argument('--action_dim', type=int, default=23, help='Action dimension')
     parser.add_argument('--mlp_config', type=str,
-                        default='IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/y2r/config/kuka_allegro/agents/rl_games_trajectory_ppo_cfg.yaml')
+                        default='IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/y2r/config/agents/rl_games_trajectory_ppo_cfg.yaml')
     parser.add_argument('--pt_config', type=str,
-                        default='IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/y2r/config/kuka_allegro/agents/rl_games_point_transformer_cfg.yaml')
+                        default='IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/y2r/config/agents/rl_games_point_transformer_cfg.yaml')
     parser.add_argument('--device', type=str, default='cuda:0')
     args = parser.parse_args()
 

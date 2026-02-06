@@ -28,7 +28,7 @@ from isaaclab.app import AppLauncher
 
 # Parse arguments
 parser = argparse.ArgumentParser(description="Keyboard debug for palm frame exploration.")
-parser.add_argument("--task", type=str, default="Isaac-Trajectory-Kuka-Allegro-v0", help="Task name.")
+parser.add_argument("--task", type=str, default="Isaac-Trajectory-UR5e-Leap-v0", help="Task name.")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -127,15 +127,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print("\n" + "=" * 80)
     print("DEBUG: JOINT ORDERING ANALYSIS")
     print("=" * 80)
-    
+
     # Get PhysX native joint names (this is the order of robot.data.joint_pos columns)
     physx_joint_names = robot.data.joint_names
     print(f"\n[PhysX Native Order] Total joints: {len(physx_joint_names)}")
     for i, name in enumerate(physx_joint_names):
         print(f"  [{i:2d}] {name}")
-    
-    # Find arm joint IDs (first 7 joints for Kuka)
-    arm_joint_names = [f"iiwa7_joint_{i+1}" for i in range(7)]
+
+    # Detect arm type from joint names
+    if any("ur5e" in name for name in physx_joint_names):
+        arm_joint_names = [f"ur5e_joint_{i+1}" for i in range(6)]
+        arm_type = "ur5e"
+    else:
+        arm_joint_names = [f"iiwa7_joint_{i+1}" for i in range(7)]
+        arm_type = "kuka"
+    print(f"\n[Detected arm: {arm_type}] {len(arm_joint_names)} arm joints")
+
     arm_joint_ids, _ = robot.find_joints(arm_joint_names, preserve_order=True)
     arm_joint_ids = list(arm_joint_ids)
     
@@ -172,10 +179,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     
     print("=" * 80 + "\n")
     
-    # Find palm_link body index
-    palm_ids = robot.find_bodies("palm_link")[0]
+    # Find palm body index
+    palm_name = unwrapped_env.cfg.y2r_cfg.robot.palm_body_name
+    palm_ids = robot.find_bodies(palm_name)[0]
     if len(palm_ids) == 0:
-        raise RuntimeError("Could not find 'palm_link' body on robot!")
+        raise RuntimeError(f"Could not find '{palm_name}' body on robot!")
     palm_body_idx = palm_ids[0]
     
     # Correct Jacobian index depends on fixed vs floating base
@@ -322,7 +330,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         ik_controller.set_command(command)
         
         # Get Jacobian and transform to base frame
-        jacobian = robot.root_physx_view.get_jacobians()[:, jacobi_body_idx, :, arm_joint_ids]  # (1, 6, 7)
+        jacobian = robot.root_physx_view.get_jacobians()[:, jacobi_body_idx, :, arm_joint_ids]  # (1, 6, N_arm)
         
         # Transform Jacobian from world to base frame
         base_rot_matrix = matrix_from_quat(quat_inv(root_quat_w))  # (1, 3, 3)
@@ -331,7 +339,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         jacobian_b[:, 3:, :] = torch.bmm(base_rot_matrix, jacobian[:, 3:, :])
         
         # Get current arm joint positions
-        arm_joint_pos = robot.data.joint_pos[:, arm_joint_ids]  # (1, 7)
+        arm_joint_pos = robot.data.joint_pos[:, arm_joint_ids]  # (1, N_arm)
         
         # Compute IK: finds joint positions that move current pose toward target
         arm_target = ik_controller.compute(
@@ -339,7 +347,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             ee_quat=palm_quat_b,
             jacobian=jacobian_b,
             joint_pos=arm_joint_pos
-        )  # (1, 7)
+        )  # (1, N_arm)
         
         # Compute error from current to target
         pos_error = (target_pos_b - palm_pos_b).norm().item()
@@ -364,45 +372,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         unwrapped_env.scene.write_data_to_sim()
         unwrapped_env.sim.step(render=True)
         unwrapped_env.scene.update(unwrapped_env.sim.get_physics_dt())
+        if hasattr(unwrapped_env, 'render_debug'):
+            unwrapped_env.render_debug()
         step_count += 1
         
-        # Periodic print of palm position and finger joints
+        # Periodic status print
         current_time = time.time()
         if current_time - last_print_time >= print_interval:
             roll, pitch, yaw = quat_to_euler_deg(palm_quat_w[0])
-            print(f"\n[Step {step_count:6d}] Palm: ({palm_pos_w[0,0]:.3f}, {palm_pos_w[0,1]:.3f}, {palm_pos_w[0,2]:.3f}) | "
+            print(f"[Step {step_count:6d}] Palm: ({palm_pos_w[0,0]:.3f}, {palm_pos_w[0,1]:.3f}, {palm_pos_w[0,2]:.3f}) | "
                   f"Euler: ({roll:.1f}, {pitch:.1f}, {yaw:.1f}) | Error: {pos_error*100:.1f}cm | "
                   f"Grip: {eigen_coeff.item():.2f}")
-            
-            # Get current hand joint positions via find_joints (correct order - what rewards use)
-            hand_joint_pos = robot.data.joint_pos[0, hand_joint_ids]  # (16,)
-            
-            # ==================== DEBUG: Joint values vs config defaults ====================
-            print("\n  [DEBUG] Current Joint Positions vs Config Default:")
-            print("  " + "-" * 70)
-            print(f"  {'Joint':<16} | {'Current':>10} | {'Config':>10} | {'Error':>10} | Visual")
-            print("  " + "-" * 70)
-            
-            config_tensor = torch.tensor(CONFIG_DEFAULT_JOINTS, device=device)
-            joint_errors = hand_joint_pos - config_tensor
-            
-            for i, name in enumerate(hand_joint_names):
-                curr_val = hand_joint_pos[i].item()
-                config_val = CONFIG_DEFAULT_JOINTS[i]
-                err = joint_errors[i].item()
-                bar = "█" * int(abs(err) * 20)  # Visual bar
-                print(f"  {name:<16} | {curr_val:+10.4f} | {config_val:+10.4f} | {err:+10.4f} | {bar}")
-            
-            # ==================== DEBUG: finger_regularizer penalty ====================
-            print("\n  [DEBUG] finger_regularizer Penalty:")
-            
-            penalty, error = debug_finger_regularizer(
-                hand_joint_pos, CONFIG_DEFAULT_JOINTS, std=1.5
-            )
-            
-            print(f"    L2 error = {error:.4f} rad -> penalty = {penalty:.4f}")
-            
-            print()
             last_print_time = current_time
     
     # Cleanup

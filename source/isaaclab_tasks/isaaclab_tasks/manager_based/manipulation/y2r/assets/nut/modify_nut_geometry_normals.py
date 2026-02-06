@@ -3,6 +3,8 @@ USD Mesh Thickening - Normal-Based Vertex Displacement
 Preserves surface curvature and threading detail.
 """
 
+from pathlib import Path
+
 from pxr import Usd, UsdGeom, Gf, Vt
 import numpy as np
 
@@ -92,12 +94,13 @@ def thicken_nut_normals(usd_path: str, output_path: str,
 
 
 if __name__ == "__main__":
-    input_usd = "/home/harsh/y2r/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/y2r/assets/nut/nut.usd"
-    output_usd = "/home/harsh/y2r/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/y2r/assets/nut/nut_thick.usd"
+    base_dir = Path(__file__).resolve().parent
+    input_usd = base_dir / "nut.usd"
+    output_usd = base_dir / "nut_thick.usd"
 
     thicken_nut_normals(
-        usd_path=input_usd,
-        output_path=output_usd,
+        usd_path=str(input_usd),
+        output_path=str(output_usd),
         thickness=0.003,  # 3mm thicker
         inner_radius_threshold=0.008  # Protect vertices within 8mm of center
     )

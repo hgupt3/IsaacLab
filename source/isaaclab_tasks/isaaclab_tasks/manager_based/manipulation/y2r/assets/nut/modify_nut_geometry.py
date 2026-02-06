@@ -4,6 +4,8 @@ WARNING: This is a template - USD mesh editing is complex and may require
 adjustments based on your specific mesh structure.
 """
 
+from pathlib import Path
+
 from pxr import Usd, UsdGeom, Gf
 import numpy as np
 
@@ -76,13 +78,14 @@ def thicken_nut_radially(usd_path: str, output_path: str, thickness_increase: fl
 
 if __name__ == "__main__":
     # Example usage
-    input_usd = "/home/harsh/y2r/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/y2r/assets/nut/nut.usd"
-    output_usd = "/home/harsh/y2r/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/y2r/assets/nut/nut_thick.usd"
+    base_dir = Path(__file__).resolve().parent
+    input_usd = base_dir / "nut.usd"
+    output_usd = base_dir / "nut_thick.usd"
 
     # Thicken by 3mm on outer surface
     thicken_nut_radially(
-        usd_path=input_usd,
-        output_path=output_usd,
+        usd_path=str(input_usd),
+        output_path=str(output_usd),
         thickness_increase=0.003  # 3mm in meters
     )
 

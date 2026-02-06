@@ -17,8 +17,8 @@ visualization:
   pose_axes: true
   targets: false
   current_object: false
-  waypoint_region: false
-  goal_region: false
+  waypoint_region: true
+  goal_region: true
   env_ids: null
   debug_print_rewards: true
 
