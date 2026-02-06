@@ -359,7 +359,7 @@ rewards:
     params:
       phases: [grasp, release]    # Active in grasp and release phases
       # Default finger joint positions (Allegro hand)
-      default_joints: [0.0315, 0.0764, 0.0196, 0.2944, -0.0010, 0.1109, 0.0309, 0.2541, -0.0067, 0.1260, 0.0697, 0.2933, 1.5165, 0.1420, 0.3112, 0.3816]
+      default_joints: [0.0315, 0.0764, 0.0196, 0.2944, -0.0010, 0.1109, 0.0309, 0.2541, -0.0067, 0.1260, 0.0697, 0.2933, 1.5165, -0.2420, 0.3112, 0.3816]
       std: 1.5                    # Penalty growth with deviation (radians)
   
   # Object stillness - penalizes object movement during grasp/release
@@ -453,6 +453,14 @@ randomization:
     robot_joints: [-0.5, 0.5]   # Joint position offset
     robot_wrist: [-1.0, 1.0]    # Wrist joint offset (larger range)
     z_offset: 0.005             # Safety margin above table (meters)
+    # Robot base position randomization (world frame, meters)
+    robot_base_x: [-0.01, 0.01]    # Front/back
+    robot_base_y: [-0.01, 0.01]    # Left/right
+    robot_base_z: [0.005, 0.02]      # Up only — robot can't sink into table
+    # Camera offset perturbation (camera frame, meters)
+    camera_forward: [0.0, 0.002]      # Toward workspace only (not back)
+    camera_lateral: [-0.002, 0.002]   # Left/right
+    camera_vertical: [-0.002, 0.002]  # Up/down
 
 # ==============================================================================
 # VISUALIZATION
@@ -478,7 +486,7 @@ robot:
   action_scale: 0.1
   arm_joint_count: 7
   hand_joint_count: 16
-  eigen_dim: 1                  # PCA dimensions for eigen grasp
+  eigen_dim: 5                  # PCA dimensions for eigen grasp
   palm_body_name: "palm_frame"  # Body used for palm pose tracking (Kuka overrides to palm_link)
 
 # ==============================================================================
@@ -512,25 +520,29 @@ pseudo_camera:
   position: [-1.0, 0.0, 0.3]     # [x, y, z] relative to env origin (meters)
 
 # ==============================================================================
-# WRIST CAMERA
+# WRIST CAMERA  (Gemini 305 depth — pinhole, square pixels, HFOV 88°)
 # ==============================================================================
 # Wrist-mounted depth camera for student observations
+# Intrinsics: fx=fy=662.7px @1280×800 → focal_length=3.19mm, horizontal_aperture=6.17mm
+# At 80×50 (native 16:10 aspect): HFOV=88°, VFOV≈62° (within 65°±3° spec)
 wrist_camera:
-  enabled: false              # Set true when using student_camera
-  resolution: 64              # Output resolution (square)
-  focal_length: 1.78          # Camera focal length (mm)
-  horizontal_aperture: 6.17  # Sensor size (mm)
-  clipping_range: [0.0001, 0.5] # Near/far clipping (meters)
-  
-  # Transform relative to palm_link (from Isaac Sim GUI)
+  enabled: false
+  width: 80                     # Gemini 305 native 16:10 aspect ratio (1280:800)
+  height: 50
+  focal_length: 3.19            # 88° HFOV: 6.17 / (2×tan(44°))
+  horizontal_aperture: 6.17     # Virtual sensor width (mm)
+  clipping_range: [0.04, 1.0]   # Gemini 305 depth range: 4–100 cm
+
+  # Offset: palm_link → camera (opengl convention, Euler degrees)
+  # UR5e: computed from URDF transforms inv(T_link6→palm) × T_link6→optical
   offset:
-    pos: [-0.1, 0.0, 0.05]    # [x, y, z] in meters
-    rot: [-90.0, -90.0, 0.0]  # [rx, ry, rz] in degrees
-  
+    pos: [-0.1774, -0.021, -0.071]
+    rot: [90.0, 90.0, 0.0]
+
   # Web viewer for remote visualization over SSH
-  web_viewer: false           # Enable web viewer
-  viewer_port: 8000           # Port for web viewer
-  viewer_update_hz: 10        # Viewer update rate (Hz)
+  web_viewer: false
+  viewer_port: 8000
+  viewer_update_hz: 10
 
 # ==============================================================================
 # PROCEDURAL OBJECTS

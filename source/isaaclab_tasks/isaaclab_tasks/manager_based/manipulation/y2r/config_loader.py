@@ -424,6 +424,12 @@ class ResetRandomizationConfig:
     robot_joints: tuple[float, float]
     robot_wrist: tuple[float, float]
     z_offset: float
+    robot_base_x: tuple[float, float]
+    robot_base_y: tuple[float, float]
+    robot_base_z: tuple[float, float]
+    camera_forward: tuple[float, float]
+    camera_lateral: tuple[float, float]
+    camera_vertical: tuple[float, float]
 
 
 @dataclass
@@ -520,7 +526,8 @@ class CameraOffsetConfig:
 @dataclass
 class WristCameraConfig:
     enabled: bool
-    resolution: int
+    width: int
+    height: int
     focal_length: float
     horizontal_aperture: float
     clipping_range: tuple[float, float]

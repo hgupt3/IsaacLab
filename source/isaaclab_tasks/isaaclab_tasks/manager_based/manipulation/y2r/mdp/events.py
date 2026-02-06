@@ -170,3 +170,89 @@ def reset_push_t_object(
     # Write to simulation
     asset.write_root_pose_to_sim(torch.cat([positions, quaternions], dim=-1), env_ids=env_ids)
     asset.write_root_velocity_to_sim(velocities, env_ids=env_ids)
+
+
+def reset_camera_offset(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    base_offset_pos: tuple[float, float, float],
+    base_offset_rot_euler: tuple[float, float, float],
+    perturbation_ranges: dict[str, tuple[float, float]],
+    parent_body_name: str,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("wrist_camera"),
+):
+    """Randomize wrist camera position offset from parent body at each reset.
+
+    Samples a position perturbation in camera frame (forward/lateral/vertical),
+    transforms it to the parent body frame via the offset rotation, and applies
+    the new offset via set_world_poses. Only position is perturbed — rotation
+    is left unchanged.
+
+    The perturbation ranges use camera-intuitive directions:
+        forward  = camera looking direction (OpenGL -Z)
+        lateral  = camera right direction   (OpenGL +X)
+        vertical = camera up direction      (OpenGL +Y)
+
+    Note: Uses stale body data from the previous step, but this cancels out
+    because set_world_poses decomposes local = inv(parent_world) × desired_world
+    using the same stale parent transform from the USD stage.
+
+    Args:
+        env: The environment instance.
+        env_ids: Environment indices to reset.
+        base_offset_pos: Default camera offset position in parent body frame (meters).
+        base_offset_rot_euler: Euler angles [rx, ry, rz] degrees for the offset
+            rotation (same format as wrist_camera.offset.rot in config).
+        perturbation_ranges: Dict with "forward", "lateral", "vertical" keys,
+            each a (min, max) range in meters.
+        parent_body_name: Name of the parent body (e.g. "palm_link").
+        sensor_cfg: Configuration for the camera sensor.
+    """
+    from scipy.spatial.transform import Rotation
+
+    camera = env.scene[sensor_cfg.name]
+    robot: Articulation = env.scene["robot"]
+    device = robot.device
+    n = len(env_ids)
+    if n == 0:
+        return
+
+    # Cache parent body index on first call
+    if not hasattr(camera, "_parent_body_idx"):
+        body_ids = robot.find_bodies(parent_body_name)[0]
+        camera._parent_body_idx = body_ids[0]
+    parent_idx = camera._parent_body_idx
+
+    # Compute opengl→palm rotation matrix (same Euler swap as env cfg mixin)
+    re = base_offset_rot_euler
+    r_palm_to_opengl = Rotation.from_euler("xyz", (re[0], re[2], -re[1]), degrees=True)
+    R_opengl_to_palm = torch.tensor(
+        r_palm_to_opengl.inv().as_matrix(), dtype=torch.float32, device=device
+    )
+
+    # Sample perturbation in OpenGL camera frame
+    fwd = perturbation_ranges.get("forward", (0.0, 0.0))
+    lat = perturbation_ranges.get("lateral", (0.0, 0.0))
+    vert = perturbation_ranges.get("vertical", (0.0, 0.0))
+    # OpenGL: +X = right (lateral), +Y = up (vertical), -Z = forward
+    ranges_t = torch.tensor([lat, vert, [-fwd[1], -fwd[0]]], device=device)
+    pert_opengl = math_utils.sample_uniform(
+        ranges_t[:, 0], ranges_t[:, 1], (n, 3), device=device
+    )
+
+    # Rotate perturbation from OpenGL frame to palm frame
+    pert_palm = (R_opengl_to_palm @ pert_opengl.unsqueeze(-1)).squeeze(-1)
+
+    # New camera local offset in palm frame = base + perturbation
+    base_pos = torch.tensor(base_offset_pos, dtype=torch.float32, device=device)
+    new_local_pos = base_pos.unsqueeze(0) + pert_palm
+
+    # Get parent body world pose (stale — cancels with set_world_poses)
+    palm_pos_w = robot.data.body_pos_w[env_ids, parent_idx]
+    palm_quat_w = robot.data.body_quat_w[env_ids, parent_idx]
+
+    # Camera world position = palm_world + palm_rot @ local_offset
+    new_cam_pos_w = palm_pos_w + math_utils.quat_apply(palm_quat_w, new_local_pos)
+
+    # Set position only — orientation stays unchanged (preserves spawn-time OpenGL convention)
+    camera.set_world_poses(positions=new_cam_pos_w, env_ids=env_ids)

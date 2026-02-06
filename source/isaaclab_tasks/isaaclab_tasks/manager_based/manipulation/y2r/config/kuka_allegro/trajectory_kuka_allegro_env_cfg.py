@@ -188,8 +188,8 @@ class KukaAllegroTrajectoryMixinCfg:
                     horizontal_aperture=cfg.wrist_camera.horizontal_aperture,
                     clipping_range=cfg.wrist_camera.clipping_range,
                 ),
-                width=cfg.wrist_camera.resolution,
-                height=cfg.wrist_camera.resolution,
+                width=cfg.wrist_camera.width,
+                height=cfg.wrist_camera.height,
             )
 
 

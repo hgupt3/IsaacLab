@@ -598,7 +598,11 @@ def _build_events_cfg(cfg: Y2RConfig):
             func=mdp.reset_root_state_uniform,
             mode="reset",
             params={
-                "pose_range": {"x": [-0.0, 0.0], "y": [-0.0, 0.0], "yaw": [-0.0, 0.0]},
+                "pose_range": {
+                    "x": list(cfg.randomization.reset.robot_base_x),
+                    "y": list(cfg.randomization.reset.robot_base_y),
+                    "z": list(cfg.randomization.reset.robot_base_z),
+                },
                 "velocity_range": {"x": [-0.0, 0.0], "y": [-0.0, 0.0], "z": [-0.0, 0.0]},
                 "asset_cfg": SceneEntityCfg("robot"),
             },
@@ -632,6 +636,24 @@ def _build_events_cfg(cfg: Y2RConfig):
                     tuple(cfg.curriculum.gravity.initial),
                 ),
                 "operation": "abs",
+            },
+        )
+
+    # Camera offset randomization (only when camera is enabled)
+    if cfg.wrist_camera.enabled:
+        EventCfg.reset_camera_offset = EventTerm(
+            func=mdp.reset_camera_offset,
+            mode="reset",
+            params={
+                "base_offset_pos": tuple(cfg.wrist_camera.offset.pos),
+                "base_offset_rot_euler": tuple(cfg.wrist_camera.offset.rot),
+                "perturbation_ranges": {
+                    "forward": list(cfg.randomization.reset.camera_forward),
+                    "lateral": list(cfg.randomization.reset.camera_lateral),
+                    "vertical": list(cfg.randomization.reset.camera_vertical),
+                },
+                "parent_body_name": cfg.robot.palm_body_name,
+                "sensor_cfg": SceneEntityCfg("wrist_camera"),
             },
         )
 

@@ -1,3 +1,12 @@
 # Kuka + Allegro Hand robot layer
 robot:
   palm_body_name: "palm_link"  # Kuka's palm_link frame is already correct
+
+wrist_camera:
+  width: 64                      # Kuka uses square image
+  height: 64
+  focal_length: 1.78             # Kuka's original tuned value (~120° HFOV)
+  clipping_range: [0.0001, 0.5]  # Kuka's original clipping range
+  offset:
+    pos: [-0.1, 0.0, 0.05]      # Tuned in Isaac Sim GUI
+    rot: [-90.0, -90.0, 0.0]

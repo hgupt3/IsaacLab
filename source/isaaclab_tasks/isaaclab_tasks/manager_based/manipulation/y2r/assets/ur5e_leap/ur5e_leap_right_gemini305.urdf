@@ -1,11 +1,21 @@
 <?xml version='1.0' encoding='utf-8'?>
 <robot name="ur5e_leap_right">
   <!-- Mounting base: 90° yaw so robot faces -X (toward table) at identity quaternion -->
+  <material name="dark_blue">
+    <color rgba="0.005 0.005 0.04 1.0" />
+  </material>
   <link name="base">
     <inertial>
       <mass value="0.001" />
       <inertia ixx="1e-9" ixy="0" ixz="0" iyy="1e-9" iyz="0" izz="1e-9" />
     </inertial>
+    <visual>
+      <origin xyz="0 0 -0.01" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/base_plate.obj" />
+      </geometry>
+      <material name="dark_blue" />
+    </visual>
   </link>
   <joint name="base_yaw_joint" type="fixed">
     <parent link="base" />
@@ -1157,7 +1167,8 @@
   <joint name="gemini_305_left_optical_joint" type="fixed">
     <parent link="gemini_305_left_camera_frame" />
     <child link="gemini_305_left_camera_optical_frame" />
-    <origin xyz="0 0 0" rpy="-1.5707963 0 -1.5707963" />
+    <!-- Camera looks along parent +Z; Rz(π) maps: opt +X=-parent_X (right), +Y=-parent_Y (down), +Z=+parent_Z (forward) -->
+    <origin xyz="0 0 0" rpy="0 0 3.14159265" />
   </joint>
   <link name="gemini_305_right_camera_frame">
     <inertial>
@@ -1179,6 +1190,7 @@
   <joint name="gemini_305_right_optical_joint" type="fixed">
     <parent link="gemini_305_right_camera_frame" />
     <child link="gemini_305_right_camera_optical_frame" />
-    <origin xyz="0 0 0" rpy="-1.5707963 0 -1.5707963" />
+    <!-- Camera looks along parent +Z; Rz(π) maps: opt +X=-parent_X (right), +Y=-parent_Y (down), +Z=+parent_Z (forward) -->
+    <origin xyz="0 0 0" rpy="0 0 3.14159265" />
   </joint>
 </robot>
