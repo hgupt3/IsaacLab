@@ -12,7 +12,7 @@
 simulation:
   physics_dt: 0.01              # Physics timestep (seconds)
   decimation: 2                 # Control decimation (steps per action)
-  num_envs: 18432
+  num_envs: 16384
   env_spacing: 3.0
   replicate_physics: false
 
@@ -121,7 +121,7 @@ hand_trajectory:
     upward_threshold: 0.05        # Reject if finger_dir.z > threshold
     # Pre-grasp approach waypoint (null = disabled, direct start→grasp)
     approach_distance: 0.1       # Distance behind grasp for pre-grasp position (meters)
-    align_fraction: 0.7           # Fraction of grasp phase for alignment (ignored if approach_distance is null)
+    align_fraction: 0.6           # Fraction of grasp phase for alignment (ignored if approach_distance is null)
     # Fixed direction grasp (null = random sampling)
     fixed_origin_offset: null     # [x,y,z] offset from object center (null = object center)
     fixed_direction: null         # [x,y,z] look direction from grasp origin to find surface point (null = random)
@@ -457,11 +457,11 @@ visualization:
   debug_print_rewards: false    # Print reward breakdown periodically
 
 # ==============================================================================
-# ROBOT-SPECIFIC SETTINGS (Kuka Allegro)
+# ROBOT-SPECIFIC SETTINGS 
 # ==============================================================================
 robot:
   action_scale: 0.1
-  arm_joint_count: 7
+  arm_joint_count: 6
   hand_joint_count: 16
   eigen_dim: 5                  # PCA dimensions for eigen grasp
   palm_body_name: "palm_frame"  # Body used for palm pose tracking (Kuka overrides to palm_link)

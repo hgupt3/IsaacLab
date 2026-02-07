@@ -1,5 +1,6 @@
 # Kuka + Allegro Hand robot layer
 robot:
+  arm_joint_count: 7
   palm_body_name: "palm_link"  # Kuka's palm_link frame is already correct
 
 wrist_camera:

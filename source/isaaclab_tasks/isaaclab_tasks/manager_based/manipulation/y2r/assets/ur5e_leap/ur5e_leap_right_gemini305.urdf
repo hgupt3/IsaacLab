@@ -35,12 +35,6 @@
         <mesh filename="ur5e/meshes/visual/base.obj" />
       </geometry>
     </visual>
-    <collision>
-      <origin xyz="0 0 0.05" rpy="0 0 0" />
-      <geometry>
-        <cylinder radius="0.075" length="0.10" />
-      </geometry>
-    </collision>
     <inertial>
       <mass value="4.0" />
       <origin rpy="0 0 0" xyz="0 0 0" />
@@ -55,9 +49,9 @@
       </geometry>
     </visual>
     <collision>
-      <origin xyz="0 0 0" rpy="0 0 0" />
+      <origin xyz="0 0 -0.05" rpy="0 0 0" />
       <geometry>
-        <cylinder radius="0.06" length="0.13" />
+        <cylinder radius="0.06" length="0.12" />
       </geometry>
     </collision>
     <inertial>
@@ -74,9 +68,9 @@
       </geometry>
     </visual>
     <collision>
-      <origin xyz="-0.213 0 0.138" rpy="0 1.5708 0" />
+      <origin xyz="-0.212 0 0.135" rpy="0 1.5708 0" />
       <geometry>
-        <cylinder radius="0.06" length="0.45" />
+        <cylinder radius="0.055" length="0.45" />
       </geometry>
     </collision>
     <inertial>
@@ -93,9 +87,9 @@
       </geometry>
     </visual>
     <collision>
-      <origin xyz="-0.186 0 0.007" rpy="0 1.5708 0" />
+      <origin xyz="-0.186 0 0.006" rpy="0 1.5708 0" />
       <geometry>
-        <cylinder radius="0.05" length="0.40" />
+        <cylinder radius="0.045" length="0.39" />
       </geometry>
     </collision>
     <inertial>
@@ -112,9 +106,9 @@
       </geometry>
     </visual>
     <collision>
-      <origin xyz="0 0 -0.02" rpy="0 0 0" />
+      <origin xyz="0 0 -0.048" rpy="0 0 0" />
       <geometry>
-        <cylinder radius="0.04" length="0.10" />
+        <cylinder radius="0.04" length="0.08" />
       </geometry>
     </collision>
     <inertial>
@@ -131,9 +125,9 @@
       </geometry>
     </visual>
     <collision>
-      <origin xyz="0 0 -0.004" rpy="0 0 0" />
+      <origin xyz="0 0 -0.044" rpy="0 0 0" />
       <geometry>
-        <cylinder radius="0.04" length="0.09" />
+        <cylinder radius="0.04" length="0.07" />
       </geometry>
     </collision>
     <inertial>
@@ -152,7 +146,7 @@
     <collision>
       <origin xyz="0 0 -0.023" rpy="0 0 0" />
       <geometry>
-        <cylinder radius="0.035" length="0.045" />
+        <cylinder radius="0.035" length="0.04" />
       </geometry>
     </collision>
     <inertial>
@@ -236,10 +230,12 @@
     <child link="ee_link" />
     <origin rpy="0 -1.57079632679 -1.57079632679" xyz="0 0 0" />
   </joint>
-  <joint name="hand_base_joint" type="fixed">
+  <joint name="hand_base_joint" type="revolute">
     <parent link="ee_link" />
     <child link="palm_link" />
     <origin xyz="0.15 0.03 0.0005" rpy="0 0 0" />
+    <axis xyz="0 0 1"/>
+    <limit effort="0" lower="0" upper="0" velocity="0"/>
   </joint>
   <link name="palm_link">
     <visual>
@@ -267,45 +263,21 @@
       </geometry>
     </collision>
     <collision>
-      <origin xyz="-0.066 -0.078 -0.0115" rpy="0 0 -0.2967" />
-      <geometry>
-        <box size="0.058 0.02 0.046" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="-0.03 -0.035 -0.003" rpy="0 0 0" />
-      <geometry>
-        <box size="0.02 0.12 0.03" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="-0.032 -0.035 -0.024" rpy="0 0.785 0" />
-      <geometry>
-        <box size="0.01 0.12 0.02" />
-      </geometry>
-    </collision>
-    <collision>
       <origin xyz="-0.048 -0.033 -0.0115" rpy="0 0 0" />
       <geometry>
         <box size="0.024 0.116 0.046" />
       </geometry>
     </collision>
     <collision>
+      <origin xyz="-0.0385 -0.035 -0.017" rpy="0 -0.75 0" />
+      <geometry>
+        <box size="0.02 0.12 0.03" />
+      </geometry>
+    </collision>
+    <collision>
       <origin xyz="-0.078 -0.053 -0.0115" rpy="0 0 0" />
       <geometry>
         <box size="0.044 0.052 0.046" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="-0.098 -0.009 -0.006" rpy="0 0 0" />
-      <geometry>
-        <box size="0.004 0.036 0.034" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="-0.078 -0.003 0.01" rpy="0 0 0" />
-      <geometry>
-        <box size="0.044 0.056 0.004" />
       </geometry>
     </collision>
     <inertial>
@@ -320,11 +292,16 @@
       <mass value="0.001"/>
       <inertia ixx="1e-9" ixy="0" ixz="0" iyy="1e-9" iyz="0" izz="1e-9"/>
     </inertial>
+    <visual>
+      <geometry><sphere radius="0.001" /></geometry>
+    </visual>
   </link>
-  <joint name="palm_frame_joint" type="fixed">
+  <joint name="palm_frame_joint" type="revolute">
     <parent link="palm_link"/>
     <child link="palm_frame"/>
     <origin xyz="-0.04 -0.038 -0.035" rpy="3.14159 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="0" lower="0" upper="0" velocity="0"/>
   </joint>
   <link name="index_link_0">
     <visual>
@@ -333,42 +310,6 @@
         <mesh filename="leap/meshes/visual/mcp_joint.obj" />
       </geometry>
     </visual>
-    <collision>
-      <origin xyz="0 0.018 0.0147" rpy="0 0 0" />
-      <geometry>
-        <box size="0.02 0.006 0.034" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="-0.027 0.042 0.015" rpy="0 0 0" />
-      <geometry>
-        <box size="0.028 0.04 0.02" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="-0.0262 0.02 0.0146" rpy="0 0 0" />
-      <geometry>
-        <box size="0.034 0.006 0.02" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="-0.0295 0.035 0.029" rpy="0 0 0" />
-      <geometry>
-        <box size="0.02 0.024 0.008" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 0.005 0.03" rpy="0 0 0" />
-      <geometry>
-        <box size="0.014 0.02 0.004" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 0.005 -0.001" rpy="0 0 0" />
-      <geometry>
-        <box size="0.014 0.02 0.004" />
-      </geometry>
-    </collision>
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <mass value="0.044" />
@@ -383,9 +324,9 @@
       </geometry>
     </visual>
     <collision>
-      <origin xyz="0.0075 -0.0002 -0.011" rpy="0 0 0" />
+      <origin xyz="0.0025 -0.0002 -0.011" rpy="0 0 0" />
       <geometry>
-        <box size="0.034 0.026 0.022" />
+        <box size="0.044 0.026 0.022" />
       </geometry>
     </collision>
     <inertial>
@@ -402,33 +343,9 @@
       </geometry>
     </visual>
     <collision>
-      <origin xyz="0 -0.02 0.015" rpy="0 0 0" />
+      <origin xyz="0.0075 -0.030 0.015" rpy="0 0 0" />
       <geometry>
-        <box size="0.016 0.006 0.026" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 -0.016 0.015" rpy="0 0 0" />
-      <geometry>
-        <box size="0.02 0.004 0.034" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 -0.0045 0.03" rpy="0 0 0" />
-      <geometry>
-        <box size="0.014 0.02 0.004" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 -0.0045 0" rpy="0 0 0" />
-      <geometry>
-        <box size="0.014 0.02 0.004" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0.0075 -0.035 0.015" rpy="0 0 0" />
-      <geometry>
-        <box size="0.034 0.022 0.026" />
+        <box size="0.034 0.032 0.026" />
       </geometry>
     </collision>
     <inertial>
@@ -445,27 +362,9 @@
       </geometry>
     </visual>
     <collision>
-      <origin xyz="0 -0.017 0.015" rpy="0 0 0" />
+      <origin xyz="0 -0.030 0.015" rpy="1.5708 0 0" />
       <geometry>
-        <box size="0.02 0.006 0.03" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 -0.006 0.03" rpy="0 0 0" />
-      <geometry>
-        <box size="0.014 0.022 0.004" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 -0.006 -0.001" rpy="0 0 0" />
-      <geometry>
-        <box size="0.014 0.022 0.004" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="leap/meshes/collision/white_tip.obj" />
+        <cylinder radius="0.012" length="0.02" />
       </geometry>
     </collision>
     <inertial>
@@ -513,42 +412,6 @@
         <mesh filename="leap/meshes/visual/mcp_joint.obj" />
       </geometry>
     </visual>
-    <collision>
-      <origin xyz="0 0.018 0.0147" rpy="0 0 0" />
-      <geometry>
-        <box size="0.02 0.006 0.034" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="-0.027 0.042 0.015" rpy="0 0 0" />
-      <geometry>
-        <box size="0.028 0.04 0.02" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="-0.0262 0.02 0.0146" rpy="0 0 0" />
-      <geometry>
-        <box size="0.034 0.006 0.02" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="-0.0295 0.035 0.029" rpy="0 0 0" />
-      <geometry>
-        <box size="0.02 0.024 0.008" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 0.005 0.03" rpy="0 0 0" />
-      <geometry>
-        <box size="0.014 0.02 0.004" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 0.005 -0.001" rpy="0 0 0" />
-      <geometry>
-        <box size="0.014 0.02 0.004" />
-      </geometry>
-    </collision>
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <mass value="0.044" />
@@ -563,9 +426,9 @@
       </geometry>
     </visual>
     <collision>
-      <origin xyz="0.0075 -0.0002 -0.011" rpy="0 0 0" />
+      <origin xyz="0.0025 -0.0002 -0.011" rpy="0 0 0" />
       <geometry>
-        <box size="0.034 0.026 0.022" />
+        <box size="0.044 0.026 0.022" />
       </geometry>
     </collision>
     <inertial>
@@ -582,33 +445,9 @@
       </geometry>
     </visual>
     <collision>
-      <origin xyz="0 -0.02 0.015" rpy="0 0 0" />
+      <origin xyz="0.0075 -0.030 0.015" rpy="0 0 0" />
       <geometry>
-        <box size="0.016 0.006 0.026" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 -0.016 0.015" rpy="0 0 0" />
-      <geometry>
-        <box size="0.02 0.004 0.034" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 -0.0045 0.03" rpy="0 0 0" />
-      <geometry>
-        <box size="0.014 0.02 0.004" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 -0.0045 0" rpy="0 0 0" />
-      <geometry>
-        <box size="0.014 0.02 0.004" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0.0075 -0.035 0.015" rpy="0 0 0" />
-      <geometry>
-        <box size="0.034 0.022 0.026" />
+        <box size="0.034 0.032 0.026" />
       </geometry>
     </collision>
     <inertial>
@@ -625,27 +464,9 @@
       </geometry>
     </visual>
     <collision>
-      <origin xyz="0 -0.017 0.015" rpy="0 0 0" />
+      <origin xyz="0 -0.030 0.015" rpy="1.5708 0 0" />
       <geometry>
-        <box size="0.02 0.006 0.03" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 -0.006 0.03" rpy="0 0 0" />
-      <geometry>
-        <box size="0.014 0.022 0.004" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 -0.006 -0.001" rpy="0 0 0" />
-      <geometry>
-        <box size="0.014 0.022 0.004" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="leap/meshes/collision/white_tip.obj" />
+        <cylinder radius="0.012" length="0.02" />
       </geometry>
     </collision>
     <inertial>
@@ -693,42 +514,6 @@
         <mesh filename="leap/meshes/visual/mcp_joint.obj" />
       </geometry>
     </visual>
-    <collision>
-      <origin xyz="0 0.018 0.0147" rpy="0 0 0" />
-      <geometry>
-        <box size="0.02 0.006 0.034" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="-0.027 0.042 0.015" rpy="0 0 0" />
-      <geometry>
-        <box size="0.028 0.04 0.02" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="-0.0262 0.02 0.0146" rpy="0 0 0" />
-      <geometry>
-        <box size="0.034 0.006 0.02" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="-0.0295 0.035 0.029" rpy="0 0 0" />
-      <geometry>
-        <box size="0.02 0.024 0.008" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 0.005 0.03" rpy="0 0 0" />
-      <geometry>
-        <box size="0.014 0.02 0.004" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 0.005 -0.001" rpy="0 0 0" />
-      <geometry>
-        <box size="0.014 0.02 0.004" />
-      </geometry>
-    </collision>
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <mass value="0.044" />
@@ -743,9 +528,9 @@
       </geometry>
     </visual>
     <collision>
-      <origin xyz="0.0075 -0.0002 -0.011" rpy="0 0 0" />
+      <origin xyz="0.0025 -0.0002 -0.011" rpy="0 0 0" />
       <geometry>
-        <box size="0.034 0.026 0.022" />
+        <box size="0.044 0.026 0.022" />
       </geometry>
     </collision>
     <inertial>
@@ -762,33 +547,9 @@
       </geometry>
     </visual>
     <collision>
-      <origin xyz="0 -0.02 0.015" rpy="0 0 0" />
+      <origin xyz="0.0075 -0.030 0.015" rpy="0 0 0" />
       <geometry>
-        <box size="0.016 0.006 0.026" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 -0.016 0.015" rpy="0 0 0" />
-      <geometry>
-        <box size="0.02 0.004 0.034" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 -0.0045 0.03" rpy="0 0 0" />
-      <geometry>
-        <box size="0.014 0.02 0.004" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 -0.0045 0" rpy="0 0 0" />
-      <geometry>
-        <box size="0.014 0.02 0.004" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0.0075 -0.035 0.015" rpy="0 0 0" />
-      <geometry>
-        <box size="0.034 0.022 0.026" />
+        <box size="0.034 0.032 0.026" />
       </geometry>
     </collision>
     <inertial>
@@ -805,27 +566,9 @@
       </geometry>
     </visual>
     <collision>
-      <origin xyz="0 -0.017 0.015" rpy="0 0 0" />
+      <origin xyz="0 -0.030 0.015" rpy="1.5708 0 0" />
       <geometry>
-        <box size="0.02 0.006 0.03" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 -0.006 0.03" rpy="0 0 0" />
-      <geometry>
-        <box size="0.014 0.022 0.004" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 -0.006 -0.001" rpy="0 0 0" />
-      <geometry>
-        <box size="0.014 0.022 0.004" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="leap/meshes/collision/white_tip.obj" />
+        <cylinder radius="0.012" length="0.02" />
       </geometry>
     </collision>
     <inertial>
@@ -892,24 +635,6 @@
         <mesh filename="leap/meshes/visual/thumb_pip.obj" />
       </geometry>
     </visual>
-    <collision>
-      <origin xyz="0 0 -0.0015" rpy="0 0 0" />
-      <geometry>
-        <box size="0.018 0.033 0.004" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 -0.015 -0.013" rpy="0 0 0" />
-      <geometry>
-        <box size="0.014 0.004 0.02" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 0.015 -0.013" rpy="0 0 0" />
-      <geometry>
-        <box size="0.014 0.004 0.02" />
-      </geometry>
-    </collision>
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <mass value="0.003" />
@@ -924,33 +649,9 @@
       </geometry>
     </visual>
     <collision>
-      <origin xyz="0 0.0105 -0.014" rpy="0 0 0" />
+      <origin xyz="0 0.0055 -0.014" rpy="0 0 0" />
       <geometry>
-        <box size="0.02 0.04 0.024" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 0.031 -0.015" rpy="0 0 0" />
-      <geometry>
-        <box size="0.02 0.004 0.032" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 0.042 0.001" rpy="0 0 0" />
-      <geometry>
-        <box size="0.014 0.02 0.004" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 0.042 -0.029" rpy="0 0 0" />
-      <geometry>
-        <box size="0.014 0.02 0.004" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="-0.0135 0.0175 -0.011656" rpy="0 0 0" />
-      <geometry>
-        <box size="0.01 0.024 0.018" />
+        <box size="0.02 0.05 0.024" />
       </geometry>
     </collision>
     <inertial>
@@ -973,21 +674,9 @@
       </geometry>
     </collision>
     <collision>
-      <origin xyz="0 -0.029 -0.014" rpy="0 0 0" />
+      <origin xyz="0 -0.042 -0.015" rpy="1.5708 0 0" />
       <geometry>
-        <box size="0.02 0.004 0.03" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0.015 -0.0175 -0.0115" rpy="0 0 0" />
-      <geometry>
-        <box size="0.008 0.024 0.018" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="leap/meshes/collision/white_tip_thumb.obj" />
+        <cylinder radius="0.012" length="0.02" />
       </geometry>
     </collision>
     <inertial>
@@ -1033,44 +722,64 @@
       <mass value="0.001" />
       <inertia ixx="1e-9" ixy="0" ixz="0" iyy="1e-9" iyz="0" izz="1e-9" />
     </inertial>
+    <visual>
+      <geometry><sphere radius="0.001" /></geometry>
+    </visual>
   </link>
   <link name="index_tip">
     <inertial>
       <mass value="0.001" />
       <inertia ixx="1e-9" ixy="0" ixz="0" iyy="1e-9" iyz="0" izz="1e-9" />
     </inertial>
+    <visual>
+      <geometry><sphere radius="0.001" /></geometry>
+    </visual>
   </link>
   <link name="middle_tip">
     <inertial>
       <mass value="0.001" />
       <inertia ixx="1e-9" ixy="0" ixz="0" iyy="1e-9" iyz="0" izz="1e-9" />
     </inertial>
+    <visual>
+      <geometry><sphere radius="0.001" /></geometry>
+    </visual>
   </link>
   <link name="ring_tip">
     <inertial>
       <mass value="0.001" />
       <inertia ixx="1e-9" ixy="0" ixz="0" iyy="1e-9" iyz="0" izz="1e-9" />
     </inertial>
+    <visual>
+      <geometry><sphere radius="0.001" /></geometry>
+    </visual>
   </link>
-  <joint name="thumb_tip_joint" type="fixed">
+  <joint name="thumb_tip_joint" type="revolute">
     <parent link="thumb_link_3" />
     <child link="thumb_tip" />
     <origin rpy="0 0 0" xyz="0 -0.06 -0.015" />
+    <axis xyz="0 0 1"/>
+    <limit effort="0" lower="0" upper="0" velocity="0"/>
   </joint>
-  <joint name="index_tip_joint" type="fixed">
+  <joint name="index_tip_joint" type="revolute">
     <parent link="index_link_3" />
     <child link="index_tip" />
     <origin rpy="0 0 0" xyz="0 -0.048 0.015" />
+    <axis xyz="0 0 1"/>
+    <limit effort="0" lower="0" upper="0" velocity="0"/>
   </joint>
-  <joint name="middle_tip_joint" type="fixed">
+  <joint name="middle_tip_joint" type="revolute">
     <parent link="middle_link_3" />
     <child link="middle_tip" />
     <origin rpy="0 0 0" xyz="0 -0.048 0.015" />
+    <axis xyz="0 0 1"/>
+    <limit effort="0" lower="0" upper="0" velocity="0"/>
   </joint>
-  <joint name="ring_tip_joint" type="fixed">
+  <joint name="ring_tip_joint" type="revolute">
     <parent link="ring_link_3" />
     <child link="ring_tip" />
     <origin rpy="0 0 0" xyz="0 -0.048 0.015" />
+    <axis xyz="0 0 1"/>
+    <limit effort="0" lower="0" upper="0" velocity="0"/>
   </joint>
   <link name="wrist_mount_link">
     <visual>
@@ -1082,12 +791,6 @@
         <color rgba="0.0 0.0 0.0 1.0" />
       </material>
     </visual>
-    <collision>
-      <origin xyz="0.0 0.025 0.0" rpy="1.57079632679 0 0" />
-      <geometry>
-        <cylinder radius="0.034" length="0.05" />
-      </geometry>
-    </collision>
     <inertial>
       <mass value="0.08" />
       <origin xyz="0 0 0" rpy="0 0 0" />
