@@ -78,8 +78,11 @@ def get_palm_frame_pose_w(
     quat_w = robot.data.body_quat_w[:, palm_idx]
 
     if y2r_cfg.robot.palm_frame_offset is not None:
+        N = pos_w.shape[0]
         pos_w, quat_w = combine_frame_transforms(
-            pos_w, quat_w, _PALM_OFFSET_POS, _PALM_OFFSET_QUAT
+            pos_w, quat_w,
+            _PALM_OFFSET_POS.expand(N, 3),
+            _PALM_OFFSET_QUAT.expand(N, 4),
         )
     return pos_w, quat_w, palm_idx
 
