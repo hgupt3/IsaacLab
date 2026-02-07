@@ -138,6 +138,14 @@ class PointCloudCache:
             self.all_base_points[geo_idx] = points
             self.all_base_normals[geo_idx] = normals
 
+    def to(self, device):
+        """Move all cached tensors to the given device."""
+        self.all_base_points = self.all_base_points.to(device)
+        self.all_base_normals = self.all_base_normals.to(device)
+        self.geo_indices = self.geo_indices.to(device)
+        self.scales = self.scales.to(device)
+        return self
+
 # === STABLE PLACEMENT CACHE (built once for all envs) ===
 # Key: prim_path -> StablePlacementCache
 _STABLE_PLACEMENT_CACHE: dict[str, "StablePlacementCache"] = {}
@@ -433,17 +441,18 @@ def sample_object_point_cloud_random(
     if cache_key not in _POINT_CLOUD_CACHE:
         num_envs = max(env_ids) + 1
         _POINT_CLOUD_CACHE[cache_key] = PointCloudCache(prim_path, num_envs, pool_size)
-    
+        _POINT_CLOUD_CACHE[cache_key].to(device)
+
     cache = _POINT_CLOUD_CACHE[cache_key]
     n_envs = len(env_ids)
-    
+
     # === Pure tensor indexing - NO LOOPS ===
-    env_ids_t = torch.tensor(env_ids, dtype=torch.long)
+    env_ids_t = torch.tensor(env_ids, dtype=torch.long, device=device)
     geo_indices = cache.geo_indices[env_ids_t]  # (n,)
-    scales = cache.scales[env_ids_t].to(device)  # (n, 3)
-    
+    scales = cache.scales[env_ids_t]  # (n, 3)
+
     # Get base points for each env by geo_idx indexing: (n, pool_size, 3)
-    all_points = cache.all_base_points.to(device)  # (num_geos, pool_size, 3)
+    all_points = cache.all_base_points  # (num_geos, pool_size, 3) - already on device
     env_base_points = all_points[geo_indices]  # (n, pool_size, 3)
 
     # Apply per-env scale BEFORE filtering: (n, pool_size, 3)
@@ -505,26 +514,35 @@ def get_point_cloud_cache(
     env_ids: list[int],
     prim_path: str,
     pool_size: int,
+    device: str | None = None,
 ) -> PointCloudCache:
     """Get or create a PointCloudCache for the given prim path and pool size.
-    
+
     Args:
         env_ids: List of environment indices.
         prim_path: USD prim path pattern with ".*" placeholder for env index.
         pool_size: Size of point pool.
-        
+        device: If given, move cache tensors to this device.
+
     Returns:
         PointCloudCache with points and normals.
     """
     global _POINT_CLOUD_CACHE
-    
+
     cache_key = (prim_path, pool_size)
-    
+
     if cache_key not in _POINT_CLOUD_CACHE:
         num_envs = max(env_ids) + 1
-        _POINT_CLOUD_CACHE[cache_key] = PointCloudCache(prim_path, num_envs, pool_size)
-    
-    return _POINT_CLOUD_CACHE[cache_key]
+        cache = PointCloudCache(prim_path, num_envs, pool_size)
+        if device is not None:
+            cache.to(device)
+        _POINT_CLOUD_CACHE[cache_key] = cache
+
+    cache = _POINT_CLOUD_CACHE[cache_key]
+    if device is not None and cache.all_base_points.device != torch.device(device):
+        cache.to(device)
+
+    return cache
 
 
 # ---- Stable Pose Computation ----

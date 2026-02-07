@@ -2,6 +2,10 @@
 robot:
   arm_joint_count: 7
   palm_body_name: "palm_link"  # Kuka's palm_link frame is already correct
+  wrist_joint_name: "iiwa7_joint_7"
+  arm_joint_regex: "iiwa7_joint_.*"
+  palm_frame_offset: null      # Kuka palm_link is already the correct frame
+  tip_offsets: null             # Kuka tip bodies exist as real bodies
 
 wrist_camera:
   width: 64                      # Kuka uses square image

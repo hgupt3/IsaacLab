@@ -172,6 +172,103 @@ def reset_push_t_object(
     asset.write_root_velocity_to_sim(velocities, env_ids=env_ids)
 
 
+def reset_robot_joints_above_table(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    position_range: tuple[float, float],
+    wrist_position_range: tuple[float, float],
+    table_surface_z: float,
+    min_clearance: float,
+    hand_body_regex: str,
+    wrist_joint_name: str,
+    arm_joint_regex: str,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+):
+    """Reset robot joints with table penetration check.
+
+    Randomizes all joints with position_range, overrides wrist with
+    wrist_position_range, then checks FK via update_articulations_kinematic()
+    to ensure all hand bodies are above the table. Envs where any hand body
+    penetrates get their arm+wrist joints reset to defaults (finger
+    randomization is preserved).
+
+    Args:
+        env: The environment instance.
+        env_ids: Environment indices to reset.
+        position_range: (min, max) offset for all joints.
+        wrist_position_range: (min, max) offset for wrist joint (overrides position_range).
+        table_surface_z: Table surface z in local env frame.
+        min_clearance: Min clearance above table (meters).
+        hand_body_regex: Regex for hand body names to check.
+        wrist_joint_name: Wrist joint name.
+        arm_joint_regex: Regex matching all arm joints (including wrist).
+        asset_cfg: Robot asset config.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    device = asset.device
+    n = len(env_ids)
+    if n == 0:
+        return
+
+    # Cache body/joint indices on first call
+    cache_key = "_above_table_cache"
+    if not hasattr(asset, cache_key):
+        import re
+        hand_body_ids, _ = asset.find_bodies(hand_body_regex)
+        wrist_joint_ids, _ = asset.find_joints(wrist_joint_name)
+        arm_joint_ids = [
+            i for i, name in enumerate(asset.joint_names)
+            if re.match(arm_joint_regex, name) and name != wrist_joint_name
+        ]
+        setattr(asset, cache_key, {
+            "hand_body_ids": hand_body_ids,
+            "arm_joint_ids": arm_joint_ids,
+            "wrist_joint_ids": wrist_joint_ids,
+        })
+    cache = getattr(asset, cache_key)
+    hand_body_ids = cache["hand_body_ids"]
+    arm_joint_ids = cache["arm_joint_ids"]
+    wrist_joint_ids = cache["wrist_joint_ids"]
+
+    # Sample all joints: default + uniform offset
+    joint_pos = asset.data.default_joint_pos[env_ids].clone()
+    joint_vel = asset.data.default_joint_vel[env_ids].clone()
+    joint_pos += math_utils.sample_uniform(*position_range, joint_pos.shape, device)
+
+    # Override wrist with wider range
+    wrist_offset = math_utils.sample_uniform(
+        *wrist_position_range, (n, len(wrist_joint_ids)), device
+    )
+    for i, jid in enumerate(wrist_joint_ids):
+        joint_pos[:, jid] = asset.data.default_joint_pos[env_ids, jid] + wrist_offset[:, i]
+
+    # Clamp to limits, zero velocity
+    soft_limits = asset.data.soft_joint_pos_limits[env_ids]
+    joint_pos.clamp_(soft_limits[..., 0], soft_limits[..., 1])
+    joint_vel.zero_()
+
+    # Write to sim (invalidates body_link_pose_w cache)
+    asset.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+
+    # FK check: body_link_pose_w calls update_articulations_kinematic() then get_link_transforms()
+    # Shape: (num_all_envs, num_bodies, 7) — positions are [:, :, :3]
+    hand_z = asset.data.body_link_pose_w[env_ids][:, hand_body_ids, 2]
+    min_hand_z = hand_z.min(dim=1).values
+    table_z_thresh = table_surface_z + min_clearance + env.scene.env_origins[env_ids, 2]
+    violating = min_hand_z < table_z_thresh
+
+    # Fallback: reset arm+wrist to defaults for violating envs (keep finger randomization)
+    if violating.any():
+        viol_local = violating.nonzero(as_tuple=False).squeeze(-1)
+        viol_env_ids = env_ids[viol_local]
+        default_pos = asset.data.default_joint_pos[viol_env_ids]
+        for jid in arm_joint_ids + wrist_joint_ids:
+            joint_pos[viol_local, jid] = default_pos[:, jid]
+        asset.write_joint_state_to_sim(
+            joint_pos[viol_local], joint_vel[viol_local], env_ids=viol_env_ids
+        )
+
+
 def reset_camera_offset(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor,

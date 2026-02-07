@@ -15,6 +15,8 @@ simulation:
   num_envs: 16384
   env_spacing: 3.0
   replicate_physics: false
+  solver_position_iteration_count: 16
+  solver_velocity_iteration_count: 0
 
 # ==============================================================================
 # MODE SELECTION
@@ -153,7 +155,7 @@ hand_trajectory:
 # ==============================================================================
 # Relative to robot base frame (meters)
 workspace:
-  x: [-0.75, -0.35]
+  x: [-0.85, -0.45]
   y: [-0.25, 0.25]
   z: [0.28, 0.65]               # [min, max] above table surface
   table_surface_z: 0.255        # Table surface height (meters)
@@ -464,7 +466,18 @@ robot:
   arm_joint_count: 6
   hand_joint_count: 16
   eigen_dim: 5                  # PCA dimensions for eigen grasp
-  palm_body_name: "palm_frame"  # Body used for palm pose tracking (Kuka overrides to palm_link)
+  palm_body_name: "palm_link"   # Body used for palm pose tracking
+  wrist_joint_name: "ur5e_joint_6"         # Wrist joint (separate randomization range)
+  arm_joint_regex: "ur5e_joint_.*"         # Regex matching all arm joints (including wrist)
+  hand_body_regex: "(palm_link|.*_link_[0-3]|.*_tip)"  # Hand bodies for table penetration check
+  palm_frame_offset:            # Offset from palm_body_name to virtual palm_frame (null = no offset)
+    pos: [-0.04, -0.038, -0.035]
+    rot_euler: [180.0, 0.0, 0.0]  # Euler XYZ degrees
+  tip_offsets:                  # Offsets from link_3 bodies to virtual tip positions
+    index: [0.0, -0.048, 0.015]
+    middle: [0.0, -0.048, 0.015]
+    ring: [0.0, -0.048, 0.015]
+    thumb: [0.0, -0.06, -0.015]
 
 # ==============================================================================
 # PUSH-T MODE (disabled by default)

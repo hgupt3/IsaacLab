@@ -20,10 +20,11 @@ Usage:
 
 from __future__ import annotations
 
+import types
 from dataclasses import dataclass, field, is_dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, get_origin, get_type_hints
+from typing import Any, Union, get_args, get_origin, get_type_hints
 
 import os
 
@@ -110,8 +111,19 @@ def _auto_parse(cls, data: dict) -> Any:
         value = data.get(field_name)
         origin = get_origin(field_type)
 
+        # Handle Optional[DataclassType] (i.e. DataclassType | None)
+        inner_dc = None
+        if origin is Union or origin is types.UnionType:
+            args = get_args(field_type)
+            for a in args:
+                if is_dataclass(a):
+                    inner_dc = a
+                    break
+
         if is_dataclass(field_type):
             kwargs[field_name] = _auto_parse(field_type, value or {})
+        elif inner_dc is not None:
+            kwargs[field_name] = _auto_parse(inner_dc, value) if value is not None else None
         elif value is None:
             kwargs[field_name] = None
         elif origin is tuple or field_type is tuple:
@@ -461,6 +473,14 @@ class SimulationConfig:
     num_envs: int
     env_spacing: float
     replicate_physics: bool
+    solver_position_iteration_count: int
+    solver_velocity_iteration_count: int
+
+
+@dataclass
+class PalmFrameOffsetConfig:
+    pos: tuple[float, float, float]
+    rot_euler: tuple[float, float, float]
 
 
 @dataclass
@@ -470,6 +490,11 @@ class RobotConfig:
     hand_joint_count: int
     eigen_dim: int
     palm_body_name: str
+    wrist_joint_name: str
+    arm_joint_regex: str
+    hand_body_regex: str
+    palm_frame_offset: PalmFrameOffsetConfig | None = None
+    tip_offsets: dict[str, list[float]] | None = None
 
 
 @dataclass

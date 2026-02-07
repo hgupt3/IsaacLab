@@ -108,8 +108,8 @@ def _build_object_cfg(cfg: Y2RConfig) -> RigidObjectCfg:
                 usd_path=str(t_shape_path),
                 scale=(cfg.push_t.object_scale,) * 3,
                 rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                    solver_position_iteration_count=16,
-                    solver_velocity_iteration_count=0,
+                    solver_position_iteration_count=cfg.simulation.solver_position_iteration_count,
+                    solver_velocity_iteration_count=cfg.simulation.solver_velocity_iteration_count,
                     disable_gravity=False,
                 ),
                 collision_props=sim_utils.CollisionPropertiesCfg(),
@@ -128,8 +128,8 @@ def _build_object_cfg(cfg: Y2RConfig) -> RigidObjectCfg:
                     usd_path=str(path),
                     scale=(1.0, 1.0, 1.0),  # Must specify scale for randomize_rigid_body_scale to work
                     rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                        solver_position_iteration_count=16,
-                        solver_velocity_iteration_count=0,
+                        solver_position_iteration_count=cfg.simulation.solver_position_iteration_count,
+                        solver_velocity_iteration_count=cfg.simulation.solver_velocity_iteration_count,
                         disable_gravity=False,
                     ),
                     collision_props=sim_utils.CollisionPropertiesCfg(),
@@ -171,8 +171,8 @@ def _build_object_cfg(cfg: Y2RConfig) -> RigidObjectCfg:
             assets_cfg=all_assets,
             random_choice=True,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                solver_position_iteration_count=16,
-                solver_velocity_iteration_count=0,
+                solver_position_iteration_count=cfg.simulation.solver_position_iteration_count,
+                solver_velocity_iteration_count=cfg.simulation.solver_velocity_iteration_count,
                 disable_gravity=False,
             ),
             collision_props=sim_utils.CollisionPropertiesCfg(),
@@ -610,21 +610,16 @@ def _build_events_cfg(cfg: Y2RConfig):
         )
 
         reset_robot_joints = EventTerm(
-            func=mdp.reset_joints_by_offset,
+            func=mdp.reset_robot_joints_above_table,
             mode="reset",
             params={
                 "position_range": list(cfg.randomization.reset.robot_joints),
-                "velocity_range": [0.0, 0.0],
-            },
-        )
-
-        reset_robot_wrist_joint = EventTerm(
-            func=mdp.reset_joints_by_offset,
-            mode="reset",
-            params={
-                "asset_cfg": SceneEntityCfg("robot", joint_names="iiwa7_joint_7"),
-                "position_range": list(cfg.randomization.reset.robot_wrist),
-                "velocity_range": [0.0, 0.0],
+                "wrist_position_range": list(cfg.randomization.reset.robot_wrist),
+                "table_surface_z": cfg.workspace.table_surface_z,
+                "min_clearance": cfg.randomization.reset.z_offset,
+                "hand_body_regex": cfg.robot.hand_body_regex,
+                "wrist_joint_name": cfg.robot.wrist_joint_name,
+                "arm_joint_regex": cfg.robot.arm_joint_regex,
             },
         )
 
@@ -1037,8 +1032,8 @@ class TrajectoryEnvCfg(ManagerBasedEnvCfg):
                 usd_path=usd_path,
                 scale=(cfg.push_t.object_scale,) * 3,
                 rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                    solver_position_iteration_count=16,
-                    solver_velocity_iteration_count=0,
+                    solver_position_iteration_count=cfg.simulation.solver_position_iteration_count,
+                    solver_velocity_iteration_count=cfg.simulation.solver_velocity_iteration_count,
                     disable_gravity=False,
                 ),
                 collision_props=sim_utils.CollisionPropertiesCfg(),

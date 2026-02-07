@@ -11,9 +11,11 @@ from typing import TYPE_CHECKING
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import ManagerTermBase, SceneEntityCfg
 from isaaclab.utils.math import (
+    combine_frame_transforms,
     quat_apply,
     quat_apply_inverse,
     quat_error_magnitude,
+    quat_from_euler_xyz,
     quat_inv,
     quat_mul,
     subtract_frame_transforms,
@@ -26,6 +28,60 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
     from ..trajectory_manager import TrajectoryManager
     from ..config_loader import Y2RConfig
+
+
+# ==============================================================================
+# PALM FRAME OFFSET HELPER
+# ==============================================================================
+# Cached tensors for palm frame offset (initialized on first call)
+_PALM_OFFSET_POS: torch.Tensor | None = None
+_PALM_OFFSET_QUAT: torch.Tensor | None = None
+
+
+def _ensure_palm_offset_cache(y2r_cfg: Y2RConfig, device: torch.device) -> None:
+    """Initialize cached palm frame offset tensors (once per process)."""
+    global _PALM_OFFSET_POS, _PALM_OFFSET_QUAT
+    if _PALM_OFFSET_POS is not None:
+        return
+    off = y2r_cfg.robot.palm_frame_offset
+    if off is None:
+        return
+    _PALM_OFFSET_POS = torch.tensor(off.pos, dtype=torch.float32, device=device).unsqueeze(0)  # (1, 3)
+    # Convert euler XYZ (degrees) to quaternion
+    r, p, y = [x * 3.14159265358979 / 180.0 for x in off.rot_euler]
+    _PALM_OFFSET_QUAT = quat_from_euler_xyz(
+        torch.tensor([r], device=device),
+        torch.tensor([p], device=device),
+        torch.tensor([y], device=device),
+    )  # (1, 4)
+
+
+def get_palm_frame_pose_w(
+    robot: Articulation,
+    y2r_cfg: Y2RConfig,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Get palm frame world pose, applying offset if configured.
+
+    Args:
+        robot: The robot articulation.
+        y2r_cfg: Y2R configuration.
+
+    Returns:
+        Tuple of (pos_w, quat_w, palm_body_idx) where pos_w and quat_w
+        are the palm frame pose in world coordinates.
+    """
+    global _PALM_OFFSET_POS, _PALM_OFFSET_QUAT
+    _ensure_palm_offset_cache(y2r_cfg, robot.device)
+
+    palm_idx = robot.find_bodies(y2r_cfg.robot.palm_body_name)[0][0]
+    pos_w = robot.data.body_pos_w[:, palm_idx]
+    quat_w = robot.data.body_quat_w[:, palm_idx]
+
+    if y2r_cfg.robot.palm_frame_offset is not None:
+        pos_w, quat_w = combine_frame_transforms(
+            pos_w, quat_w, _PALM_OFFSET_POS, _PALM_OFFSET_QUAT
+        )
+    return pos_w, quat_w, palm_idx
 
 
 def zeros_placeholder(
@@ -200,16 +256,8 @@ def hand_pose_b(
     """
     robot: Articulation = env.scene[robot_cfg.name]
 
-    # Find palm body index
-    palm_name = env.cfg.y2r_cfg.robot.palm_body_name
-    palm_ids = robot.find_bodies(palm_name)[0]
-    if len(palm_ids) == 0:
-        raise RuntimeError(f"Could not find '{palm_name}' body on robot!")
-    palm_idx = palm_ids[0]
-
-    # Get palm pose in world frame
-    palm_pos_w = robot.data.body_pos_w[:, palm_idx]  # (N, 3)
-    palm_quat_w = robot.data.body_quat_w[:, palm_idx]  # (N, 4)
+    # Get palm frame pose in world frame (with offset if configured)
+    palm_pos_w, palm_quat_w, _ = get_palm_frame_pose_w(robot, env.cfg.y2r_cfg)
 
     # Get robot base frame
     root_pos_w = robot.data.root_link_pos_w  # (N, 3)
@@ -259,6 +307,61 @@ def body_state_b(
     # concate and return
     out = torch.cat((body_pos_b, body_quat_b, body_lin_vel_b, body_ang_vel_b), dim=1)
     return out.view(env.num_envs, -1)
+
+
+# Cached tip offset tensor (initialized on first call)
+_TIP_OFFSETS_TENSOR: torch.Tensor | None = None
+
+
+def _ensure_tip_offsets_cache(y2r_cfg: Y2RConfig, device: torch.device) -> None:
+    """Initialize cached tip offset tensor (once per process)."""
+    global _TIP_OFFSETS_TENSOR
+    if _TIP_OFFSETS_TENSOR is not None:
+        return
+    tip_cfg = y2r_cfg.robot.tip_offsets
+    if tip_cfg is None:
+        return
+    # Order matches regex ".*_link_3": index, middle, ring, thumb
+    _TIP_OFFSETS_TENSOR = torch.tensor(
+        [tip_cfg["index"], tip_cfg["middle"], tip_cfg["ring"], tip_cfg["thumb"]],
+        dtype=torch.float32,
+        device=device,
+    )  # (4, 3)
+
+
+def hand_tips_state_with_offsets_b(
+    env: ManagerBasedRLEnv,
+    body_asset_cfg: SceneEntityCfg,
+    base_asset_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Hand tips body state with tip offsets applied.
+
+    Same as body_state_b but applies configured tip offsets to link_3 positions.
+    Body order: [palm_link, index_link_3, middle_link_3, ring_link_3, thumb_link_3].
+    Tip offsets are applied to the last 4 bodies (link_3) if configured.
+
+    Returns:
+        Tensor of shape ``(num_envs, 5 * 13)`` with per-body states in base root frame.
+    """
+    y2r_cfg = env.cfg.y2r_cfg
+    _ensure_tip_offsets_cache(y2r_cfg, env.device)
+
+    # Get base body states
+    out = body_state_b(env, body_asset_cfg, base_asset_cfg)  # (N, 5*13)
+
+    # Apply tip offsets if configured
+    global _TIP_OFFSETS_TENSOR
+    if _TIP_OFFSETS_TENSOR is not None:
+        N = env.num_envs
+        out_reshaped = out.view(N, 5, 13)  # (N, 5, 13)
+        # Bodies 1-4 are link_3 bodies; apply offset in each body's local frame
+        for i in range(4):
+            body_quat_b = out_reshaped[:, 1 + i, 3:7]  # (N, 4) quaternion in base frame
+            offset_b = quat_apply(body_quat_b, _TIP_OFFSETS_TENSOR[i].unsqueeze(0).expand(N, 3))
+            out_reshaped[:, 1 + i, 0:3] = out_reshaped[:, 1 + i, 0:3] + offset_b
+        out = out_reshaped.view(N, -1)
+
+    return out
 
 
 class object_point_cloud_b(ManagerTermBase):
@@ -1004,8 +1107,8 @@ class target_sequence_obs_b(ManagerTermBase):
             self._init_region_visualizer()
         
         # Cache palm body index for hand trajectory
-        palm_name = y2r_cfg.robot.palm_body_name
-        palm_ids = self.ref_asset.find_bodies(palm_name)[0]
+        _ensure_palm_offset_cache(y2r_cfg, env.device)
+        palm_ids = self.ref_asset.find_bodies(y2r_cfg.robot.palm_body_name)[0]
         self._palm_body_idx = palm_ids[0] if len(palm_ids) > 0 else None
 
         # Expose render_debug on the env so external scripts (keyboard, etc.) can call it
@@ -1393,11 +1496,10 @@ class target_sequence_obs_b(ManagerTermBase):
             all_ends.append(tgt_pos + axis_world)
             all_colors.extend([color] * E)
         
-        # === Palm link axes (standard RGB, medium size) ===
+        # === Palm frame axes (standard RGB, medium size) ===
         if self._palm_body_idx is not None:
-            palm_pos_w = self.ref_asset.data.body_pos_w[:, self._palm_body_idx]  # (N, 3)
-            palm_quat_w = self.ref_asset.data.body_quat_w[:, self._palm_body_idx]  # (N, 4)
-            
+            palm_pos_w, palm_quat_w, _ = get_palm_frame_pose_w(self.ref_asset, self.y2r_cfg)
+
             palm_pos = palm_pos_w[env_ids]  # (E, 3)
             palm_quat = palm_quat_w[env_ids]  # (E, 4)
             
@@ -1485,8 +1587,9 @@ class target_sequence_obs_b(ManagerTermBase):
             # Get current palm poses for hand trajectory (if enabled)
             start_palm_poses = None
             if self.y2r_cfg.hand_trajectory.enabled and self._palm_body_idx is not None:
-                palm_pos = self.ref_asset.data.body_pos_w[reset_ids, self._palm_body_idx]
-                palm_quat = self.ref_asset.data.body_quat_w[reset_ids, self._palm_body_idx]
+                palm_pos_all, palm_quat_all, _ = get_palm_frame_pose_w(self.ref_asset, self.y2r_cfg)
+                palm_pos = palm_pos_all[reset_ids]
+                palm_quat = palm_quat_all[reset_ids]
                 start_palm_poses = torch.cat([palm_pos, palm_quat], dim=-1)
             
             difficulties = None
@@ -1704,7 +1807,7 @@ class target_sequence_obs_b(ManagerTermBase):
 
         # Cache aligned hand target (pose in world frame)
         if self._palm_body_idx is not None:
-            palm_pos_w = self.ref_asset.data.body_pos_w[:, self._palm_body_idx]  # (N, 3)
+            palm_pos_w, _, _ = get_palm_frame_pose_w(self.ref_asset, self.y2r_cfg)
         else:
             palm_pos_w = self.ref_asset.data.root_pos_w  # Fallback (N, 3)
         env._cached_aligned_hand_target = _compute_aligned_hand_target(

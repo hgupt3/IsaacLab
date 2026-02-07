@@ -93,10 +93,10 @@ def _build_ur5e_leap_rewards_cfg(cfg: Y2RConfig, base_rewards):
 # UR5E LEAP MIXIN
 # ==============================================================================
 
-# The URDF is converted to USD with merge_fixed_joints=False.
-# Despite preserving all links, the USD converter creates a FLAT prim hierarchy:
-# all bodies are direct children of /World/Robot/{link_name} (no nesting).
-# This differs from the Kuka's pre-built USD which nests links under ee_link.
+# The URDF is converted to USD with merge_fixed_joints=True.
+# Fixed-joint links (camera chain, palm_frame, tip frames) are merged into parents.
+# Surviving bodies (connected via revolute joints) remain as direct children of /World/Robot/.
+# hand_base_joint is zero-limit revolute to preserve palm_link as a separate body.
 
 @configclass
 class UR5eLeapTrajectoryMixinCfg:
@@ -141,10 +141,6 @@ class UR5eLeapTrajectoryMixinCfg:
         _build_ur5e_leap_rewards_cfg(cfg, self.rewards)
 
         # Override base config terms that hardcode Kuka joint/body names
-        # reset_robot_wrist_joint: iiwa7_joint_7 -> ur5e_joint_6
-        self.events.reset_robot_wrist_joint.params["asset_cfg"] = SceneEntityCfg(
-            "robot", joint_names="ur5e_joint_6"
-        )
         # arm_table_penalty: iiwa7_link_(3|4|5|6|7) -> ur5e_link_(3|4|5|6)
         self.rewards.arm_table_penalty.params["asset_cfg"] = SceneEntityCfg(
             "robot", body_names=["ur5e_link_(3|4|5|6)|palm_link"]
@@ -170,11 +166,18 @@ class UR5eLeapTrajectoryMixinCfg:
             clip=(-20.0, 20.0),
         )
 
-        # Hand tips state observation
-        self.observations.proprio.hand_tips_state_b.params["body_asset_cfg"].body_names = ["palm_link", ".*_tip"]
+        # Hand tips state observation (link_3 bodies with computed tip offsets)
+        self.observations.proprio.hand_tips_state_b = ObsTerm(
+            func=mdp.hand_tips_state_with_offsets_b,
+            noise=self.observations.proprio.hand_tips_state_b.noise,
+            params={
+                "body_asset_cfg": SceneEntityCfg("robot", body_names=["palm_link", "(index|middle|ring|thumb)_link_3"]),
+                "base_asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
 
-        # Fingers to object reward
-        self.rewards.fingers_to_object.params["asset_cfg"] = SceneEntityCfg("robot", body_names=["palm_link", ".*_tip"])
+        # Fingers to object reward (link_3 bodies with tip offsets applied internally)
+        self.rewards.fingers_to_object.params["asset_cfg"] = SceneEntityCfg("robot", body_names=["palm_link", "(index|middle|ring|thumb)_link_3"])
 
         # Add wrist camera if enabled
         if cfg.wrist_camera.enabled:

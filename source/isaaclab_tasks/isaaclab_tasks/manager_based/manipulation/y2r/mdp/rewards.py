@@ -16,12 +16,25 @@ from isaaclab.sensors import ContactSensor
 import isaaclab.utils.math as math_utils
 from isaaclab.utils.math import quat_apply_inverse, quat_inv, quat_mul, quat_error_magnitude
 
+from .observations import get_palm_frame_pose_w
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
 # Phase name to index mapping
 PHASE_MAP = {"grasp": 0, "manipulation": 1, "release": 2}
+
+
+def _get_cached_phase(env) -> torch.Tensor:
+    """Return trajectory_manager.get_phase(), cached per step."""
+    step = env.common_step_counter
+    cached = getattr(env, '_cached_phase_data', None)
+    if cached is not None and cached[0] == step:
+        return cached[1]
+    phase = env.trajectory_manager.get_phase()
+    env._cached_phase_data = (step, phase)
+    return phase
 
 
 def _apply_phase_filter(
@@ -45,14 +58,14 @@ def _apply_phase_filter(
     
     if not hasattr(env, 'trajectory_manager') or env.trajectory_manager is None:
         return reward
-    
-    phase = env.trajectory_manager.get_phase()  # (N,) - 0=grasp, 1=manip, 2=release
-    
+
+    phase = _get_cached_phase(env)  # (N,) - 0=grasp, 1=manip, 2=release
+
     active = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     for p in phases:
         if p in PHASE_MAP:
             active = active | (phase == PHASE_MAP[p])
-    
+
     return torch.where(active, reward, torch.zeros_like(reward))
 
 
@@ -136,7 +149,18 @@ def _get_finger_release_gate(
     
     # Apply floor: gate ranges from floor to 1.0
     gate = floor + (1.0 - floor) * raw_factor
-    
+
+    return gate
+
+
+def _get_cached_finger_release_gate(env, threshold=0.5, ramp=2.0, floor=0.2):
+    """Return _get_finger_release_gate(), cached per step."""
+    step = env.common_step_counter
+    cached = getattr(env, '_cached_finger_gate_data', None)
+    if cached is not None and cached[0] == step:
+        return cached[1]
+    gate = _get_finger_release_gate(env, threshold, ramp, floor)
+    env._cached_finger_gate_data = (step, gate)
     return gate
 
 
@@ -226,7 +250,25 @@ def object_ee_distance(
     """
     asset: RigidObject = env.scene[asset_cfg.name]
     object: RigidObject = env.scene[object_cfg.name]
-    asset_pos = asset.data.body_pos_w[:, asset_cfg.body_ids]
+    asset_pos = asset.data.body_pos_w[:, asset_cfg.body_ids].clone()  # (N, B, 3)
+
+    # Apply tip offsets if configured (bodies 1+ are link_3, offsets are in body-local frame)
+    tip_cfg = env.cfg.y2r_cfg.robot.tip_offsets
+    if tip_cfg is not None and asset_pos.shape[1] > 1:
+        from . import observations as _obs_mod
+        from isaaclab.utils.math import quat_apply as _quat_apply
+        _obs_mod._ensure_tip_offsets_cache(env.cfg.y2r_cfg, env.device)
+        tip_offsets = _obs_mod._TIP_OFFSETS_TENSOR
+        if tip_offsets is not None:
+            asset_quat = asset.data.body_quat_w[:, asset_cfg.body_ids]  # (N, B, 4)
+            for i in range(min(4, asset_pos.shape[1] - 1)):
+                # Rotate local offset into world frame and add to position
+                offset_w = _quat_apply(
+                    asset_quat[:, 1 + i],
+                    tip_offsets[i].unsqueeze(0).expand(env.num_envs, 3),
+                )
+                asset_pos[:, 1 + i] = asset_pos[:, 1 + i] + offset_w
+
     object_pos = object.data.root_pos_w
     object_ee_distance = torch.norm(asset_pos - object_pos[:, None, :], dim=-1).max(dim=-1).values
     reward = 1 - torch.tanh(object_ee_distance / std)
@@ -588,7 +630,7 @@ def lookahead_tracking(
 
     # Apply per-phase scaling with grasp_scale
     if phases is not None and len(phases) > 0 and hasattr(env, 'trajectory_manager') and env.trajectory_manager is not None:
-        phase = env.trajectory_manager.get_phase()  # (N,) - 0=grasp, 1=manip, 2=release
+        phase = _get_cached_phase(env)  # (N,) - 0=grasp, 1=manip, 2=release
         scale = torch.zeros(env.num_envs, dtype=reward.dtype, device=env.device)
         for p in phases:
             if p in PHASE_MAP:
@@ -767,10 +809,10 @@ def trajectory_success(
     
     # Optionally gate sparse component by finger release (must actually release, not hold)
     if use_finger_release_gate:
-        contact_gate = _get_finger_release_gate(
-            env, 
-            threshold=contact_gate_threshold, 
-            ramp=contact_gate_ramp, 
+        contact_gate = _get_cached_finger_release_gate(
+            env,
+            threshold=contact_gate_threshold,
+            ramp=contact_gate_ramp,
             floor=contact_gate_floor
         )
         sparse_gated = sparse * contact_gate
@@ -885,20 +927,9 @@ def finger_manipulation(
     obj: RigidObject = env.scene[object_cfg.name]
     cfg = env.cfg.y2r_cfg
     
-    # Get palm body index (cache on first call)
-    if not hasattr(env, '_palm_body_idx'):
-        palm_ids = robot.find_bodies(env.cfg.y2r_cfg.robot.palm_body_name)[0]
-        if len(palm_ids) == 0:
-            # Fallback: no palm_link found, return zero reward
-            return torch.zeros(env.num_envs, device=env.device)
-        env._palm_body_idx = palm_ids[0]
-    
-    palm_idx = env._palm_body_idx
-    
-    # Get palm pose in world frame
-    palm_pos_w = robot.data.body_pos_w[:, palm_idx]  # (N, 3)
-    palm_quat_w = robot.data.body_quat_w[:, palm_idx]  # (N, 4)
-    
+    # Get palm frame pose in world frame (with offset if configured)
+    palm_pos_w, palm_quat_w, _ = get_palm_frame_pose_w(robot, env.cfg.y2r_cfg)
+
     # Get object pose in world frame
     object_pos_w = obj.data.root_pos_w  # (N, 3)
     object_quat_w = obj.data.root_quat_w  # (N, 4)
@@ -1004,15 +1035,9 @@ def palm_velocity_penalty(
     """
     robot: Articulation = env.scene[robot_cfg.name]
     
-    # Get palm body index (reuse cached value if available from finger_manipulation)
-    if not hasattr(env, '_palm_body_idx'):
-        palm_ids = robot.find_bodies(env.cfg.y2r_cfg.robot.palm_body_name)[0]
-        if len(palm_ids) == 0:
-            return torch.zeros(env.num_envs, device=env.device)
-        env._palm_body_idx = palm_ids[0]
-    
-    palm_idx = env._palm_body_idx
-    
+    # Get palm body index (velocities use palm_link directly, offset is rigid)
+    _, _, palm_idx = get_palm_frame_pose_w(robot, env.cfg.y2r_cfg)
+
     # Get palm velocities in world frame
     palm_lin_vel_w = robot.data.body_lin_vel_w[:, palm_idx]  # (N, 3)
     palm_ang_vel_w = robot.data.body_ang_vel_w[:, palm_idx]  # (N, 3)
@@ -1030,8 +1055,7 @@ def palm_velocity_penalty(
     penalty = angular_penalty + linear_penalty
     
     # Gate by manipulation phase (phase == 1)
-    trajectory_manager = env.trajectory_manager
-    in_manipulation = trajectory_manager.get_phase() == 1  # (N,) bool
+    in_manipulation = _get_cached_phase(env) == 1  # (N,) bool
     
     # Only penalize during manipulation phase
     penalty = torch.where(in_manipulation, penalty, torch.zeros_like(penalty))
@@ -1063,17 +1087,8 @@ def palm_orientation_penalty(
     """
     robot: Articulation = env.scene[robot_cfg.name]
     
-    # Get palm body index (reuse cached if available)
-    if not hasattr(env, '_palm_body_idx'):
-        palm_ids = robot.find_bodies(env.cfg.y2r_cfg.robot.palm_body_name)[0]
-        if len(palm_ids) == 0:
-            return torch.zeros(env.num_envs, device=env.device)
-        env._palm_body_idx = palm_ids[0]
-    
-    palm_idx = env._palm_body_idx
-    
-    # Get current palm orientation in world frame
-    palm_quat_w = robot.data.body_quat_w[:, palm_idx]  # (N, 4)
+    # Get palm frame pose (with offset if configured)
+    _, palm_quat_w, _ = get_palm_frame_pose_w(robot, env.cfg.y2r_cfg)
     
     # Convert target euler to quaternion (cached on first call)
     if not hasattr(env, '_target_palm_quat'):
@@ -1230,19 +1245,8 @@ def hand_pose_following(
     robot: Articulation = env.scene[robot_cfg.name]
     trajectory_manager = env.trajectory_manager
     
-    # Get palm body index (cache it)
-    if not hasattr(env, '_palm_body_idx'):
-        palm_ids = robot.find_bodies(env.cfg.y2r_cfg.robot.palm_body_name)[0]
-        if len(palm_ids) == 0:
-            env.hand_pose_gate = torch.ones(N, device=env.device)
-            return torch.zeros(N, device=env.device)
-        env._palm_body_idx = palm_ids[0]
-    
-    palm_idx = env._palm_body_idx
-    
-    # Get actual palm pose in world frame
-    palm_pos_w = robot.data.body_pos_w[:, palm_idx]  # (N, 3)
-    palm_quat_w = robot.data.body_quat_w[:, palm_idx]  # (N, 4)
+    # Get palm frame pose in world frame (with offset if configured)
+    palm_pos_w, palm_quat_w, _ = get_palm_frame_pose_w(robot, env.cfg.y2r_cfg)
     
     # Get aligned hand target pose (cached during observations)
     if not hasattr(env, "_cached_aligned_hand_target"):
@@ -1256,8 +1260,8 @@ def hand_pose_following(
     rot_error = quat_error_magnitude(palm_quat_w, target_quat_w)  # (N,)
     
     # Get current phase (0=grasp, 1=manipulation, 2=release)
-    phase = trajectory_manager.get_phase()  # (N,)
-    
+    phase = _get_cached_phase(env)  # (N,)
+
     # Phase-varying tolerances
     pos_tol = torch.where(
         phase == 0, 

@@ -18,6 +18,9 @@ from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_error_magnitude
 
+from . import rewards as _rewards_mod
+from .observations import get_palm_frame_pose_w
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -113,28 +116,18 @@ def hand_pose_deviation(
     trajectory_manager = env.trajectory_manager
     robot: Articulation = env.scene[robot_cfg.name]
     
-    # Get palm body index (cache it)
-    if not hasattr(env, '_term_palm_body_idx'):
-        palm_ids = robot.find_bodies(env.cfg.y2r_cfg.robot.palm_body_name)[0]
-        if len(palm_ids) == 0:
-            return torch.zeros(N, dtype=torch.bool, device=env.device)
-        env._term_palm_body_idx = palm_ids[0]
-    
-    palm_idx = env._term_palm_body_idx
-    
     # Get current phase (0=grasp, 1=manipulation, 2=release)
-    phase = trajectory_manager.get_phase()  # (N,)
-    
+    phase = _rewards_mod._get_cached_phase(env)  # (N,)
+
     # Only terminate during grasp and release phases
     in_gated_phase = (phase == 0) | (phase == 2)
-    
+
     # If no envs are in gated phase, skip computation
     if not in_gated_phase.any():
         return torch.zeros(N, dtype=torch.bool, device=env.device)
-    
-    # Get actual palm pose in world frame
-    palm_pos_w = robot.data.body_pos_w[:, palm_idx]  # (N, 3)
-    palm_quat_w = robot.data.body_quat_w[:, palm_idx]  # (N, 4)
+
+    # Get palm frame pose in world frame (with offset if configured)
+    palm_pos_w, palm_quat_w, _ = get_palm_frame_pose_w(robot, env.cfg.y2r_cfg)
     
     # Get aligned hand target pose (cached during observations)
     if not hasattr(env, "_cached_aligned_hand_target"):

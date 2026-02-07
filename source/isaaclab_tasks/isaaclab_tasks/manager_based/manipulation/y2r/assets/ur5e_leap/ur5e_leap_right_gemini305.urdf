@@ -48,12 +48,12 @@
         <mesh filename="ur5e/meshes/visual/shoulder.obj" />
       </geometry>
     </visual>
-    <collision>
+    <!-- <collision>
       <origin xyz="0 0 -0.05" rpy="0 0 0" />
       <geometry>
         <cylinder radius="0.06" length="0.12" />
       </geometry>
-    </collision>
+    </collision> -->
     <inertial>
       <mass value="3.7" />
       <origin rpy="0 0 0" xyz="0 0 0" />
@@ -234,8 +234,8 @@
     <parent link="ee_link" />
     <child link="palm_link" />
     <origin xyz="0.15 0.03 0.0005" rpy="0 0 0" />
-    <axis xyz="0 0 1"/>
-    <limit effort="0" lower="0" upper="0" velocity="0"/>
+    <axis xyz="0 0 1" />
+    <limit effort="0" velocity="0" lower="0" upper="0" />
   </joint>
   <link name="palm_link">
     <visual>
@@ -292,16 +292,11 @@
       <mass value="0.001"/>
       <inertia ixx="1e-9" ixy="0" ixz="0" iyy="1e-9" iyz="0" izz="1e-9"/>
     </inertial>
-    <visual>
-      <geometry><sphere radius="0.001" /></geometry>
-    </visual>
   </link>
-  <joint name="palm_frame_joint" type="revolute">
+  <joint name="palm_frame_joint" type="fixed">
     <parent link="palm_link"/>
     <child link="palm_frame"/>
     <origin xyz="-0.04 -0.038 -0.035" rpy="3.14159 0 0"/>
-    <axis xyz="0 0 1"/>
-    <limit effort="0" lower="0" upper="0" velocity="0"/>
   </joint>
   <link name="index_link_0">
     <visual>
@@ -722,64 +717,44 @@
       <mass value="0.001" />
       <inertia ixx="1e-9" ixy="0" ixz="0" iyy="1e-9" iyz="0" izz="1e-9" />
     </inertial>
-    <visual>
-      <geometry><sphere radius="0.001" /></geometry>
-    </visual>
   </link>
   <link name="index_tip">
     <inertial>
       <mass value="0.001" />
       <inertia ixx="1e-9" ixy="0" ixz="0" iyy="1e-9" iyz="0" izz="1e-9" />
     </inertial>
-    <visual>
-      <geometry><sphere radius="0.001" /></geometry>
-    </visual>
   </link>
   <link name="middle_tip">
     <inertial>
       <mass value="0.001" />
       <inertia ixx="1e-9" ixy="0" ixz="0" iyy="1e-9" iyz="0" izz="1e-9" />
     </inertial>
-    <visual>
-      <geometry><sphere radius="0.001" /></geometry>
-    </visual>
   </link>
   <link name="ring_tip">
     <inertial>
       <mass value="0.001" />
       <inertia ixx="1e-9" ixy="0" ixz="0" iyy="1e-9" iyz="0" izz="1e-9" />
     </inertial>
-    <visual>
-      <geometry><sphere radius="0.001" /></geometry>
-    </visual>
   </link>
-  <joint name="thumb_tip_joint" type="revolute">
+  <joint name="thumb_tip_joint" type="fixed">
     <parent link="thumb_link_3" />
     <child link="thumb_tip" />
     <origin rpy="0 0 0" xyz="0 -0.06 -0.015" />
-    <axis xyz="0 0 1"/>
-    <limit effort="0" lower="0" upper="0" velocity="0"/>
   </joint>
-  <joint name="index_tip_joint" type="revolute">
+  <joint name="index_tip_joint" type="fixed">
     <parent link="index_link_3" />
     <child link="index_tip" />
     <origin rpy="0 0 0" xyz="0 -0.048 0.015" />
-    <axis xyz="0 0 1"/>
-    <limit effort="0" lower="0" upper="0" velocity="0"/>
   </joint>
-  <joint name="middle_tip_joint" type="revolute">
+  <joint name="middle_tip_joint" type="fixed">
     <parent link="middle_link_3" />
     <child link="middle_tip" />
     <origin rpy="0 0 0" xyz="0 -0.048 0.015" />
-    <axis xyz="0 0 1"/>
-    <limit effort="0" lower="0" upper="0" velocity="0"/>
   </joint>
-  <joint name="ring_tip_joint" type="revolute">
+  <joint name="ring_tip_joint" type="fixed">
     <parent link="ring_link_3" />
     <child link="ring_tip" />
     <origin rpy="0 0 0" xyz="0 -0.048 0.015" />
-    <axis xyz="0 0 1"/>
-    <limit effort="0" lower="0" upper="0" velocity="0"/>
   </joint>
   <link name="wrist_mount_link">
     <visual>

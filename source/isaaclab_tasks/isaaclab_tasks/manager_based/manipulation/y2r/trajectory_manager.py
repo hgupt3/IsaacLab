@@ -882,20 +882,19 @@ class TrajectoryManager:
         n = len(env_ids)
         cfg = self.cfg.hand_trajectory.grasp_sampling
         
-        # Get cached points and normals
+        # Get cached points and normals (on GPU)
         cache = get_point_cloud_cache(
             env_ids=env_ids.tolist(),
             prim_path=self.object_prim_path,
             pool_size=256,
+            device=self.device,
         )
-        
-        # Get points and normals for these envs
-        # Note: cache tensors are on CPU, so use CPU indices for indexing
-        env_ids_cpu = env_ids.cpu()
-        geo_indices = cache.geo_indices[env_ids_cpu].to(self.device)
-        scales = cache.scales[env_ids_cpu].to(self.device)
-        all_points = cache.all_base_points.to(self.device)
-        all_normals = cache.all_base_normals.to(self.device)
+
+        # Get points and normals for these envs (all tensors already on GPU)
+        geo_indices = cache.geo_indices[env_ids]
+        scales = cache.scales[env_ids]
+        all_points = cache.all_base_points
+        all_normals = cache.all_base_normals
         
         # Get base points/normals per env (in object-local frame)
         env_points = all_points[geo_indices]  # (n, pool_size, 3)
@@ -1246,7 +1245,7 @@ class TrajectoryManager:
 
         # Find intersection of all feasible regions
         # Strategy: Sample N candidate rolls uniformly around circle, check which satisfy ALL constraints
-        num_samples = 128
+        num_samples = 16
         candidate_rolls = torch.linspace(-math.pi, math.pi, num_samples, device=device).unsqueeze(0).expand(n, num_samples)  # (n, num_samples)
 
         # Evaluate all constraints for all candidates
@@ -1437,17 +1436,17 @@ class TrajectoryManager:
         if max_kp == 0:
             return
 
-        # Get point cloud pool for these envs
+        # Get point cloud pool for these envs (on GPU)
         cache = get_point_cloud_cache(
             env_ids=env_ids.tolist(),
             prim_path=self.object_prim_path,
-            pool_size=256,
+            pool_size=128,
+            device=self.device,
         )
-        env_ids_cpu = env_ids.cpu()
-        geo_indices = cache.geo_indices[env_ids_cpu].to(self.device)
-        scales = cache.scales[env_ids_cpu].to(self.device)
-        pool_points = cache.all_base_points.to(self.device)[geo_indices]  # (n, pool_size, 3)
-        pool_normals = cache.all_base_normals.to(self.device)[geo_indices]  # (n, pool_size, 3)
+        geo_indices = cache.geo_indices[env_ids]
+        scales = cache.scales[env_ids]
+        pool_points = cache.all_base_points[geo_indices]  # (n, pool_size, 3)
+        pool_normals = cache.all_base_normals[geo_indices]  # (n, pool_size, 3)
 
         # Apply object scale to points (scales is (n, 3) for per-axis scaling)
         pool_points = pool_points * scales.unsqueeze(1)  # (n, 1, 3) * (n, 256, 3) -> (n, 256, 3)
