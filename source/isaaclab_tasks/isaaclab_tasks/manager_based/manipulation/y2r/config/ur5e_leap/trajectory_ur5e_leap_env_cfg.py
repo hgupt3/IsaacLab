@@ -94,9 +94,9 @@ def _build_ur5e_leap_rewards_cfg(cfg: Y2RConfig, base_rewards):
 # ==============================================================================
 
 # The URDF is converted to USD with merge_fixed_joints=True.
-# Fixed-joint links (camera chain, palm_frame, tip frames) are merged into parents.
+# Fixed-joint links (camera chain, palm_frame, tip frames, palm_link) are merged into parents.
 # Surviving bodies (connected via revolute joints) remain as direct children of /World/Robot/.
-# hand_base_joint is zero-limit revolute to preserve palm_link as a separate body.
+# hand_base_joint is fixed — palm_link is merged into ur5e_link_6.
 
 @configclass
 class UR5eLeapTrajectoryMixinCfg:
@@ -143,7 +143,7 @@ class UR5eLeapTrajectoryMixinCfg:
         # Override base config terms that hardcode Kuka joint/body names
         # arm_table_penalty: iiwa7_link_(3|4|5|6|7) -> ur5e_link_(3|4|5|6)
         self.rewards.arm_table_penalty.params["asset_cfg"] = SceneEntityCfg(
-            "robot", body_names=["ur5e_link_(3|4|5|6)|palm_link"]
+            "robot", body_names=["ur5e_link_(3|4|5|6)"]
         )
 
         # Setup contact sensors for fingertips
@@ -171,13 +171,13 @@ class UR5eLeapTrajectoryMixinCfg:
             func=mdp.hand_tips_state_with_offsets_b,
             noise=self.observations.proprio.hand_tips_state_b.noise,
             params={
-                "body_asset_cfg": SceneEntityCfg("robot", body_names=["palm_link", "(index|middle|ring|thumb)_link_3"]),
+                "body_asset_cfg": SceneEntityCfg("robot", body_names=["ur5e_link_6", "(index|middle|ring|thumb)_link_3"]),
                 "base_asset_cfg": SceneEntityCfg("robot"),
             },
         )
 
         # Fingers to object reward (link_3 bodies with tip offsets applied internally)
-        self.rewards.fingers_to_object.params["asset_cfg"] = SceneEntityCfg("robot", body_names=["palm_link", "(index|middle|ring|thumb)_link_3"])
+        self.rewards.fingers_to_object.params["asset_cfg"] = SceneEntityCfg("robot", body_names=["ur5e_link_6", "(index|middle|ring|thumb)_link_3"])
 
         # Add wrist camera if enabled
         if cfg.wrist_camera.enabled:
@@ -192,7 +192,7 @@ class UR5eLeapTrajectoryMixinCfg:
             pos = tuple(float(x) for x in cfg.wrist_camera.offset.pos)
 
             self.scene.wrist_camera = TiledCameraCfg(
-                prim_path="{ENV_REGEX_NS}/Robot/palm_link/wrist_camera",
+                prim_path="{ENV_REGEX_NS}/Robot/ur5e_link_6/wrist_camera",
                 offset=TiledCameraCfg.OffsetCfg(
                     pos=pos,
                     rot=quat_wxyz,

@@ -12,7 +12,7 @@
 simulation:
   physics_dt: 0.01              # Physics timestep (seconds)
   decimation: 2                 # Control decimation (steps per action)
-  num_envs: 16384
+  num_envs: 20480
   env_spacing: 3.0
   replicate_physics: false
   solver_position_iteration_count: 16
@@ -306,7 +306,7 @@ rewards:
   # Hand pose following reward (when hand_trajectory.enabled)
   # Guides hand to follow palm pose trajectory through grasp/manipulation/release
   hand_pose_following:
-    weight: 3.5                   # Guiding signal, not strict
+    weight: 3.0                   # Guiding signal, not strict
     params:
       # Phase-varying tolerances: average of position/rotation kernels
       grasp_pos_tol: 0.03         # Position tolerance during grasp
@@ -362,6 +362,9 @@ terminations:
     position_threshold: [0.3, 0.1]         # Position threshold (meters)
     rotation_threshold: [3.14, 3.14]        # Rotation threshold (radians)
 
+  abnormal_robot:
+    debug: true                            # Enable per-joint termination stats
+
 # ==============================================================================
 # CURRICULUM (Adaptive Domain Randomization)
 # ==============================================================================
@@ -396,8 +399,8 @@ curriculum:
     target_poses: [0.0, 0.01]
     hand_pose_targets: [0.0, 0.01]
     
-  gate_floor: [0.4, 0.1] # Hand pose gate floor: [initial, final]
-  grasp_scale: [0.4, 0.0] # Grasp phase scaling for lookahead tracking: [initial, final]
+  gate_floor: [0.3, 0.1] # Hand pose gate floor: [initial, final]
+  grasp_scale: [0.9, 0.1] # Grasp phase scaling for lookahead tracking: [initial, final]
     
   # Gravity scheduling (m/s²)
   gravity:
@@ -466,13 +469,13 @@ robot:
   arm_joint_count: 6
   hand_joint_count: 16
   eigen_dim: 5                  # PCA dimensions for eigen grasp
-  palm_body_name: "palm_link"   # Body used for palm pose tracking
+  palm_body_name: "ur5e_link_6"  # Body used for palm pose tracking (palm_link merged into link_6)
   wrist_joint_name: "ur5e_joint_6"         # Wrist joint (separate randomization range)
   arm_joint_regex: "ur5e_joint_.*"         # Regex matching all arm joints (including wrist)
-  hand_body_regex: "(palm_link|.*_link_[0-3]|.*_tip)"  # Hand bodies for table penetration check
+  hand_body_regex: "(ur5e_link_6|.*_link_[0-3]|.*_tip)"  # Hand bodies for table penetration check
   palm_frame_offset:            # Offset from palm_body_name to virtual palm_frame (null = no offset)
-    pos: [-0.04, -0.038, -0.035]
-    rot_euler: [180.0, 0.0, 0.0]  # Euler XYZ degrees
+    pos: [-0.008, -0.0345, 0.11]
+    rot_euler: [0.0, -90.0, 90.0]  # Euler XYZ degrees
   tip_offsets:                  # Offsets from link_3 bodies to virtual tip positions
     index: [0.0, -0.048, 0.015]
     middle: [0.0, -0.048, 0.015]
@@ -523,11 +526,11 @@ wrist_camera:
   horizontal_aperture: 6.17     # Virtual sensor width (mm)
   clipping_range: [0.04, 1.0]   # Gemini 305 depth range: 4–100 cm
 
-  # Offset: palm_link → camera (opengl convention, Euler degrees)
-  # UR5e: computed from URDF transforms inv(T_link6→palm) × T_link6→optical
+  # Offset: ur5e_link_6 → camera (opengl convention, Euler degrees)
+  # Computed from URDF chain: link_6→ee_link→palm_link→camera
   offset:
-    pos: [-0.1774, -0.021, -0.071]
-    rot: [90.0, 90.0, 0.0]
+    pos: [0.009, -0.0705, -0.0274]
+    rot: [0.0, 0.0, 180.0]
 
   # Web viewer for remote visualization over SSH
   web_viewer: false

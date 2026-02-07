@@ -49,9 +49,74 @@ def time_out(env: ManagerBasedRLEnv) -> torch.Tensor:
 
 def abnormal_robot_state(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """Terminating environment when violation of velocity limits detects, this usually indicates unstable physics caused
-    by very bad, or aggressive action"""
+    by very bad, or aggressive action.
+
+    When ``cfg.terminations.abnormal_robot.debug`` is True, accumulates per-joint
+    termination counts and prints a compact summary table every 1000 steps.
+    """
     robot: Articulation = env.scene[asset_cfg.name]
-    return (robot.data.joint_vel.abs() > (robot.data.joint_vel_limits * 2)).any(dim=1)
+    exceeded = robot.data.joint_vel.abs() > (robot.data.joint_vel_limits * 2)
+    terminated = exceeded.any(dim=1)
+
+    debug = env.cfg.y2r_cfg.terminations.abnormal_robot.debug
+    if not debug:
+        return terminated
+
+    # -- Debug accumulation --
+    num_joints = robot.data.joint_vel.shape[1]
+    joint_names = robot.data.joint_names
+
+    # Lazily initialize accumulators on first call
+    if not hasattr(env, "_abnormal_joint_counts"):
+        env._abnormal_joint_counts = torch.zeros(num_joints, dtype=torch.long, device=env.device)
+        env._abnormal_total = 0
+        env._abnormal_step_count = 0
+        env._abnormal_worst_ratios = torch.zeros(num_joints, device=env.device)
+
+    env._abnormal_step_count += 1
+
+    n_terminated = terminated.sum().item()
+    if n_terminated > 0:
+        env._abnormal_joint_counts += exceeded[terminated].sum(dim=0).long()
+        env._abnormal_total += n_terminated
+
+        # Track worst velocity/limit ratio per joint
+        vel_limits = robot.data.joint_vel_limits
+        if vel_limits.dim() == 2:
+            vel_limits = vel_limits[0]  # Same limits for all envs, take first row
+        ratios = robot.data.joint_vel[terminated].abs() / vel_limits.unsqueeze(0).clamp(min=1e-6)
+        step_worst = ratios.max(dim=0).values
+        env._abnormal_worst_ratios = torch.max(env._abnormal_worst_ratios, step_worst)
+
+    # Print summary every 1000 steps
+    if env._abnormal_step_count >= 1000:
+        total = env._abnormal_total
+        steps = env._abnormal_step_count
+        pct = 100.0 * total / steps if steps > 0 else 0.0
+        print(f"\n[abnormal_robot] {total} terminations over last {steps} steps ({pct:.1f}%)")
+
+        if total > 0:
+            counts = env._abnormal_joint_counts
+            worst = env._abnormal_worst_ratios
+            nonzero = counts.nonzero(as_tuple=True)[0]
+            # Sort by count descending
+            sorted_idx = nonzero[counts[nonzero].argsort(descending=True)]
+
+            print(f"  {'Joint':<24} {'Count':>6}  {'%':>6}  {'Worst vel/limit':>15}")
+            for j in sorted_idx:
+                jname = joint_names[j.item()]
+                cnt = counts[j].item()
+                jpct = 100.0 * cnt / total
+                wratio = worst[j].item()
+                print(f"  {jname:<24} {cnt:>6}  {jpct:>5.1f}%  {wratio:>14.1f}x")
+
+        # Reset accumulators
+        env._abnormal_joint_counts.zero_()
+        env._abnormal_total = 0
+        env._abnormal_step_count = 0
+        env._abnormal_worst_ratios.zero_()
+
+    return terminated
 
 
 def trajectory_deviation(

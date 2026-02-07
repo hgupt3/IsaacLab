@@ -230,12 +230,10 @@
     <child link="ee_link" />
     <origin rpy="0 -1.57079632679 -1.57079632679" xyz="0 0 0" />
   </joint>
-  <joint name="hand_base_joint" type="revolute">
+  <joint name="hand_base_joint" type="fixed">
     <parent link="ee_link" />
     <child link="palm_link" />
     <origin xyz="0.15 0.03 0.0005" rpy="0 0 0" />
-    <axis xyz="0 0 1" />
-    <limit effort="0" velocity="0" lower="0" upper="0" />
   </joint>
   <link name="palm_link">
     <visual>
@@ -611,12 +609,6 @@
         <mesh filename="leap/meshes/visual/pip.obj" />
       </geometry>
     </visual>
-    <collision>
-      <origin xyz="-0.0075 -0.0002 -0.011" rpy="0 0 0" />
-      <geometry>
-        <box size="0.034 0.026 0.022" />
-      </geometry>
-    </collision>
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <mass value="0.032" />

@@ -352,9 +352,15 @@ class HandPoseDeviationConfig:
 
 
 @dataclass
+class AbnormalRobotConfig:
+    debug: bool
+
+
+@dataclass
 class TerminationsConfig:
     trajectory_deviation: TrajectoryDeviationConfig
     hand_pose_deviation: HandPoseDeviationConfig
+    abnormal_robot: AbnormalRobotConfig
 
 
 @dataclass

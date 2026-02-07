@@ -4,6 +4,7 @@ robot:
   palm_body_name: "palm_link"  # Kuka's palm_link frame is already correct
   wrist_joint_name: "iiwa7_joint_7"
   arm_joint_regex: "iiwa7_joint_.*"
+  hand_body_regex: "(palm_link|.*_link_[0-3]|.*_tip)"  # Kuka keeps palm_link as real body
   palm_frame_offset: null      # Kuka palm_link is already the correct frame
   tip_offsets: null             # Kuka tip bodies exist as real bodies
 
