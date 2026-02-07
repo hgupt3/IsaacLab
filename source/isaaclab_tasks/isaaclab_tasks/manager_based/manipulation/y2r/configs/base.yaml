@@ -67,7 +67,8 @@ trajectory:
       type: "waypoint"
       pose: null              # Computed from start_poses
       duration: 2.0
-      hand_coupling: "full"
+      hand_coupling_weights:
+        full: 1.0
 
     - name: "explore"
       type: "random_waypoint"
@@ -80,7 +81,7 @@ trajectory:
         z: null
       vary_orientation: true
       max_rotation: 1.0          # Max rotation (radians)
-      hand_coupling_weights:     # Per-waypoint random coupling
+      hand_coupling_weights:
         full: 0.5
         position_only: 0.5
 
@@ -88,19 +89,24 @@ trajectory:
       type: "waypoint"
       pose: null              # Computed from goal_poses
       duration: 3.0
-      hand_coupling: "full"
+      hand_coupling_weights:
+        full: 0.5
+        position_only: 0.5
 
     - name: "settle"
       type: "waypoint"
       pose: null              # Computed from goal_poses
       duration: 0.1
-      hand_coupling: "full"
+      hand_coupling_weights:
+        full: 0.5
+        position_only: 0.5
 
     - name: "release"
       type: "waypoint"
       pose: null              # Computed: object stays, hand retreats
       duration: 2.0
-      hand_coupling: "none"   # Hand fully decoupled
+      hand_coupling_weights:
+        none: 1.0             # Hand fully decoupled
 
 # ==============================================================================
 # HAND TRAJECTORY (palm pose guidance)
@@ -310,11 +316,11 @@ rewards:
     params:
       # Phase-varying tolerances: average of position/rotation kernels
       grasp_pos_tol: 0.03         # Position tolerance during grasp
-      grasp_rot_tol: 0.3          # Rotation tolerance during grasp
+      grasp_rot_tol: 0.4          # Rotation tolerance during grasp
       manipulation_pos_tol: 0.04  # Position tolerance during manipulation
-      manipulation_rot_tol: 0.4   # Rotation tolerance during manipulation
+      manipulation_rot_tol: 0.5   # Rotation tolerance during manipulation
       release_pos_tol: 0.03       # Position tolerance during release
-      release_rot_tol: 0.3        # Rotation tolerance during release
+      release_rot_tol: 0.4        # Rotation tolerance during release
       # Per-phase gating - gate other rewards if hand deviates from target
       gate_in_grasp: true         # Gate during grasp phase
       gate_in_manipulation: true  # Gate during manipulation phase

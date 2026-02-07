@@ -473,9 +473,16 @@ class TrajectoryManager:
                 # Duration
                 self.segment_durations[global_env_idx, target_seg_idx] = seg_config.duration
 
-                # Coupling mode
-                coupling_map = {"full": 0, "position_only": 1, "none": 2}
-                self.coupling_modes[global_env_idx, target_seg_idx] = coupling_map[seg_config.hand_coupling]
+                # Per-env coupling mode sampled from hand_coupling_weights
+                mode_order = ["full", "position_only", "none"]
+                coupling_base = [seg_config.hand_coupling_weights.get(m, 0.0) for m in mode_order]
+                coupling_overrides = self._parse_curriculum_dict_overrides(
+                    seg_config.curriculum, "hand_coupling_weights", mode_order,
+                )
+                coupling_weights = self._resolve_weighted_curriculum(
+                    coupling_base, coupling_overrides, difficulties, n,
+                )
+                self.coupling_modes[global_env_idx, target_seg_idx] = torch.multinomial(coupling_weights, 1).squeeze(1)
 
                 # Segment type markers
                 name_lower = seg_config.name.lower()

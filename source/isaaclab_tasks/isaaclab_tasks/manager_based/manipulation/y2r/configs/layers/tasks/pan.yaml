@@ -51,7 +51,8 @@ trajectory:
       type: "waypoint"
       pose: null              # Object stays at goal
       duration: 2.0
-      hand_coupling: "none"   # Hand decouples and retreats
+      hand_coupling_weights:
+        none: 1.0             # Hand decouples and retreats
 
 push_t:
   enabled: true

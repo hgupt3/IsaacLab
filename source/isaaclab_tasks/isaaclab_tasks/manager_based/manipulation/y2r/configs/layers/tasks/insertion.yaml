@@ -18,21 +18,24 @@ trajectory:
       # Hover above bolt
       pose: [-0.65, 0.0, 0.38, 1.0, 0.0, 0.0, 0.0]
       duration: 6.0
-      hand_coupling: "position_only"
+      hand_coupling_weights:
+        position_only: 1.0
 
     - name: "hover_low"
       type: "waypoint"
       # Lower hover above bolt
       pose: [-0.65, 0.0, 0.32, 1.0, 0.0, 0.0, 0.0]
       duration: 2.0
-      hand_coupling: "position_only"
+      hand_coupling_weights:
+        position_only: 1.0
 
     - name: "insert"
       type: "waypoint"
       # Pre-threading position
       pose: [-0.65, 0.0, 0.29, 1.0, 0.0, 0.0, 0.0]
       duration: 7.0
-      hand_coupling: "position_only"
+      hand_coupling_weights:
+        position_only: 1.0
 
     - name: "thread"
       type: "helical"
@@ -40,14 +43,16 @@ trajectory:
       angular_velocity: 0.628    # Threading angular speed (rad/s)
       translation: [0, 0, -0.005]  # Threading descent (meters)
       duration: 40.0
-      hand_coupling: "position_only"  # Palm descends with nut, wrist orientation fixed
+      hand_coupling_weights:
+        position_only: 1.0  # Palm descends with nut, wrist orientation fixed
       # hand_orientation: null will use orientation from previous segment (hover_low)
 
     - name: "release"
       type: "waypoint"
       pose: [-0.65, 0.0, 0.31, 1.0, 0.0, 0.0, 0.0]              # Object stays at threaded position
       duration: 2.0
-      hand_coupling: "none"   # Hand decouples and retreats
+      hand_coupling_weights:
+        none: 1.0             # Hand decouples and retreats
 
 hand_trajectory:
   enabled: true

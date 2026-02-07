@@ -186,9 +186,9 @@ class BaseSegmentConfig:
     name: str                    # Human-readable identifier
     duration: float              # Seconds for this segment
     type: str = "base"           # Segment type (overridden by children)
-    hand_coupling: str = "full"  # Defaults to "full" - only specify if different
+    hand_coupling_weights: dict[str, float] = field(default_factory=lambda: {"full": 1.0})  # Per-env coupling weights
     hand_orientation: list[float] | None = None  # Optional fixed hand quat [qw,qx,qy,qz] for position_only mode
-    curriculum: dict | None = None  # Optional per-difficulty overrides (e.g., count ranges)
+    curriculum: dict | None = None  # Optional per-difficulty overrides
 
 
 @dataclass
@@ -216,7 +216,6 @@ class RandomWaypointSegmentConfig(BaseSegmentConfig):
     position_range: PositionRangeConfig | None = None
     vary_orientation: bool = False
     max_rotation: float = 0.0
-    hand_coupling_weights: dict[str, float] = field(default_factory=lambda: {"full": 1.0})  # Per-waypoint coupling weights
     type: str = "random_waypoint"
     duration: float = 0.0  # Ignored - computed at reset based on sampled count
 
@@ -598,22 +597,30 @@ def _parse_segments(yaml_segments: list[dict]) -> list[BaseSegmentConfig]:
     for seg_dict in yaml_segments:
         seg_type = seg_dict["type"]
 
+        # Parse hand_coupling_weights (common to all segment types)
+        hcw = seg_dict.get("hand_coupling_weights", {"full": 1.0})
+        valid_modes = {"full", "position_only", "none"}
+        invalid = set(hcw.keys()) - valid_modes
+        if invalid:
+            raise ValueError(
+                f"Invalid hand_coupling_weights keys in segment '{seg_dict['name']}': {invalid}. "
+                f"Valid modes: {sorted(valid_modes)}"
+            )
+
         if seg_type == "waypoint":
-            # Validate fields
-            expected = {"type", "name", "duration", "pose", "hand_coupling", "hand_orientation", "curriculum"}
+            expected = {"type", "name", "duration", "pose", "hand_coupling_weights", "hand_orientation", "curriculum"}
             _validate_segment_fields(seg_dict, expected, "waypoint")
 
             seg = WaypointSegmentConfig(
                 name=seg_dict["name"],
                 duration=seg_dict["duration"],
-                pose=seg_dict.get("pose"),  # Can be null
-                hand_coupling=seg_dict.get("hand_coupling", "full"),  # Has default in dataclass
-                hand_orientation=seg_dict.get("hand_orientation"),  # Optional fixed orientation
+                pose=seg_dict.get("pose"),
+                hand_coupling_weights=hcw,
+                hand_orientation=seg_dict.get("hand_orientation"),
                 curriculum=seg_dict.get("curriculum"),
             )
         elif seg_type == "helical":
-            # Validate fields
-            expected = {"type", "name", "duration", "axis", "angular_velocity", "translation", "hand_coupling", "hand_orientation", "curriculum"}
+            expected = {"type", "name", "duration", "axis", "angular_velocity", "translation", "hand_coupling_weights", "hand_orientation", "curriculum"}
             _validate_segment_fields(seg_dict, expected, "helical")
 
             seg = HelicalSegmentConfig(
@@ -622,12 +629,11 @@ def _parse_segments(yaml_segments: list[dict]) -> list[BaseSegmentConfig]:
                 axis=seg_dict["axis"],
                 angular_velocity=seg_dict["angular_velocity"],
                 translation=seg_dict["translation"],
-                hand_coupling=seg_dict.get("hand_coupling", "full"),  # Has default in dataclass
-                hand_orientation=seg_dict.get("hand_orientation"),  # Optional fixed orientation
+                hand_coupling_weights=hcw,
+                hand_orientation=seg_dict.get("hand_orientation"),
                 curriculum=seg_dict.get("curriculum"),
             )
         elif seg_type == "random_waypoint":
-            # Validate fields
             expected = {"type", "name", "count_weights", "movement_duration", "pause_duration", "position_range",
                        "vary_orientation", "max_rotation", "hand_coupling_weights", "curriculum"}
             _validate_segment_fields(seg_dict, expected, "random_waypoint")
@@ -640,16 +646,6 @@ def _parse_segments(yaml_segments: list[dict]) -> list[BaseSegmentConfig]:
                     x=tuple(pr["x"]) if pr.get("x") else None,
                     y=tuple(pr["y"]) if pr.get("y") else None,
                     z=tuple(pr["z"]) if pr.get("z") else None,
-                )
-
-            # Validate hand_coupling_weights keys
-            hcw = seg_dict["hand_coupling_weights"]
-            valid_modes = {"full", "position_only", "none"}
-            invalid = set(hcw.keys()) - valid_modes
-            if invalid:
-                raise ValueError(
-                    f"Invalid hand_coupling_weights keys in segment '{seg_dict['name']}': {invalid}. "
-                    f"Valid modes: {sorted(valid_modes)}"
                 )
 
             seg = RandomWaypointSegmentConfig(
