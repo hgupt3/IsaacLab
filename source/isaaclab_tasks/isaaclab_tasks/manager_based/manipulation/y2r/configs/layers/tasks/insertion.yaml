@@ -59,7 +59,7 @@ hand_trajectory:
     approach_distance: 0.15
     align_fraction: 0.7
   keypoints:
-    count: [0, 0]               # No keypoints for threading task
+    count_weights: [1.0]        # No keypoints for threading task
 
 # Use push-T config for nut/bolt setup
 push_t:

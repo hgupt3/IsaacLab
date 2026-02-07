@@ -27,7 +27,7 @@ hand_trajectory:
     align_fraction: 1.0                 # Fraction of grasp phase to reach pre-grasp
 
   keypoints:
-    count: [0, 0]                       # No in-hand manipulation keypoints
+    count_weights: [1.0]                # No in-hand manipulation keypoints
 
 trajectory:
   segments:

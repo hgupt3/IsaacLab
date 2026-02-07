@@ -18,7 +18,7 @@ hand_trajectory:
     align_fraction: 0.7      # Fraction of grasp phase to reach pre-grasp
 
   keypoints:
-    count: [0, 0]               # Random number of additional grasp keypoints
+    count_weights: [1.0]        # No additional grasp keypoints
 
 trajectory:
   segments:

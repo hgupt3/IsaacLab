@@ -35,6 +35,7 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from . import mdp
 from .adr_curriculum import build_curriculum_cfg
 from .config_loader import get_config, Y2RConfig
+from .trajectory_manager import TrajectoryManager
 from .mdp.utils import compute_z_offset_from_usd
 from .procedural_shapes import get_procedural_shape_paths
 
@@ -982,19 +983,10 @@ class TrajectoryEnvCfg(ManagerBasedEnvCfg):
         
         # Compute max possible episode duration from segment config
         # Includes random_waypoint expansion (max count * (movement + pause))
-        def _max_count_from_curriculum(base_count: tuple[int, int], curriculum: dict | None) -> int:
-            max_count = int(base_count[1])
-            if isinstance(curriculum, dict):
-                overrides = curriculum.get("count")
-                if isinstance(overrides, dict):
-                    for value in overrides.values():
-                        max_count = max(max_count, int(value[1]))
-            return max_count
-
         max_duration = 0.0
         for seg in cfg.trajectory.segments:
             if getattr(seg, "type", None) == "random_waypoint":
-                max_count = _max_count_from_curriculum(seg.count, seg.curriculum)
+                max_count = TrajectoryManager._get_max_count_for_weights(seg.count_weights, seg.curriculum)
                 max_duration += max_count * (seg.movement_duration + seg.pause_duration)
             else:
                 max_duration += seg.duration

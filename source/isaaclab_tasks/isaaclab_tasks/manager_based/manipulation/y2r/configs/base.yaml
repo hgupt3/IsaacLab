@@ -71,35 +71,18 @@ trajectory:
 
     - name: "explore"
       type: "random_waypoint"
-      count: [0, 1]          # Random waypoints for training variation
-      curriculum:
-        count:
-          7: [0, 2]          # Higher difficulty: more waypoints
-      movement_duration: 3.0  # Per-waypoint duration (seconds)
-      pause_duration: 0.25    # Per-waypoint pause (seconds)
+      count_weights: [0.5, 0.5]  # P(0 waypoints)=50%, P(1 waypoint)=50%
+      movement_duration: 3.0     # Per-waypoint duration (seconds)
+      pause_duration: 0.25       # Per-waypoint pause (seconds)
       position_range:
-        x: null              # null = use workspace bounds
+        x: null                  # null = use workspace bounds
         y: null
         z: null
       vary_orientation: true
-      max_rotation: 1.0      # Max rotation (radians)
-      hand_coupling: "full"
-
-    - name: "explore_position"
-      type: "random_waypoint"
-      count: [0, 0]          # Disabled at low difficulty
-      curriculum:
-        count:
-          5: [0, 1]          # Higher difficulty: add position-only waypoints
-      movement_duration: 3.0  # Per-waypoint duration (seconds)
-      pause_duration: 0.25    # Per-waypoint pause (seconds)
-      position_range:
-        x: null              # null = use workspace bounds
-        y: null
-        z: null
-      vary_orientation: true
-      max_rotation: 1.0      # Max rotation (radians)
-      hand_coupling: "position_only"
+      max_rotation: 1.0          # Max rotation (radians)
+      hand_coupling_weights:     # Per-waypoint random coupling
+        full: 0.5
+        position_only: 0.5
 
     - name: "goal"
       type: "waypoint"
@@ -150,11 +133,7 @@ hand_trajectory:
   # Keypoints are sampled from nearby feasible surface points, ensuring the hand
   # can achieve the pose at each point in the trajectory.
   keypoints:
-    count: [0, 0]               # Disabled at low difficulty
-    curriculum:
-      count:
-        3: [0, 1]               # Higher difficulty: add keypoints
-        9: [0, 2]               # Higher difficulty: add more keypoints
+    count_weights: [0.5, 0.5]      # P(0 keypoints)=50%, P(1 keypoint)=50%
     max_surface_perturbation: 0.04  # Max distance to search for nearby surface points (meters)
     roll_perturbation: 0.3      # Max roll perturbation around approach axis (radians)
     normal_similarity_threshold: -0.05  # Min dot product of normals (prevents flipping to opposite face)
@@ -225,7 +204,7 @@ rewards:
       use_hand_pose_gate: true     # Apply hand pose gate from hand_pose_following
       use_contact_gating: true     # Enable/disable contact gating
       std: 0.03                    # Position/point cloud error std
-      rot_std: 0.3                 # Rotation error std (pose mode only)
+      rot_std: 0.4                 # Rotation error std (pose mode only)
       decay: 0.1                   # Exponential decay for lookahead weights (ignored in path_mode)
       # Soft contact gating: scales tracking reward but never hard-zeros it.
       contact_threshold: 1.0       # Force threshold for contact detection (N)
@@ -249,8 +228,8 @@ rewards:
       pos_threshold: [0.07, 0.04]     # Position/point cloud threshold (meters)
       rot_threshold: [0.7, 0.4]       # Rotation threshold (radians)
       # Dense shaping (fixed, provides gradient toward goal)
-      pos_std: 0.05                   # Exp kernel std for dense shaping (meters)
-      rot_std: 0.5                    # Exp kernel std for dense shaping (radians)
+      pos_std: 0.03                   # Exp kernel std for dense shaping (meters)
+      rot_std: 0.4                    # Exp kernel std for dense shaping (radians)
       sparse_weight: 0.9              # Sparse vs dense weighting
       contact_gate_threshold: 1.0     # Finger force threshold for gate floor (N)
       contact_gate_ramp: 1.0          # Ramp range for gate recovery (N)
@@ -262,7 +241,7 @@ rewards:
       term_keys: ["trajectory_deviation", "hand_pose_deviation", "abnormal_robot"]
     
   arm_table_penalty:
-    weight: -0.3
+    weight: -0.5
     params:
       table_z: 0.255
       threshold_mid: 0.1         # Safe height above table for mid links
@@ -286,7 +265,7 @@ rewards:
       rot_std: 0.2                # Rotation change std (radians)
     
   distal_joint3_penalty:
-    weight: -0.3  
+    weight: -0.5  
     params:
       phases: [grasp, manipulation, release]  # Active in all phases (no phase restriction)
       std: 1.5                    # Larger = more lenient (radians)
@@ -355,7 +334,7 @@ rewards:
   
   # Finger regularizer - penalizes deviation from neutral/default finger pose
   finger_regularizer:
-    weight: -0.3                  # Negative = penalty
+    weight: -0.5                  # Negative = penalty
     params:
       phases: [grasp, release]    # Active in grasp and release phases
       # Default finger joint positions (Allegro hand)
@@ -364,7 +343,7 @@ rewards:
   
   # Object stillness - penalizes object movement during grasp/release
   object_stillness:
-    weight: -0.3                  # Negative = penalty
+    weight: -0.5                  # Negative = penalty
     params:
       phases: [release]    # Active in grasp and release phases
       lin_std: 0.02               # Linear velocity std (m/s)
@@ -376,12 +355,12 @@ rewards:
 # Thresholds use [initial, final] format - curriculum interpolates between
 terminations:
   trajectory_deviation:
-    position_threshold: [0.25, 0.1]      # Spatial error (meters)
-    rotation_threshold: [2.5, 1.2]       # Rotation error (radians)
+    position_threshold: [0.3, 0.1]      # Spatial error (meters)
+    rotation_threshold: [3.0, 1.25]       # Rotation error (radians)
   
   hand_pose_deviation:
     position_threshold: [0.3, 0.1]         # Position threshold (meters)
-    rotation_threshold: [3.14, 2.5]        # Rotation threshold (radians)
+    rotation_threshold: [3.14, 3.14]        # Rotation threshold (radians)
 
 # ==============================================================================
 # CURRICULUM (Adaptive Domain Randomization)
@@ -407,7 +386,7 @@ curriculum:
   # Observation noise curriculum: [initial, final]
   noise:
     joint_pos: [0.0, 0.1]
-    joint_vel: [0.0, 0.2]
+    joint_vel: [0.0, 0.1]
     hand_eigen: [0.0, 0.01]
     hand_tips: [0.0, 0.01]
     object_point_cloud: [0.0, 0.01]
@@ -417,8 +396,8 @@ curriculum:
     target_poses: [0.0, 0.01]
     hand_pose_targets: [0.0, 0.01]
     
-  gate_floor: [0.9, 0.1] # Hand pose gate floor: [initial, final]
-  grasp_scale: [0.9, 0.0] # Grasp phase scaling for lookahead tracking: [initial, final]
+  gate_floor: [0.4, 0.1] # Hand pose gate floor: [initial, final]
+  grasp_scale: [0.4, 0.0] # Grasp phase scaling for lookahead tracking: [initial, final]
     
   # Gravity scheduling (m/s²)
   gravity:
@@ -447,8 +426,8 @@ randomization:
     
   reset:
     table_xy: [0.0, 0.0]     # Table position randomization
-    object_x: [-0.25, 0.25]     # Object X relative to init
-    object_y: [-0.3, 0.3]       # Object Y relative to init
+    object_x: [-0.3, 0.3]     # Object X relative to init
+    object_y: [-0.35, 0.35]       # Object Y relative to init
     object_yaw: [-3.14, 3.14]   # Object yaw rotation
     robot_joints: [-0.5, 0.5]   # Joint position offset
     robot_wrist: [-1.0, 1.0]    # Wrist joint offset (larger range)

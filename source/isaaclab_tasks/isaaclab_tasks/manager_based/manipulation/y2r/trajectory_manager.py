@@ -65,7 +65,7 @@ class TrajectoryManager:
         max_duration = 0.0
         for seg in traj.segments:
             if seg.type == "random_waypoint":
-                max_count = self._get_max_count_from_curriculum(seg.count, seg.curriculum)
+                max_count = self._get_max_count_for_weights(seg.count_weights, seg.curriculum)
                 max_duration += max_count * (seg.movement_duration + seg.pause_duration)
             else:
                 max_duration += seg.duration
@@ -108,8 +108,8 @@ class TrajectoryManager:
         self.grasp_standoff = torch.zeros(num_envs, device=device)
         self.grasp_surface_idx = torch.zeros(num_envs, dtype=torch.long, device=device)
 
-        max_keypoints = self._get_max_count_from_curriculum(
-            hand_cfg.keypoints.count,
+        max_keypoints = self._get_max_count_for_weights(
+            hand_cfg.keypoints.count_weights,
             hand_cfg.keypoints.curriculum,
         )
         self.keypoint_surface_points = torch.zeros(num_envs, max_keypoints, 3, device=device)
@@ -128,7 +128,7 @@ class TrajectoryManager:
         # Segment-based trajectory
         # Max segments after random_waypoint expansion (each becomes movement + pause)
         max_segments_after_expansion = sum(
-            self._get_max_count_from_curriculum(seg.count, seg.curriculum) * 2
+            self._get_max_count_for_weights(seg.count_weights, seg.curriculum) * 2
             if seg.type == "random_waypoint"
             else 1
             for seg in cfg.trajectory.segments
@@ -197,68 +197,102 @@ class TrajectoryManager:
                     scale=1.0,  # Base z_offset at unit scale
                 )
 
+
+    def _resolve_weighted_curriculum(
+        self,
+        base_weights: list[float],
+        overrides: list[tuple[float, list[float]]],
+        difficulties: torch.Tensor | None,
+        n: int,
+    ) -> torch.Tensor:
+        """Resolve per-env weight vectors with curriculum overrides.
+
+        Args:
+            base_weights: Default probability weights (unnormalized).
+            overrides: Sorted list of (difficulty_level, weights_list) curriculum overrides.
+            difficulties: Per-env difficulty levels (n,).
+            n: Number of environments.
+
+        Returns:
+            (n, max_options) float tensor of weights ready for torch.multinomial.
+        """
+        # Pad all weight lists to same length
+        max_len = len(base_weights)
+        for _, w in overrides:
+            max_len = max(max_len, len(w))
+
+        def pad(w: list[float]) -> list[float]:
+            return w + [0.0] * (max_len - len(w))
+
+        weights = torch.tensor(pad(base_weights), device=self.device, dtype=torch.float32).unsqueeze(0).expand(n, -1).clone()
+
+        if overrides and difficulties is not None:
+            diffs = difficulties.to(self.device).float().view(-1)[:n]
+            levels = torch.tensor([lv for lv, _ in overrides], device=self.device, dtype=torch.float32)
+            # For each env, find highest level <= difficulty
+            mask = diffs.unsqueeze(1) >= levels.unsqueeze(0)  # (n, num_levels)
+            idx_range = torch.arange(levels.numel(), device=self.device).unsqueeze(0).expand(n, -1)
+            selected_idx = torch.where(mask, idx_range, torch.full_like(idx_range, -1)).max(dim=1).values
+            has_override = selected_idx >= 0
+            if has_override.any():
+                override_tensor = torch.tensor(
+                    [pad(w) for _, w in overrides], device=self.device, dtype=torch.float32,
+                )
+                weights[has_override] = override_tensor[selected_idx[has_override].clamp(min=0)]
+
+        weights = weights.clamp(min=0)
+        assert (weights.sum(dim=1) > 0).all(), "All-zero weight rows in count_weights/hand_coupling_weights"
+        return weights
+
     @staticmethod
-    def _get_curriculum_count_overrides(curriculum: dict | None) -> list[tuple[float, tuple[int, int]]]:
-        """Return sorted (level, (min,max)) override list from curriculum dict."""
+    def _parse_curriculum_list_overrides(curriculum: dict | None, key: str) -> list[tuple[float, list[float]]]:
+        """Extract sorted (level, weights_list) overrides from curriculum[key] dict."""
         if not isinstance(curriculum, dict):
             return []
-        count_overrides = curriculum.get("count")
-        if not isinstance(count_overrides, dict):
+        raw = curriculum.get(key)
+        if not isinstance(raw, dict):
             return []
-        overrides: list[tuple[float, tuple[int, int]]] = []
-        for level, value in count_overrides.items():
+        overrides: list[tuple[float, list[float]]] = []
+        for level_str, value in raw.items():
             try:
-                level_value = float(level)
+                overrides.append((float(level_str), value))
             except (TypeError, ValueError):
                 continue
-            if value is None:
+        overrides.sort(key=lambda x: x[0])
+        return overrides
+
+    @staticmethod
+    def _parse_curriculum_dict_overrides(
+        curriculum: dict | None, key: str, mode_order: list[str],
+    ) -> list[tuple[float, list[float]]]:
+        """Extract sorted (level, weights_list) from curriculum[key] where values are {mode: weight} dicts."""
+        if not isinstance(curriculum, dict):
+            return []
+        raw = curriculum.get(key)
+        if not isinstance(raw, dict):
+            return []
+        overrides: list[tuple[float, list[float]]] = []
+        for level_str, mode_dict in raw.items():
+            try:
+                level = float(level_str)
+            except (TypeError, ValueError):
                 continue
-            overrides.append((level_value, (int(value[0]), int(value[1]))))
-        return sorted(overrides, key=lambda item: item[0])
+            if isinstance(mode_dict, dict):
+                overrides.append((level, [mode_dict.get(m, 0.0) for m in mode_order]))
+        overrides.sort(key=lambda x: x[0])
+        return overrides
 
-    def _get_max_count_from_curriculum(self, base_count: tuple[int, int], curriculum: dict | None) -> int:
-        """Get worst-case max count across base and curriculum overrides."""
-        max_count = int(base_count[1])
-        for _, override in self._get_curriculum_count_overrides(curriculum):
-            max_count = max(max_count, int(override[1]))
+    @staticmethod
+    def _get_max_count_for_weights(count_weights: list[float], curriculum: dict | None) -> int:
+        """Get worst-case max count from count_weights and curriculum overrides."""
+        max_count = len(count_weights) - 1
+        if isinstance(curriculum, dict):
+            cw_overrides = curriculum.get("count_weights")
+            if isinstance(cw_overrides, dict):
+                for weights in cw_overrides.values():
+                    if isinstance(weights, list):
+                        max_count = max(max_count, len(weights) - 1)
         return max_count
-
-    def _resolve_curriculum_count(
-        self,
-        base_count: tuple[int, int],
-        curriculum: dict | None,
-        difficulties: torch.Tensor | None,
-        num_envs: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Resolve per-env [min,max] count range based on difficulty."""
-        min_default = int(base_count[0])
-        max_default = int(base_count[1])
-        min_counts = torch.full((num_envs,), min_default, device=self.device, dtype=torch.long)
-        max_counts = torch.full((num_envs,), max_default, device=self.device, dtype=torch.long)
-
-        overrides = self._get_curriculum_count_overrides(curriculum)
-        if difficulties is None or not overrides:
-            return min_counts, max_counts
-
-        levels = torch.tensor([item[0] for item in overrides], device=self.device, dtype=torch.float32)
-        override_min = torch.tensor([item[1][0] for item in overrides], device=self.device, dtype=torch.long)
-        override_max = torch.tensor([item[1][1] for item in overrides], device=self.device, dtype=torch.long)
-
-        diffs = difficulties.to(self.device).float().view(-1)
-        if diffs.numel() != num_envs:
-            diffs = diffs[:num_envs]
-
-        mask = diffs.unsqueeze(1) >= levels.unsqueeze(0)
-        idx_range = torch.arange(levels.numel(), device=self.device).unsqueeze(0).expand(num_envs, -1)
-        invalid = torch.full_like(idx_range, -1)
-        selected_idx = torch.where(mask, idx_range, invalid).max(dim=1).values
-        has_override = selected_idx >= 0
-        selected_idx = selected_idx.clamp(min=0)
-
-        min_counts = torch.where(has_override, override_min[selected_idx], min_counts)
-        max_counts = torch.where(has_override, override_max[selected_idx], max_counts)
-
-        return min_counts, max_counts
 
     def _expand_segments(
         self,
@@ -301,16 +335,14 @@ class TrajectoryManager:
         for seg_config in self.cfg.trajectory.segments:
             if seg_config.type == "random_waypoint":
                 # Each waypoint becomes two segments: movement + pause
-                min_counts, max_counts = self._resolve_curriculum_count(
-                    seg_config.count,
-                    seg_config.curriculum,
-                    difficulties,
-                    n,
+                # Sample count per env using weighted probabilities
+                count_overrides = self._parse_curriculum_list_overrides(
+                    seg_config.curriculum, "count_weights",
                 )
-                range_sizes = (max_counts - min_counts + 1).clamp(min=1)
-                num_wp_per_env = min_counts + torch.floor(
-                    torch.rand(n, device=self.device) * range_sizes
-                ).long()
+                count_weights = self._resolve_weighted_curriculum(
+                    seg_config.count_weights, count_overrides, difficulties, n,
+                )
+                num_wp_per_env = torch.multinomial(count_weights, 1).squeeze(1)
 
                 max_wp = num_wp_per_env.max().item()
 
@@ -387,16 +419,23 @@ class TrajectoryManager:
                     # Get global env IDs
                     global_env_idx = env_ids[env_idx_flat]
 
-                    # Coupling mode (same for both movement and pause)
-                    coupling_map = {"full": 0, "position_only": 1, "none": 2}
-                    coupling_value = coupling_map[seg_config.hand_coupling]
+                    # Per-waypoint coupling mode sampled from hand_coupling_weights
+                    mode_order = ["full", "position_only", "none"]
+                    coupling_base = [seg_config.hand_coupling_weights.get(m, 0.0) for m in mode_order]
+                    coupling_overrides = self._parse_curriculum_dict_overrides(
+                        seg_config.curriculum, "hand_coupling_weights", mode_order,
+                    )
+                    coupling_weights = self._resolve_weighted_curriculum(
+                        coupling_base, coupling_overrides, difficulties, n,
+                    )  # (n, 3)
+                    coupling_per_wp = torch.multinomial(coupling_weights, max_wp, replacement=True)  # (n, max_wp)
 
                     # ===== MOVEMENT SEGMENT (interpolates to waypoint) =====
                     # Segment index: base + 2*wp_idx (even indices are movement)
                     move_seg_idx = output_seg_idx[env_idx_flat] + wp_idx_flat * 2
 
                     self.segment_durations[global_env_idx, move_seg_idx] = seg_config.movement_duration
-                    self.coupling_modes[global_env_idx, move_seg_idx] = coupling_value
+                    self.coupling_modes[global_env_idx, move_seg_idx] = coupling_per_wp[env_idx_flat, wp_idx_flat]
                     self.segment_is_helical[global_env_idx, move_seg_idx] = False
                     self.segment_is_grasp[global_env_idx, move_seg_idx] = False
                     self.segment_is_release[global_env_idx, move_seg_idx] = False
@@ -412,7 +451,7 @@ class TrajectoryManager:
                     pause_seg_idx = move_seg_idx + 1
 
                     self.segment_durations[global_env_idx, pause_seg_idx] = seg_config.pause_duration
-                    self.coupling_modes[global_env_idx, pause_seg_idx] = coupling_value
+                    self.coupling_modes[global_env_idx, pause_seg_idx] = coupling_per_wp[env_idx_flat, wp_idx_flat]
                     self.segment_is_helical[global_env_idx, pause_seg_idx] = False
                     self.segment_is_grasp[global_env_idx, pause_seg_idx] = False
                     self.segment_is_release[global_env_idx, pause_seg_idx] = False
@@ -1382,16 +1421,11 @@ class TrajectoryManager:
         cfg = self.cfg.hand_trajectory.keypoints
         max_kp = self.keypoint_surface_points.shape[1]
 
-        min_counts, max_counts = self._resolve_curriculum_count(
-            cfg.count,
-            cfg.curriculum,
-            difficulties,
-            n,
+        count_overrides = self._parse_curriculum_list_overrides(cfg.curriculum, "count_weights")
+        count_weights = self._resolve_weighted_curriculum(
+            cfg.count_weights, count_overrides, difficulties, n,
         )
-        range_sizes = (max_counts - min_counts + 1).clamp(min=1)
-        self.num_grasp_keypoints[env_ids] = min_counts + torch.floor(
-            torch.rand(n, device=self.device) * range_sizes
-        ).long()
+        self.num_grasp_keypoints[env_ids] = torch.multinomial(count_weights, 1).squeeze(1)
 
         if max_kp == 0:
             return
