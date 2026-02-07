@@ -93,14 +93,6 @@ trajectory:
         full: 0.5
         position_only: 0.5
 
-    - name: "settle"
-      type: "waypoint"
-      pose: null              # Computed from goal_poses
-      duration: 0.1
-      hand_coupling_weights:
-        full: 0.5
-        position_only: 0.5
-
     - name: "release"
       type: "waypoint"
       pose: null              # Computed: object stays, hand retreats
@@ -121,7 +113,7 @@ hand_trajectory:
   # Grasp region sampling (surface normal based)
   # Palm approaches from surface normal direction, Z axis (blue) faces object
   grasp_sampling:
-    standoff_range: [0.02, 0.06]  # Palm distance from object surface (meters)
+    standoff_range: [0.01, 0.05]  # Palm distance from object surface (meters)
     exclude_bottom_fraction: 0.4  # Exclude bottom portion of object surface (table side)
     exclude_toward_robot: true    # Flip grasps where fingers point toward robot
     toward_robot_threshold: -0.05   # Reject if finger_dir.x > threshold

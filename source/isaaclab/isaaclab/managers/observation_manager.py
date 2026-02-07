@@ -294,10 +294,13 @@ class ObservationManager(ManagerBase):
     """
 
     def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
+        extras = {}
         # call all terms that are classes
         for group_name, group_cfg in self._group_obs_class_term_cfgs.items():
             for term_cfg in group_cfg:
-                term_cfg.func.reset(env_ids=env_ids)
+                info = term_cfg.func.reset(env_ids=env_ids)
+                if isinstance(info, dict):
+                    extras.update(info)
             # reset terms with history
             for term_name in self._group_obs_term_names[group_name]:
                 if term_name in self._group_obs_term_history_buffer[group_name]:
@@ -306,8 +309,7 @@ class ObservationManager(ManagerBase):
         for mod in self._group_obs_class_instances:
             mod.reset(env_ids=env_ids)
 
-        # nothing to log here
-        return {}
+        return extras
 
     def compute(self, update_history: bool = False) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
         """Compute the observations per group for all groups.

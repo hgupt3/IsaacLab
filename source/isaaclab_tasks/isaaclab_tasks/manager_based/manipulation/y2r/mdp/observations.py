@@ -1010,7 +1010,69 @@ class target_sequence_obs_b(ManagerTermBase):
 
         # Expose render_debug on the env so external scripts (keyboard, etc.) can call it
         env.render_debug = self.render_debug
-    
+
+        # --- Episode metric accumulators ---
+        N = env.num_envs
+        device = env.device
+        self._ep_step_count = torch.zeros(N, device=device)
+        self._ep_pos_error_sum = torch.zeros(N, device=device)
+        self._ep_rot_error_sum = torch.zeros(N, device=device)
+        self._ep_last_pos_error = torch.zeros(N, device=device)
+        self._ep_last_rot_error = torch.zeros(N, device=device)
+        self._ep_last_phase = torch.zeros(N, device=device)
+        self._ep_reached_release = torch.zeros(N, dtype=torch.bool, device=device)
+        self._ep_success_ever = torch.zeros(N, dtype=torch.bool, device=device)
+        self._ep_grasp_contact_steps = torch.zeros(N, device=device)
+        self._ep_grasp_total_steps = torch.zeros(N, device=device)
+
+    def reset(self, env_ids=None):
+        """Compute episode metrics for resetting envs and reset accumulators.
+
+        Called by ObservationManager.reset(). Returns a dict that flows into
+        extras["log"] and gets logged to wandb automatically.
+        """
+        if env_ids is None:
+            env_ids = torch.arange(self.env.num_envs, device=self.env.device)
+
+        metrics = {}
+        if len(env_ids) == 0 or self._ep_step_count.sum() == 0:
+            return metrics
+
+        ids = env_ids
+        mask = self._ep_step_count[ids] > 0
+        if not mask.any():
+            return metrics
+
+        valid = ids[mask]
+        sc = self._ep_step_count[valid].clamp(min=1)
+
+        metrics["Episode_Metric/success_rate"] = self._ep_success_ever[valid].float().mean().item()
+        metrics["Episode_Metric/reached_release"] = self._ep_reached_release[valid].float().mean().item()
+        metrics["Episode_Metric/phase_at_termination"] = self._ep_last_phase[valid].float().mean().item()
+        metrics["Episode_Metric/mean_pos_error"] = (self._ep_pos_error_sum[valid] / sc).mean().item()
+        metrics["Episode_Metric/mean_rot_error"] = (self._ep_rot_error_sum[valid] / sc).mean().item()
+        metrics["Episode_Metric/final_pos_error"] = self._ep_last_pos_error[valid].mean().item()
+        metrics["Episode_Metric/final_rot_error"] = self._ep_last_rot_error[valid].mean().item()
+
+        grasp_total = self._ep_grasp_total_steps[valid].clamp(min=1)
+        metrics["Episode_Metric/grasp_contact_rate"] = (
+            self._ep_grasp_contact_steps[valid] / grasp_total
+        ).mean().item()
+
+        # Reset accumulators for these env_ids
+        self._ep_step_count[ids] = 0
+        self._ep_pos_error_sum[ids] = 0
+        self._ep_rot_error_sum[ids] = 0
+        self._ep_last_pos_error[ids] = 0
+        self._ep_last_rot_error[ids] = 0
+        self._ep_last_phase[ids] = 0
+        self._ep_reached_release[ids] = False
+        self._ep_success_ever[ids] = False
+        self._ep_grasp_contact_steps[ids] = 0
+        self._ep_grasp_total_steps[ids] = 0
+
+        return metrics
+
     def render_debug(self):
         """Draw debug visualizations (pose axes, regions) using current scene state.
 
@@ -1469,9 +1531,57 @@ class target_sequence_obs_b(ManagerTermBase):
         
         # Always compute point cloud observations and cache BOTH error types.
         # Rewards/terminations use aligned errors (path-aware if enabled).
-        return self._compute_observations(
+        obs = self._compute_observations(
             env, N, W, window_targets, object_pos_w, object_quat_w, ref_pos_w, ref_quat_w
         )
+
+        # --- Accumulate episode metrics (uses cached errors from _compute_observations) ---
+        pos_error = env._cached_aligned_pose_errors['pos']  # (N,)
+        rot_error = env._cached_aligned_pose_errors['rot']  # (N,)
+        phase = self.trajectory_manager.get_phase().float()  # (N,) 0=grasp,1=manip,2=release
+
+        self._ep_step_count += 1
+        self._ep_pos_error_sum += pos_error
+        self._ep_rot_error_sum += rot_error
+        self._ep_last_pos_error = pos_error
+        self._ep_last_rot_error = rot_error
+        self._ep_last_phase = phase
+
+        # Track if ever reached release phase
+        self._ep_reached_release |= (phase >= 2)
+
+        # Success detection: object at goal + in release phase
+        cfg = env.cfg.y2r_cfg
+        success_pos_thresh = getattr(cfg, '_ep_metric_pos_thresh', 0.05)
+        success_rot_thresh = getattr(cfg, '_ep_metric_rot_thresh', 0.3)
+        # Check reward config for trajectory_success thresholds
+        if not hasattr(self, '_success_thresholds_cached'):
+            self._success_thresholds_cached = True
+            reward_cfg = getattr(env.cfg, 'rewards', None)
+            if reward_cfg is not None:
+                ts_cfg = getattr(reward_cfg, 'trajectory_success', None)
+                if ts_cfg is not None:
+                    params = getattr(ts_cfg, 'params', {})
+                    success_pos_thresh = params.get('pos_threshold', 0.05)
+                    success_rot_thresh = params.get('rot_threshold', 0.3)
+            self._success_pos_thresh = success_pos_thresh
+            self._success_rot_thresh = success_rot_thresh
+        in_release = (phase >= 2)
+        pos_ok = (pos_error < self._success_pos_thresh)
+        rot_ok = (rot_error < self._success_rot_thresh)
+        self._ep_success_ever |= (in_release & pos_ok & rot_ok)
+
+        # Contact tracking during grasp phase
+        in_grasp = (phase < 1)
+        self._ep_grasp_total_steps += in_grasp.float()
+        try:
+            from .rewards import _contacts_bool
+            good_contact = _contacts_bool(env, 1.0)
+            self._ep_grasp_contact_steps += (in_grasp & good_contact).float()
+        except Exception:
+            pass  # Contact sensors may not be available
+
+        return obs
     
     def _compute_observations(
         self,
