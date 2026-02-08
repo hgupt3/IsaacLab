@@ -584,8 +584,8 @@ def _build_events_cfg(cfg: Y2RConfig):
             mode="reset",
             params={
                 "xy_position_range": {
-                    "x": list(cfg.randomization.reset.object_x),
-                    "y": list(cfg.randomization.reset.object_y),
+                    "x": list(cfg.randomization.reset.object_x) if cfg.randomization.reset.object_x is not None else [cfg.workspace.x[0] + 0.55, cfg.workspace.x[1] + 0.55],
+                    "y": list(cfg.randomization.reset.object_y) if cfg.randomization.reset.object_y is not None else list(cfg.workspace.y),
                     "yaw": list(cfg.randomization.reset.object_yaw),
                 },
                 "table_surface_z": cfg.workspace.table_surface_z,
@@ -656,7 +656,7 @@ def _build_events_cfg(cfg: Y2RConfig):
     return EventCfg()
 
 
-def _build_rewards_cfg(cfg: Y2RConfig):
+def _build_rewards_cfg(cfg: Y2RConfig, terminations_cfg=None):
     """Build RewardsCfg from config."""
     
     @configclass
@@ -762,7 +762,7 @@ def _build_rewards_cfg(cfg: Y2RConfig):
         early_termination = RewTerm(
             func=mdp.is_terminated_term,
             weight=cfg.rewards.early_termination.weight,
-            params={"term_keys": cfg.rewards.early_termination.params["term_keys"]},
+            params={"term_keys": [k for k in cfg.rewards.early_termination.params["term_keys"] if getattr(terminations_cfg, k, None) is not None]},
         )
 
         arm_table_penalty = RewTerm(
@@ -784,6 +784,10 @@ def _build_rewards_cfg(cfg: Y2RConfig):
                 "use_hand_pose_gate": cfg.rewards.finger_manipulation.params.get("use_hand_pose_gate"),
                 "pos_std": cfg.rewards.finger_manipulation.params["pos_std"],
                 "rot_std": cfg.rewards.finger_manipulation.params["rot_std"],
+                "use_contact_gating": cfg.rewards.finger_manipulation.params["use_contact_gating"],
+                "contact_threshold": cfg.rewards.finger_manipulation.params["contact_threshold"],
+                "contact_ramp": cfg.rewards.finger_manipulation.params["contact_ramp"],
+                "contact_min_factor": cfg.rewards.finger_manipulation.params["contact_min_factor"],
                 "robot_cfg": SceneEntityCfg("robot"),
                 "object_cfg": SceneEntityCfg("object"),
             },
@@ -882,7 +886,7 @@ def _build_terminations_cfg(cfg: Y2RConfig):
         abnormal_robot = DoneTerm(
             func=mdp.abnormal_robot_state,
             params={"asset_cfg": SceneEntityCfg("robot")},
-        )
+        ) if cfg.terminations.abnormal_robot.enabled else None
 
         trajectory_deviation = DoneTerm(
             func=mdp.trajectory_deviation,
@@ -961,8 +965,8 @@ class TrajectoryEnvCfg(ManagerBasedEnvCfg):
         # Build managers
         self.observations = _build_observations_cfg(cfg)
         self.events = _build_events_cfg(cfg)
-        self.rewards = _build_rewards_cfg(cfg)
         self.terminations = _build_terminations_cfg(cfg)
+        self.rewards = _build_rewards_cfg(cfg, self.terminations)
         self.curriculum = build_curriculum_cfg(cfg)
         
         # Override object reset for push_t mode (after events is built)
@@ -1099,8 +1103,8 @@ class TrajectoryEnvCfg(ManagerBasedEnvCfg):
             mode="reset",
             params={
                 "pose_range": {
-                    "x": list(cfg.randomization.reset.object_x),
-                    "y": list(cfg.randomization.reset.object_y),
+                    "x": list(cfg.randomization.reset.object_x) if cfg.randomization.reset.object_x is not None else [cfg.workspace.x[0] + 0.55, cfg.workspace.x[1] + 0.55],
+                    "y": list(cfg.randomization.reset.object_y) if cfg.randomization.reset.object_y is not None else list(cfg.workspace.y),
                     "yaw": list(cfg.randomization.reset.object_yaw),
                 },
                 "asset_cfg": SceneEntityCfg("object"),

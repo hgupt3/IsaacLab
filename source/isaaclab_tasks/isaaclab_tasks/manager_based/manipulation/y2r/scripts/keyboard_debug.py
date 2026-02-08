@@ -11,11 +11,16 @@ Allows manual control of the robot arm via keyboard to explore palm orientations
 Uses the full y2r environment with all visualization features.
 
 Controls:
-    WASDQE  - Move palm (X/Y/Z)
-    ZXTGCV  - Rotate palm (roll/pitch/yaw)
-    J/K     - Close/Open gripper (eigengrasp)
-    R       - Reset pose
-    ESC     - Quit
+    WASDQE      - Move palm (X/Y/Z)
+    ZXTGCV      - Rotate palm (roll/pitch/yaw)
+    J/K         - Close/Open selected joint (or eigengrasp)
+    Up/Down     - Cycle through joint modes
+    R           - Reset pose
+    ESC         - Quit
+
+Joint modes (cycle with Up/Down):
+    [0] Eigengrasp  - All fingers via PCA synergy
+    [1..16]         - Individual finger joints
 
 Usage:
     ./isaac_scripts/keyboard.sh
@@ -234,31 +239,48 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Add callback for 'R' key using Se3Keyboard's built-in mechanism
     se3_keyboard.add_callback("R", on_reset_key)
     
+    # Joint mode: 0 = eigengrasp, 1..16 = individual joints
+    # Mode names for display
+    joint_mode_names = ["Eigengrasp"] + hand_joint_names
+    joint_mode = [0]  # Mutable container: 0 = eigengrasp, 1-16 = individual joint index
+    num_modes = len(joint_mode_names)  # 17 total (eigen + 16 joints)
+
+    # Per-joint position offsets (added to default pos for individual joint control)
+    joint_offsets = torch.zeros(16, device=device)
+    joint_speed = 0.02  # rad per frame when key held
+
     # Gripper key states (J = close, K = open) - track press/release for continuous control
-    # Note: Using K for open since L is used for reset in Se3Keyboard
     gripper_delta = [0.0]  # Mutable container for closure access
-    
-    def on_gripper_keyboard_event(event, *args):
-        """Handle J/K keys for continuous gripper control (eigengrasp)."""
+
+    def on_keyboard_event(event, *args):
+        """Handle J/K for joint control and Up/Down for mode cycling."""
         if event.type == carb.input.KeyboardEventType.KEY_PRESS:
             if event.input.name == "J":
-                gripper_delta[0] += eigen_speed  # Close (positive eigen coeff)
+                gripper_delta[0] += 1.0  # Close / positive direction
             elif event.input.name == "K":
-                gripper_delta[0] -= eigen_speed  # Open (negative eigen coeff)
+                gripper_delta[0] -= 1.0  # Open / negative direction
+            elif event.input.name == "UP":
+                joint_mode[0] = (joint_mode[0] + 1) % num_modes
+                mode_name = joint_mode_names[joint_mode[0]]
+                print(f"  >> Joint mode: [{joint_mode[0]}] {mode_name}")
+            elif event.input.name == "DOWN":
+                joint_mode[0] = (joint_mode[0] - 1) % num_modes
+                mode_name = joint_mode_names[joint_mode[0]]
+                print(f"  >> Joint mode: [{joint_mode[0]}] {mode_name}")
         elif event.type == carb.input.KeyboardEventType.KEY_RELEASE:
             if event.input.name == "J":
-                gripper_delta[0] -= eigen_speed  # Stop closing
+                gripper_delta[0] -= 1.0
             elif event.input.name == "K":
-                gripper_delta[0] += eigen_speed  # Stop opening
+                gripper_delta[0] += 1.0
         return True
-    
-    # Subscribe to keyboard events for gripper control
+
+    # Subscribe to keyboard events
     appwindow = omni.appwindow.get_default_app_window()
     kb_input = carb.input.acquire_input_interface()
     keyboard = appwindow.get_keyboard()
     gripper_kb_sub = kb_input.subscribe_to_keyboard_events(
         keyboard,
-        lambda event, *args: on_gripper_keyboard_event(event, *args),
+        lambda event, *args: on_keyboard_event(event, *args),
     )
     
     # Timing for periodic prints
@@ -275,10 +297,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print("  Z/X     - Roll (around X)")
     print("  T/G     - Pitch (around Y)")
     print("  C/V     - Yaw (around Z)")
-    print("  J       - Close gripper (hold)")
-    print("  K       - Open gripper (hold)")
+    print("  J/K     - Close/Open (hold)")
+    print("  Up/Down - Cycle joint mode")
     print("  R       - Reset to default pose")
     print("  ESC     - Quit")
+    print("")
+    print("Joint modes (Up/Down to cycle):")
+    for i, name in enumerate(joint_mode_names):
+        marker = " >>" if i == 0 else "   "
+        print(f"  {marker} [{i:2d}] {name}")
     print("=" * 60 + "\n")
     
     step_count = 0
@@ -309,6 +336,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             target_pos_b = default_pos_b.clone()
             target_quat_b = default_quat_b.clone()
             eigen_coeff.zero_()  # Reset gripper to default
+            joint_offsets.zero_()  # Reset individual joint offsets
             reset_state["pressed"] = False
             print("[INFO] Reset to default pose")
         
@@ -355,15 +383,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # Set arm joint position targets
         robot.set_joint_position_target(arm_target, joint_ids=arm_joint_ids)
         
-        # Update eigengrasp coefficient based on gripper delta
-        eigen_coeff += gripper_delta[0]
-        eigen_coeff.clamp_(eigen_range[0], eigen_range[1])
-        
-        # Compute hand joint targets from eigengrasp
-        # hand_target = default_pos + eigen_coeff * eigen_basis
+        # Update hand targets based on current joint mode
+        mode = joint_mode[0]
         default_hand_pos = robot.data.default_joint_pos[:, hand_joint_ids]  # (1, 16)
-        hand_delta = eigen_coeff * eigen_basis  # (1,) * (16,) = (16,)
-        hand_target = default_hand_pos + hand_delta.unsqueeze(0)  # (1, 16)
+
+        if mode == 0:
+            # Eigengrasp mode: J/K control eigen coefficient
+            eigen_coeff += gripper_delta[0] * eigen_speed
+            eigen_coeff.clamp_(eigen_range[0], eigen_range[1])
+            hand_delta = eigen_coeff * eigen_basis  # (16,)
+            hand_target = default_hand_pos + joint_offsets.unsqueeze(0) + hand_delta.unsqueeze(0)
+        else:
+            # Individual joint mode: J/K control single joint
+            joint_idx = mode - 1  # 0-15
+            joint_offsets[joint_idx] += gripper_delta[0] * joint_speed
+            hand_delta = eigen_coeff * eigen_basis
+            hand_target = default_hand_pos + joint_offsets.unsqueeze(0) + hand_delta.unsqueeze(0)
         
         # Set hand joint position targets
         robot.set_joint_position_target(hand_target, joint_ids=hand_joint_ids)
@@ -380,9 +415,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         current_time = time.time()
         if current_time - last_print_time >= print_interval:
             roll, pitch, yaw = quat_to_euler_deg(palm_quat_w[0])
+            mode = joint_mode[0]
+            mode_name = joint_mode_names[mode]
+            if mode == 0:
+                mode_info = f"Eigen: {eigen_coeff.item():.2f}"
+            else:
+                joint_idx = mode - 1
+                cur_pos = robot.data.joint_pos[0, hand_joint_ids[joint_idx]].item()
+                mode_info = f"{mode_name}: {cur_pos:.3f} rad ({cur_pos*57.296:.1f} deg)"
             print(f"[Step {step_count:6d}] Palm: ({palm_pos_w[0,0]:.3f}, {palm_pos_w[0,1]:.3f}, {palm_pos_w[0,2]:.3f}) | "
-                  f"Euler: ({roll:.1f}, {pitch:.1f}, {yaw:.1f}) | Error: {pos_error*100:.1f}cm | "
-                  f"Grip: {eigen_coeff.item():.2f}")
+                  f"Euler: ({roll:.1f}, {pitch:.1f}, {yaw:.1f}) | [{mode}] {mode_info}")
             last_print_time = current_time
     
     # Cleanup

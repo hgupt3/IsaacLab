@@ -105,6 +105,13 @@ UR5E_LEAP_CFG = ArticulationCfg(
                 "ring_joint_(0|1|2|3)": 0.5,
                 "thumb_joint_(0|1|2|3)": 0.5,
             },
+            velocity_limit_sim={
+                "ur5e_joint_(1|2|3|4|5|6)": 3.14159,
+                "index_joint_(0|1|2|3)": 3.14159,
+                "middle_joint_(0|1|2|3)": 3.14159,
+                "ring_joint_(0|1|2|3)": 3.14159,
+                "thumb_joint_(0|1|2|3)": 3.14159,
+            },
             stiffness={
                 "ur5e_joint_(1|2)": 600.0,
                 "ur5e_joint_3": 300.0,

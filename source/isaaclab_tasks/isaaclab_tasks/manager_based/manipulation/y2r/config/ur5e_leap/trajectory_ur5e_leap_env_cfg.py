@@ -146,10 +146,11 @@ class UR5eLeapTrajectoryMixinCfg:
             "robot", body_names=["ur5e_link_(3|4|5|6)"]
         )
 
-        # Setup contact sensors for fingertips
+        # Setup contact sensors for fingertips (link_3) and mid-phalanx (link_2)
         # USD hierarchy is flat: all bodies are at {ENV_REGEX_NS}/Robot/{link_name}
         finger_tip_body_list = ["index_link_3", "middle_link_3", "ring_link_3", "thumb_link_3"]
-        for link_name in finger_tip_body_list:
+        finger_mid_body_list = ["index_link_2", "middle_link_2", "ring_link_2", "thumb_link_2"]
+        for link_name in finger_tip_body_list + finger_mid_body_list:
             setattr(
                 self.scene,
                 f"{link_name}_object_s",

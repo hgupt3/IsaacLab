@@ -305,8 +305,8 @@
     </visual>
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="0.044" />
-      <inertia ixx="0.000011499" ixy="0.000003049" ixz="0.000000121" iyy="0.000007796" iyz="0.000000112" izz="0.000014759" />
+      <mass value="0.1" />
+      <inertia ixx="0.000026134" ixy="0.000006930" ixz="0.000000275" iyy="0.000017718" iyz="0.000000255" izz="0.000033543" />
     </inertial>
   </link>
   <link name="index_link_1">
@@ -317,15 +317,15 @@
       </geometry>
     </visual>
     <collision>
-      <origin xyz="0.0025 -0.0002 -0.011" rpy="0 0 0" />
+      <origin xyz="0.0075 -0.0002 -0.011" rpy="0 0 0" />
       <geometry>
-        <box size="0.044 0.026 0.022" />
+        <box size="0.034 0.026 0.022" />
       </geometry>
     </collision>
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="0.032" />
-      <inertia ixx="0.000004798" ixy="0.000000012" ixz="0.000000004" iyy="0.000002862" iyz="0.000000011" izz="0.000004234" />
+      <mass value="0.1" />
+      <inertia ixx="0.000014994" ixy="0.000000038" ixz="0.000000013" iyy="0.000008944" iyz="0.000000034" izz="0.000013231" />
     </inertial>
   </link>
   <link name="index_link_2">
@@ -343,27 +343,45 @@
     </collision>
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="0.037" />
-      <inertia ixx="0.000005542" ixy="-0.000000607" ixz="-0.000000017" iyy="0.000005727" iyz="-0.000000023" izz="0.000006682" />
+      <mass value="0.1" />
+      <inertia ixx="0.000014978" ixy="-0.000001641" ixz="-0.000000046" iyy="0.000015478" iyz="-0.000000062" izz="0.000018059" />
     </inertial>
   </link>
   <link name="index_link_3">
     <visual>
       <origin xyz="0.0132 -0.0061 0.0144" rpy="3.1415926 0 0" />
       <geometry>
-        <mesh filename="leap/meshes/visual/fingertip.obj" />
+        <mesh filename="leap/meshes/visual/fingertip_connector.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="-0.0095 -0.017 -0.002" rpy="-1.5708 0 0" />
+      <geometry>
+        <mesh filename="finger_tip.stl" />
       </geometry>
     </visual>
     <collision>
-      <origin xyz="0 -0.030 0.015" rpy="1.5708 0 0" />
+      <origin xyz="0 -0.018 0.0145" rpy="0 0 0" />
       <geometry>
-        <cylinder radius="0.012" length="0.02" />
+        <box size="0.019 0.008 0.033" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="0 -0.031 0.0145" rpy="0 0 0" />
+      <geometry>
+        <box size="0.019 0.018 0.019" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="-0.00445 -0.050 0.0145" rpy="1.5708 0 -0.46" />
+      <geometry>
+        <cylinder radius="0.0075" length="0.024" />
       </geometry>
     </collision>
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="0.016" />
-      <inertia ixx="0.000003368" ixy="0.000000115" ixz="0" iyy="0.000001556" iyz="0" izz="0.000002863" />
+      <mass value="0.06" />
+      <inertia ixx="0.000012630" ixy="0.000000431" ixz="0" iyy="0.000005835" iyz="0" izz="0.000010736" />
     </inertial>
   </link>
   <joint name="index_joint_0" type="revolute">
@@ -407,8 +425,8 @@
     </visual>
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="0.044" />
-      <inertia ixx="0.000011499" ixy="0.000003049" ixz="0.000000121" iyy="0.000007796" iyz="0.000000112" izz="0.000014759" />
+      <mass value="0.1" />
+      <inertia ixx="0.000026134" ixy="0.000006930" ixz="0.000000275" iyy="0.000017718" iyz="0.000000255" izz="0.000033543" />
     </inertial>
   </link>
   <link name="middle_link_1">
@@ -419,15 +437,15 @@
       </geometry>
     </visual>
     <collision>
-      <origin xyz="0.0025 -0.0002 -0.011" rpy="0 0 0" />
+      <origin xyz="0.0075 -0.0002 -0.011" rpy="0 0 0" />
       <geometry>
-        <box size="0.044 0.026 0.022" />
+        <box size="0.034 0.026 0.022" />
       </geometry>
     </collision>
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="0.032" />
-      <inertia ixx="0.000004798" ixy="0.000000012" ixz="0.000000004" iyy="0.000002862" iyz="0.000000011" izz="0.000004234" />
+      <mass value="0.1" />
+      <inertia ixx="0.000014994" ixy="0.000000038" ixz="0.000000013" iyy="0.000008944" iyz="0.000000034" izz="0.000013231" />
     </inertial>
   </link>
   <link name="middle_link_2">
@@ -445,27 +463,45 @@
     </collision>
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="0.037" />
-      <inertia ixx="0.000005542" ixy="-0.000000607" ixz="-0.000000017" iyy="0.000005727" iyz="-0.000000023" izz="0.000006682" />
+      <mass value="0.1" />
+      <inertia ixx="0.000014978" ixy="-0.000001641" ixz="-0.000000046" iyy="0.000015478" iyz="-0.000000062" izz="0.000018059" />
     </inertial>
   </link>
   <link name="middle_link_3">
     <visual>
       <origin xyz="0.0132 -0.0061 0.01450" rpy="3.14159 0 0" />
       <geometry>
-        <mesh filename="leap/meshes/visual/fingertip.obj" />
+        <mesh filename="leap/meshes/visual/fingertip_connector.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="-0.0095 -0.017 -0.002" rpy="-1.5708 0 0" />
+      <geometry>
+        <mesh filename="finger_tip.stl" />
       </geometry>
     </visual>
     <collision>
-      <origin xyz="0 -0.030 0.015" rpy="1.5708 0 0" />
+      <origin xyz="0 -0.018 0.0145" rpy="0 0 0" />
       <geometry>
-        <cylinder radius="0.012" length="0.02" />
+        <box size="0.019 0.008 0.033" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="0 -0.031 0.0145" rpy="0 0 0" />
+      <geometry>
+        <box size="0.019 0.018 0.019" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="-0.00445 -0.050 0.0145" rpy="1.5708 0 -0.46" />
+      <geometry>
+        <cylinder radius="0.0075" length="0.024" />
       </geometry>
     </collision>
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="0.016" />
-      <inertia ixx="0.000003368" ixy="0.000000115" ixz="0" iyy="0.000001556" iyz="0" izz="0.000002863" />
+      <mass value="0.06" />
+      <inertia ixx="0.000012630" ixy="0.000000431" ixz="0" iyy="0.000005835" iyz="0" izz="0.000010736" />
     </inertial>
   </link>
   <joint name="middle_joint_0" type="revolute">
@@ -509,8 +545,8 @@
     </visual>
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="0.044" />
-      <inertia ixx="0.000011499" ixy="0.000003049" ixz="0.000000121" iyy="0.000007796" iyz="0.000000112" izz="0.000014759" />
+      <mass value="0.1" />
+      <inertia ixx="0.000026134" ixy="0.000006930" ixz="0.000000275" iyy="0.000017718" iyz="0.000000255" izz="0.000033543" />
     </inertial>
   </link>
   <link name="ring_link_1">
@@ -521,15 +557,15 @@
       </geometry>
     </visual>
     <collision>
-      <origin xyz="0.0025 -0.0002 -0.011" rpy="0 0 0" />
+      <origin xyz="0.0075 -0.0002 -0.011" rpy="0 0 0" />
       <geometry>
-        <box size="0.044 0.026 0.022" />
+        <box size="0.034 0.026 0.022" />
       </geometry>
     </collision>
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="0.032" />
-      <inertia ixx="0.000004798" ixy="0.000000012" ixz="0.000000004" iyy="0.000002862" iyz="0.000000011" izz="0.000004234" />
+      <mass value="0.1" />
+      <inertia ixx="0.000014994" ixy="0.000000038" ixz="0.000000013" iyy="0.000008944" iyz="0.000000034" izz="0.000013231" />
     </inertial>
   </link>
   <link name="ring_link_2">
@@ -547,27 +583,45 @@
     </collision>
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="0.037" />
-      <inertia ixx="0.000005542" ixy="-0.000000607" ixz="-0.000000017" iyy="0.000005727" iyz="-0.000000023" izz="0.000006682" />
+      <mass value="0.1" />
+      <inertia ixx="0.000014978" ixy="-0.000001641" ixz="-0.000000046" iyy="0.000015478" iyz="-0.000000062" izz="0.000018059" />
     </inertial>
   </link>
   <link name="ring_link_3">
     <visual>
       <origin xyz="0.0132 -0.0061 0.0145" rpy="3.14159 0 0" />
       <geometry>
-        <mesh filename="leap/meshes/visual/fingertip.obj" />
+        <mesh filename="leap/meshes/visual/fingertip_connector.obj" />
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="-0.0095 -0.017 -0.002" rpy="-1.5708 0 0" />
+      <geometry>
+        <mesh filename="finger_tip.stl" />
       </geometry>
     </visual>
     <collision>
-      <origin xyz="0 -0.030 0.015" rpy="1.5708 0 0" />
+      <origin xyz="0 -0.018 0.0145" rpy="0 0 0" />
       <geometry>
-        <cylinder radius="0.012" length="0.02" />
+        <box size="0.019 0.008 0.033" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="0 -0.031 0.0145" rpy="0 0 0" />
+      <geometry>
+        <box size="0.019 0.018 0.019" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="-0.00445 -0.050 0.0145" rpy="1.5708 0 -0.46" />
+      <geometry>
+        <cylinder radius="0.0075" length="0.024" />
       </geometry>
     </collision>
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="0.016" />
-      <inertia ixx="0.000003368" ixy="0.000000115" ixz="0" iyy="0.000001556" iyz="0" izz="0.000002863" />
+      <mass value="0.06" />
+      <inertia ixx="0.000012630" ixy="0.000000431" ixz="0" iyy="0.000005835" iyz="0" izz="0.000010736" />
     </inertial>
   </link>
   <joint name="ring_joint_0" type="revolute">
@@ -611,8 +665,8 @@
     </visual>
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="0.032" />
-      <inertia ixx="0.000004798" ixy="0.000000012" ixz="0.000000004" iyy="0.000002862" iyz="0.000000011" izz="0.000004234" />
+      <mass value="0.1" />
+      <inertia ixx="0.000014994" ixy="0.000000038" ixz="0.000000013" iyy="0.000008944" iyz="0.000000034" izz="0.000013231" />
     </inertial>
   </link>
   <link name="thumb_link_1">
@@ -624,8 +678,8 @@
     </visual>
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="0.003" />
-      <inertia ixx="0.000000593" ixy="0" ixz="0" iyy="0.000000549" iyz="0" izz="0.000000224" />
+      <mass value="0.1" />
+      <inertia ixx="0.000019767" ixy="0" ixz="0" iyy="0.000018300" iyz="0" izz="0.000007467" />
     </inertial>
   </link>
   <link name="thumb_link_2">
@@ -636,40 +690,58 @@
       </geometry>
     </visual>
     <collision>
-      <origin xyz="0 0.0055 -0.014" rpy="0 0 0" />
+      <origin xyz="0 0.0105 -0.014" rpy="0 0 0" />
       <geometry>
-        <box size="0.02 0.05 0.024" />
+        <box size="0.02 0.04 0.024" />
       </geometry>
     </collision>
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="0.038" />
-      <inertia ixx="0.000008474" ixy="0.000000241" ixz="0.000000026" iyy="0.000003841" iyz="0.000000025" izz="0.000007679" />
+      <mass value="0.1" />
+      <inertia ixx="0.000022300" ixy="0.000000634" ixz="0.000000068" iyy="0.000010108" iyz="0.000000066" izz="0.000020208" />
     </inertial>
   </link>
   <link name="thumb_link_3">
     <visual>
       <origin xyz="0.0625 0.0784 0.0489" rpy="0 0 0" />
       <geometry>
-        <mesh filename="leap/meshes/visual/thumb_fingertip.obj" />
+        <mesh filename="leap/meshes/visual/thumb_fingertip_connector.obj" />
       </geometry>
     </visual>
+    <visual>
+      <origin xyz="-0.0095 -0.0295 -0.0305" rpy="-1.5708 0 0" />
+      <geometry>
+        <mesh filename="finger_tip.stl" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 -0.0305 -0.014" rpy="0 0 0" />
+      <geometry>
+        <box size="0.019 0.008 0.033" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="0 -0.0435 -0.014" rpy="0 0 0" />
+      <geometry>
+        <box size="0.019 0.018 0.019" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="-0.00445 -0.0625 -0.014" rpy="1.5708 0 -0.46" />
+      <geometry>
+        <cylinder radius="0.0075" length="0.024" />
+      </geometry>
+    </collision>
     <collision>
       <origin xyz="0 -0.0085 -0.015" rpy="0 0 0" />
       <geometry>
         <box size="0.02 0.036 0.024" />
       </geometry>
     </collision>
-    <collision>
-      <origin xyz="0 -0.042 -0.015" rpy="1.5708 0 0" />
-      <geometry>
-        <cylinder radius="0.012" length="0.02" />
-      </geometry>
-    </collision>
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="0.049" />
-      <inertia ixx="0.000020372" ixy="-0.000000489" ixz="-0.00000003" iyy="0.000004336" iyz="-0.000000097" izz="0.000019845" />
+      <mass value="0.1" />
+      <inertia ixx="0.000041576" ixy="-0.000000998" ixz="-0.000000061" iyy="0.000008849" iyz="-0.000000198" izz="0.000040500" />
     </inertial>
   </link>
   <joint name="thumb_joint_0" type="revolute">

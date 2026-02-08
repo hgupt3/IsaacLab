@@ -353,6 +353,7 @@ class HandPoseDeviationConfig:
 
 @dataclass
 class AbnormalRobotConfig:
+    enabled: bool
     debug: bool
 
 
@@ -436,8 +437,8 @@ class RobotRandomizationConfig:
 @dataclass
 class ResetRandomizationConfig:
     table_xy: tuple[float, float]
-    object_x: tuple[float, float]
-    object_y: tuple[float, float]
+    object_x: tuple[float, float] | None  # null = inherit workspace bounds
+    object_y: tuple[float, float] | None  # null = inherit workspace bounds
     object_yaw: tuple[float, float]
     robot_joints: tuple[float, float]
     robot_wrist: tuple[float, float]

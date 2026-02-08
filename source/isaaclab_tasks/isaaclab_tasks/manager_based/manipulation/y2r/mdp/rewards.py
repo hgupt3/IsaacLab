@@ -106,6 +106,33 @@ def _get_hand_pose_gate(env: ManagerBasedRLEnv) -> torch.Tensor:
     return torch.ones(env.num_envs, device=env.device)
 
 
+def _get_finger_contact_mags(env: ManagerBasedRLEnv):
+    """Cached per-step finger contact magnitudes: max(link_3, link_2) per finger."""
+    step = env.common_step_counter
+    cached = getattr(env, '_cached_finger_mags', None)
+    if cached is not None and cached[0] == step:
+        return cached[1]
+    thumb_mag = torch.maximum(
+        env.scene.sensors["thumb_link_3_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
+        env.scene.sensors["thumb_link_2_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
+    )
+    index_mag = torch.maximum(
+        env.scene.sensors["index_link_3_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
+        env.scene.sensors["index_link_2_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
+    )
+    middle_mag = torch.maximum(
+        env.scene.sensors["middle_link_3_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
+        env.scene.sensors["middle_link_2_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
+    )
+    ring_mag = torch.maximum(
+        env.scene.sensors["ring_link_3_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
+        env.scene.sensors["ring_link_2_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
+    )
+    mags = (thumb_mag, index_mag, middle_mag, ring_mag)
+    env._cached_finger_mags = (step, mags)
+    return mags
+
+
 def _get_finger_release_gate(
     env: ManagerBasedRLEnv,
     threshold: float = 0.5,
@@ -135,11 +162,8 @@ def _get_finger_release_gate(
     """
     
     # Get max finger contact force
-    thumb_mag = env.scene.sensors["thumb_link_3_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1)
-    index_mag = env.scene.sensors["index_link_3_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1)
-    middle_mag = env.scene.sensors["middle_link_3_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1)
-    ring_mag = env.scene.sensors["ring_link_3_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1)
-    
+    thumb_mag, index_mag, middle_mag, ring_mag = _get_finger_contact_mags(env)
+
     max_finger_force = torch.stack([thumb_mag, index_mag, middle_mag, ring_mag], dim=-1).max(dim=-1).values
     
     # INVERTED ramp: high contact = low gate, no contact = high gate
@@ -304,20 +328,7 @@ def _contacts_bool(env: ManagerBasedRLEnv, threshold: float) -> torch.Tensor:
     
     Internal helper that returns boolean tensor.
     """
-    thumb_contact_sensor: ContactSensor = env.scene.sensors["thumb_link_3_object_s"]
-    index_contact_sensor: ContactSensor = env.scene.sensors["index_link_3_object_s"]
-    middle_contact_sensor: ContactSensor = env.scene.sensors["middle_link_3_object_s"]
-    ring_contact_sensor: ContactSensor = env.scene.sensors["ring_link_3_object_s"]
-    # check if contact force is above threshold
-    thumb_contact = thumb_contact_sensor.data.force_matrix_w.view(env.num_envs, 3)
-    index_contact = index_contact_sensor.data.force_matrix_w.view(env.num_envs, 3)
-    middle_contact = middle_contact_sensor.data.force_matrix_w.view(env.num_envs, 3)
-    ring_contact = ring_contact_sensor.data.force_matrix_w.view(env.num_envs, 3)
-
-    thumb_contact_mag = torch.norm(thumb_contact, dim=-1)
-    index_contact_mag = torch.norm(index_contact, dim=-1)
-    middle_contact_mag = torch.norm(middle_contact, dim=-1)
-    ring_contact_mag = torch.norm(ring_contact, dim=-1)
+    thumb_contact_mag, index_contact_mag, middle_contact_mag, ring_contact_mag = _get_finger_contact_mags(env)
     good_contact_cond1 = (thumb_contact_mag > threshold) & (
         (index_contact_mag > threshold) | (middle_contact_mag > threshold) | (ring_contact_mag > threshold)
     )
@@ -381,15 +392,7 @@ def contact_factor(
         raise ValueError(f"ramp must be > 0, got {ramp}.")
     min_factor = float(min(max(min_factor, 0.0), 1.0))
 
-    thumb_contact_sensor: ContactSensor = env.scene.sensors["thumb_link_3_object_s"]
-    index_contact_sensor: ContactSensor = env.scene.sensors["index_link_3_object_s"]
-    middle_contact_sensor: ContactSensor = env.scene.sensors["middle_link_3_object_s"]
-    ring_contact_sensor: ContactSensor = env.scene.sensors["ring_link_3_object_s"]
-
-    thumb_mag = torch.norm(thumb_contact_sensor.data.force_matrix_w.view(env.num_envs, 3), dim=-1)
-    index_mag = torch.norm(index_contact_sensor.data.force_matrix_w.view(env.num_envs, 3), dim=-1)
-    middle_mag = torch.norm(middle_contact_sensor.data.force_matrix_w.view(env.num_envs, 3), dim=-1)
-    ring_mag = torch.norm(ring_contact_sensor.data.force_matrix_w.view(env.num_envs, 3), dim=-1)
+    thumb_mag, index_mag, middle_mag, ring_mag = _get_finger_contact_mags(env)
 
     other_mag = torch.stack([index_mag, middle_mag, ring_mag], dim=-1).max(dim=-1).values
     strength = torch.minimum(thumb_mag, other_mag)
@@ -891,6 +894,10 @@ def finger_manipulation(
     rot_std: float = 0.1,
     phases: list[str] | None = None,
     use_hand_pose_gate: bool = True,
+    use_contact_gating: bool = True,
+    contact_threshold: float = 0.05,
+    contact_ramp: float = 1.0,
+    contact_min_factor: float = 0.05,
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
 ) -> torch.Tensor:
@@ -997,7 +1004,9 @@ def finger_manipulation(
     
     # Gate by error improvement: only reward when tracking is getting better
     reward = torch.where(error_improved, reward, torch.zeros_like(reward))
-    reward = torch.where(_contacts_bool(env, 1.0), reward, torch.zeros_like(reward))
+    if use_contact_gating:
+        cfac = contact_factor(env, threshold=contact_threshold, ramp=contact_ramp, min_factor=contact_min_factor)
+        reward = reward * cfac
     
     # Zero out reward for reset frames
     reward = torch.where(reset_mask, torch.zeros_like(reward), reward)
