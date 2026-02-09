@@ -119,7 +119,7 @@ def _get_finger_contact_mags(env: ManagerBasedRLEnv):
     if cached is not None and cached[0] == step:
         return cached[1]
 
-    nail_gate = env.cfg.y2r_cfg.rewards.nail_contact_gate
+    nail_gate = env.cfg.y2r_cfg.rewards.contact_factor.nail_gate
 
     # Fast path: no gating needed
     if nail_gate >= 1.0:
@@ -392,82 +392,81 @@ def object_ee_distance(
     return reward
 
 
-def _contacts_bool(env: ManagerBasedRLEnv, threshold: float) -> torch.Tensor:
-    """Check if good finger contact is present (thumb + at least one other finger).
-    
-    Internal helper that returns boolean tensor.
-    """
-    thumb_contact_mag, index_contact_mag, middle_contact_mag, ring_contact_mag = _get_finger_contact_mags(env)
-    good_contact_cond1 = (thumb_contact_mag > threshold) & (
-        (index_contact_mag > threshold) | (middle_contact_mag > threshold) | (ring_contact_mag > threshold)
-    )
-    return good_contact_cond1
-
-
-def contacts(
-    env: ManagerBasedRLEnv, 
-    threshold: float, 
+def good_finger_contact(
+    env: ManagerBasedRLEnv,
     phases: list[str] | None = None,
     use_hand_pose_gate: bool = True,
     invert_in_release: bool = False,
 ) -> torch.Tensor:
-    """Reward for good finger contact (thumb + at least one other finger).
-    
-    Returns a gated float reward (0.0 or 1.0 * gate).
-    
+    """Reward for good finger contact using the global contact_factor.
+
+    Returns the cached contact_factor value, optionally inverted during release phase.
+
     Args:
         env: The environment.
-        threshold: Contact force threshold (Newtons).
         phases: List of phases to be active in. None = all phases.
         use_hand_pose_gate: If True, apply hand pose gate from hand_pose_following.
-        invert_in_release: If True, reward NO contact during release (encourages letting go).
+        invert_in_release: If True, reward low contact during release (encourages letting go).
     """
-    good_contact = _contacts_bool(env, threshold)
-    
-    # During release phase, optionally invert (reward no contact instead)
+    cfac = contact_factor(env)
+
+    # During release phase, optionally invert (reward low contact instead)
     if invert_in_release and hasattr(env, 'trajectory_manager') and env.trajectory_manager is not None:
         in_release = env.trajectory_manager.is_in_release_phase()
-        # Invert: reward when NOT in contact during release
-        contact_value = torch.where(in_release, (~good_contact).float(), good_contact.float())
+        reward = torch.where(in_release, 1.0 - cfac, cfac)
     else:
-        contact_value = good_contact.float()
-    
-    reward = contact_value
-    
-    # Apply phase filter and optional hand pose gate
+        reward = cfac
+
     reward = _apply_phase_filter(env, reward, phases)
     reward = _apply_hand_pose_gate(env, reward, use_hand_pose_gate)
     return reward
 
 
-def contact_factor(
-    env: ManagerBasedRLEnv,
-    threshold: float,
-    ramp: float = 1.0,
-    min_factor: float = 0.05,
-) -> torch.Tensor:
-    """Continuous [0, 1] contact factor (soft version of `contacts`).
+def contact_factor(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Cached per-step contact factor with diminishing returns for multi-finger contact.
 
-    Uses thumb + max(other finger) contact magnitudes and converts them into a smooth factor:
+    Reads all parameters from rewards.contact_factor config block.
+    Computes per-finger soft factors (0-1 ramp) and combines with diminishing weights:
 
-        strength = min(|F_thumb|, max(|F_other|))
-        factor   = clamp((strength - threshold) / ramp, 0, 1)
-        factor   = min_factor + (1 - min_factor) * factor
+        thumb_f gates everything (prerequisite for any grasp)
+        other fingers sorted by contact strength, weighted by finger_weights
+        factor = thumb_f * (w0 * best + w1 * second + w2 * third)
 
-    This prevents the reward from collapsing to exactly 0 when contact is weak, which
-    helps recovery behaviors.
+    With weights summing > 1.0, full grasp gets a bonus multiplier.
     """
-    if ramp <= 0.0:
-        raise ValueError(f"ramp must be > 0, got {ramp}.")
-    min_factor = float(min(max(min_factor, 0.0), 1.0))
+    step = env.common_step_counter
+    cached = getattr(env, '_cached_contact_factor', None)
+    if cached is not None and cached[0] == step:
+        return cached[1]
+
+    cf_cfg = env.cfg.y2r_cfg.rewards.contact_factor
+    threshold = cf_cfg.threshold
+    inv_ramp = 1.0 / cf_cfg.ramp
+    min_factor = float(min(max(cf_cfg.min_factor, 0.0), 1.0))
+
+    # Cache weights tensor (created once)
+    w = getattr(env, '_contact_finger_weights_t', None)
+    if w is None:
+        w = torch.tensor(cf_cfg.finger_weights, device=env.device, dtype=torch.float32)
+        env._contact_finger_weights_t = w
 
     thumb_mag, index_mag, middle_mag, ring_mag = _get_finger_contact_mags(env)
 
-    other_mag = torch.stack([index_mag, middle_mag, ring_mag], dim=-1).max(dim=-1).values
-    strength = torch.minimum(thumb_mag, other_mag)
+    # Per-finger soft factor (0-1 each)
+    thumb_f = ((thumb_mag - threshold) * inv_ramp).clamp(0.0, 1.0)
+    other_f = torch.stack([
+        ((index_mag - threshold) * inv_ramp).clamp(0.0, 1.0),
+        ((middle_mag - threshold) * inv_ramp).clamp(0.0, 1.0),
+        ((ring_mag - threshold) * inv_ramp).clamp(0.0, 1.0),
+    ], dim=-1)  # (N, 3)
 
-    factor = ((strength - threshold) / ramp).clamp(0.0, 1.0)
-    return min_factor + (1.0 - min_factor) * factor
+    # Sort descending: best-contacting finger first, then weighted sum
+    other_sorted = other_f.sort(dim=-1, descending=True).values
+    raw_factor = thumb_f * (other_sorted * w).sum(dim=-1)
+
+    result = min_factor + (1.0 - min_factor) * raw_factor
+    env._cached_contact_factor = (step, result)
+    return result
 
 
 def joint_pos_limits_margin(
@@ -526,9 +525,6 @@ def lookahead_tracking(
     phases: list[str] | None = None,
     use_hand_pose_gate: bool = True,
     use_contact_gating: bool = True,
-    contact_threshold: float = 0.05,
-    contact_ramp: float = 1.0,
-    contact_min_factor: float = 0.05,
     rot_std: float = 0.5,
     neg_threshold: float = 0.08,
     neg_std: float = 0.1,
@@ -563,8 +559,7 @@ def lookahead_tracking(
         decay: Exponential decay factor (0-1). Lower = focus on current target. (Ignored in path_mode)
         phases: List of phases to be active in, e.g. ["manipulation"]. None = all phases.
         use_hand_pose_gate: If True, apply hand pose gate from hand_pose_following.
-        use_contact_gating: If True, scale reward by finger contact factor.
-        contact_threshold: Force threshold for contact detection (N).
+        use_contact_gating: If True, multiply reward by global contact_factor.
         rot_std: Standard deviation for rotation exp kernel (pose mode only).
         neg_threshold: Position error threshold above which negative penalty activates (m).
         neg_std: How fast the position penalty grows beyond threshold.
@@ -604,7 +599,7 @@ def lookahead_tracking(
 
             # Soft contact gating (prevents reward collapse when contact is weak)
             if use_contact_gating:
-                cfac = contact_factor(env, threshold=contact_threshold, ramp=contact_ramp, min_factor=contact_min_factor)
+                cfac = contact_factor(env)
                 pos_reward = pos_reward * cfac
 
             # Negative penalty: separate for position and rotation
@@ -626,7 +621,7 @@ def lookahead_tracking(
 
             # Soft contact gating
             if use_contact_gating:
-                cfac = contact_factor(env, threshold=contact_threshold, ramp=contact_ramp, min_factor=contact_min_factor)
+                cfac = contact_factor(env)
                 pos_reward = pos_reward * cfac
 
             # Negative penalty
@@ -658,7 +653,7 @@ def lookahead_tracking(
 
             # Soft contact gating (prevents reward collapse when contact is weak)
             if use_contact_gating:
-                cfac = contact_factor(env, threshold=contact_threshold, ramp=contact_ramp, min_factor=contact_min_factor)
+                cfac = contact_factor(env)
                 pos_reward = pos_reward * cfac
 
             # Negative penalty: separate for position and rotation
@@ -691,7 +686,7 @@ def lookahead_tracking(
 
             # Soft contact gating (prevents reward collapse when contact is weak)
             if use_contact_gating:
-                cfac = contact_factor(env, threshold=contact_threshold, ramp=contact_ramp, min_factor=contact_min_factor)
+                cfac = contact_factor(env)
                 pos_reward = pos_reward * cfac
 
             # Negative penalty: activates when error > neg_threshold
@@ -964,9 +959,6 @@ def finger_manipulation(
     phases: list[str] | None = None,
     use_hand_pose_gate: bool = True,
     use_contact_gating: bool = True,
-    contact_threshold: float = 0.05,
-    contact_ramp: float = 1.0,
-    contact_min_factor: float = 0.05,
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
 ) -> torch.Tensor:
@@ -1074,7 +1066,7 @@ def finger_manipulation(
     # Gate by error improvement: only reward when tracking is getting better
     reward = torch.where(error_improved, reward, torch.zeros_like(reward))
     if use_contact_gating:
-        cfac = contact_factor(env, threshold=contact_threshold, ramp=contact_ramp, min_factor=contact_min_factor)
+        cfac = contact_factor(env)
         reward = reward * cfac
     
     # Zero out reward for reset frames
@@ -1195,7 +1187,6 @@ def distal_joint3_penalty(
     std: float = 1.0,
     joint_name_regex: str = ".*_joint_3",
     only_when_contact: bool = True,
-    contact_threshold: float = 1.0,
     phases: list[str] | None = None,
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
@@ -1204,15 +1195,14 @@ def distal_joint3_penalty(
 
     This targets the posture that tends to produce "nail-side" / folded-in grasps.
     The penalty is bounded using a tanh kernel and can be gated:
-    - by contact (thumb + at least one other finger) and/or
+    - by contact (via global contact_factor) and/or
     - by phase.
 
     Args:
         env: The environment.
         std: Scale (rad) for tanh kernel. Larger = more lenient.
         joint_name_regex: Regex to select distal joints. Defaults to ".*_joint_3".
-        only_when_contact: If True, only apply penalty when grasp contact is present.
-        contact_threshold: Threshold (N) for contact detection used by `contacts()`.
+        only_when_contact: If True, scale penalty by contact_factor.
         phases: List of phases to be active in. None = all phases.
         robot_cfg: Scene entity config for robot.
 
@@ -1245,8 +1235,7 @@ def distal_joint3_penalty(
 
     # Gate by contact if requested
     if only_when_contact:
-        has_contact = _contacts_bool(env, contact_threshold)
-        penalty = torch.where(has_contact, penalty, torch.zeros_like(penalty))
+        penalty = penalty * contact_factor(env)
 
     # Apply phase filter
     penalty = _apply_phase_filter(env, penalty, phases)

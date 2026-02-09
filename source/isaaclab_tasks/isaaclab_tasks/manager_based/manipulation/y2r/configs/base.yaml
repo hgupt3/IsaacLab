@@ -12,7 +12,7 @@
 simulation:
   physics_dt: 0.01              # Physics timestep (seconds)
   decimation: 2                 # Control decimation (steps per action)
-  num_envs: 20480
+  num_envs: 16384
   env_spacing: 3.0
   replicate_physics: false
   solver_position_iteration_count: 16
@@ -179,16 +179,22 @@ goal:
 # Set weight to disable any reward
 # Thresholds use [initial, final] format - curriculum interpolates between
 rewards:
-  nail_contact_gate: 0.1    # Gate factor for nail/back-of-finger contact (0.0 = ignore, 1.0 = no gating)
+  contact_factor:
+    nail_gate: 0.1                        # Nail/back-of-finger gating (0.0 = ignore, 1.0 = no gating)
+    finger_weights: [0.75, 0.25, 0.125]   # Diminishing weights for [1st, 2nd, 3rd] best non-thumb finger
+    threshold: 0.5                         # Force threshold below which finger factor is 0 (N)
+    ramp: 1.5                              # Range over which factor ramps 0→1 (N)
+    min_factor: 0.0                       # Floor so factor never fully zeroes
+
   action_l2:
     weight: -0.005
     params:
-      finger_scale: 0.1
+      finger_scale: 0.15
     
   action_rate_l2:
     weight: -0.005
     params:
-      finger_scale: 0.1    
+      finger_scale: 0.15
     
   fingers_to_object:
     weight: 1.5
@@ -206,14 +212,10 @@ rewards:
     params:
       phases: [grasp, manipulation]      # Active in grasp and manipulation phases
       use_hand_pose_gate: true     # Apply hand pose gate from hand_pose_following
-      use_contact_gating: true     # Enable/disable contact gating
+      use_contact_gating: true     # Multiply by global contact_factor
       std: 0.03                    # Position/point cloud error std
       rot_std: 0.4                 # Rotation error std (pose mode only)
       decay: 0.1                   # Exponential decay for lookahead weights (ignored in path_mode)
-      # Soft contact gating: scales tracking reward but never hard-zeros it.
-      contact_threshold: 1.0       # Force threshold for contact detection (N)
-      contact_ramp: 1.0            # Ramp range for contact factor (N)
-      contact_min_factor: 0.05     # Lower bound so reward doesn't fully collapse
       # Negative penalty zones (activates when error > threshold):
       neg_scale: 0.1               # Max penalty magnitude
       neg_threshold: 0.04          # Position error threshold (meters)
@@ -227,8 +229,7 @@ rewards:
       phases: [release]               # Active only in release phase
       use_hand_pose_gate: true        # Apply hand pose gate from hand_pose_following
       use_finger_release_gate: true   # Gate sparse bonus by finger release
-      # Sparse binary thresholds [initial (lenient), final (strict)]
-      # Both pos AND rot must be within threshold for sparse bonus
+      # Sparse binary thresholds [initial (lenient), final (strict)
       pos_threshold: [0.07, 0.04]     # Position/point cloud threshold (meters)
       rot_threshold: [0.7, 0.4]       # Rotation threshold (radians)
       # Dense shaping (fixed, provides gradient toward goal)
@@ -240,7 +241,7 @@ rewards:
       contact_gate_floor: 0.05        # Minimum gate when fingers touching
     
   early_termination:
-    weight: -50.0
+    weight: -100.0
     params:
       term_keys: ["trajectory_deviation", "hand_pose_deviation", "abnormal_robot"]
     
@@ -255,31 +256,26 @@ rewards:
   good_finger_contact:
     weight: 1.0
     params:
-      phases: [manipulation, release]  # Active in all phases
-      use_hand_pose_gate: true         # Apply hand pose gate from hand_pose_following
+      phases: [manipulation, release]
+      use_hand_pose_gate: true
       invert_in_release: true          # Invert reward in release (reward NO contact)
-      threshold: 1.0                   # Contact force threshold (N)
     
   finger_manipulation:
     weight: 5.0
     params:
       phases: [manipulation, release]    # Active in grasp and manipulation phases
       use_hand_pose_gate: true         # Apply hand pose gate from hand_pose_following
-      pos_std: 0.02               # Position change std (meters)
-      rot_std: 0.2                # Rotation change std (radians)
-      use_contact_gating: true         # Soft contact gating (vs old hard 1N gate)
-      contact_threshold: 0.2         # Force threshold for contact detection (N)
-      contact_ramp: 0.8               # Range over which factor ramps 0→1 (N)
-      contact_min_factor: 0.0        # Floor factor when no contact (prevents zero reward)
+      pos_std: 0.015               # Position change std (meters)
+      rot_std: 0.15                # Rotation change std (radians)
+      use_contact_gating: true         # Multiply by global contact_factor
     
   distal_joint3_penalty:
-    weight: -0.3  
+    weight: 0.0
     params:
       phases: [grasp, manipulation, release]  # Active in all phases (no phase restriction)
       std: 1.5                    # Larger = more lenient (radians)
       joint_name_regex: ".*_joint_3"
       only_when_contact: false
-      contact_threshold: 1.0     # Contact force threshold (N)
     
   palm_velocity_penalty:
     weight: 0.0
@@ -342,16 +338,16 @@ rewards:
   
   # Finger regularizer - penalizes deviation from neutral/default finger pose
   finger_regularizer:
-    weight: -1.0                  # Negative = penalty
+    weight: -0.5                  # Negative = penalty
     params:
       phases: [grasp, release]    # Active in grasp and release phases
       # Default finger joint positions (Allegro hand)
       default_joints: [0.0315, 0.0764, 0.0196, 0.2944, -0.0010, 0.1109, 0.0309, 0.2541, -0.0067, 0.1260, 0.0697, 0.2933, 1.5165, -0.2420, 0.3112, 0.3816]
-      std: 1.0                    # Penalty growth with deviation (radians)
+      std: 0.5                    # Penalty growth with deviation (radians)
   
   # Object stillness - penalizes object movement during grasp/release
   object_stillness:
-    weight: -0.5                  # Negative = penalty
+    weight: -0.3                  # Negative = penalty
     params:
       phases: [release]    # Active in grasp and release phases
       lin_std: 0.02               # Linear velocity std (m/s)
@@ -385,7 +381,7 @@ curriculum:
     
   # Step-based scheduler (set step_interval to null to disable)
   scheduler: 
-    step_interval: 80000        # Floor increases at this interval
+    step_interval: 100000        # Floor increases at this interval
     use_performance: true       # Performance can still advance faster than floor
     
   # Tolerances to advance difficulty level

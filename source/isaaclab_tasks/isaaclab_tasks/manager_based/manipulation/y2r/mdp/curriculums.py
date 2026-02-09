@@ -13,7 +13,6 @@ from isaaclab.envs import mdp
 from isaaclab.managers import ManagerTermBase
 from isaaclab.utils.math import quat_error_magnitude, quat_apply
 
-from .rewards import contacts as y2r_contacts
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv

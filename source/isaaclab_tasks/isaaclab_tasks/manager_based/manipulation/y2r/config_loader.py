@@ -321,8 +321,17 @@ class RewardConfig:
 
 
 @dataclass
+class ContactFactorConfig:
+    nail_gate: float
+    finger_weights: list[float]
+    threshold: float
+    ramp: float
+    min_factor: float
+
+
+@dataclass
 class RewardsConfig:
-    nail_contact_gate: float
+    contact_factor: ContactFactorConfig
     action_l2: RewardConfig
     action_rate_l2: RewardConfig
     fingers_to_object: RewardConfig

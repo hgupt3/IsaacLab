@@ -81,13 +81,12 @@ def _build_eigen_grasp_action_cfg(cfg: Y2RConfig):
 def _build_kuka_allegro_rewards_cfg(cfg: Y2RConfig, base_rewards):
     """Add Kuka Allegro specific rewards to base rewards."""
     base_rewards.good_finger_contact = RewTerm(
-        func=mdp.contacts,
+        func=mdp.good_finger_contact,
         weight=cfg.rewards.good_finger_contact.weight,
         params={
             "phases": cfg.rewards.good_finger_contact.params.get("phases"),
             "use_hand_pose_gate": cfg.rewards.good_finger_contact.params.get("use_hand_pose_gate"),
             "invert_in_release": cfg.rewards.good_finger_contact.params.get("invert_in_release"),
-            "threshold": cfg.rewards.good_finger_contact.params["threshold"],
         },
     )
     base_rewards.distal_joint3_penalty = RewTerm(
@@ -98,7 +97,6 @@ def _build_kuka_allegro_rewards_cfg(cfg: Y2RConfig, base_rewards):
             "std": cfg.rewards.distal_joint3_penalty.params["std"],
             "joint_name_regex": cfg.rewards.distal_joint3_penalty.params["joint_name_regex"],
             "only_when_contact": cfg.rewards.distal_joint3_penalty.params["only_when_contact"],
-            "contact_threshold": cfg.rewards.distal_joint3_penalty.params["contact_threshold"],
         },
     )
     return base_rewards

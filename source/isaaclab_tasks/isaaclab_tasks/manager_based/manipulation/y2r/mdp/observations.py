@@ -1217,7 +1217,7 @@ class target_sequence_obs_b(ManagerTermBase):
         # Expose render_debug on the env so external scripts (keyboard, etc.) can call it
         env.render_debug = self.render_debug
 
-        # --- Episode metric accumulators ---
+        # --- Episode metric accumulators (current episode, reset each episode) ---
         N = env.num_envs
         device = env.device
         self._ep_step_count = torch.zeros(N, device=device)
@@ -1231,51 +1231,73 @@ class target_sequence_obs_b(ManagerTermBase):
         self._ep_grasp_contact_steps = torch.zeros(N, device=device)
         self._ep_grasp_total_steps = torch.zeros(N, device=device)
 
+        # --- Last-episode snapshots (one per env, mean over all envs for logging) ---
+        # Same approach as termination_manager._last_episode_dones:
+        # updated at reset, reported as global mean for consistent denominators.
+        self._last_success = torch.zeros(N, dtype=torch.bool, device=device)
+        self._last_reached_release = torch.zeros(N, dtype=torch.bool, device=device)
+        self._last_phase = torch.zeros(N, device=device)
+        self._last_mean_pos_error = torch.zeros(N, device=device)
+        self._last_mean_rot_error = torch.zeros(N, device=device)
+        self._last_final_pos_error = torch.zeros(N, device=device)
+        self._last_final_rot_error = torch.zeros(N, device=device)
+        self._last_grasp_contact_rate = torch.zeros(N, device=device)
+
     def reset(self, env_ids=None):
         """Compute episode metrics for resetting envs and reset accumulators.
 
         Called by ObservationManager.reset(). Returns a dict that flows into
         extras["log"] and gets logged to wandb automatically.
+
+        Uses the same approach as TerminationManager._last_episode_dones:
+        snapshot per-env metrics at reset, report mean over ALL envs so the
+        denominator is consistent with Episode_Termination/* stats.
         """
         if env_ids is None:
             env_ids = torch.arange(self.env.num_envs, device=self.env.device)
 
-        metrics = {}
-        if len(env_ids) == 0 or self._ep_step_count.sum() == 0:
-            return metrics
-
         ids = env_ids
-        mask = self._ep_step_count[ids] > 0
-        if not mask.any():
-            return metrics
+        if len(ids) > 0:
+            mask = self._ep_step_count[ids] > 0
+            if mask.any():
+                valid = ids[mask]
+                sc = self._ep_step_count[valid].clamp(min=1)
 
-        valid = ids[mask]
-        sc = self._ep_step_count[valid].clamp(min=1)
+                # Snapshot finished-episode metrics into last-episode buffers
+                self._last_success[valid] = self._ep_success_ever[valid]
+                self._last_reached_release[valid] = self._ep_reached_release[valid]
+                self._last_phase[valid] = self._ep_last_phase[valid]
+                self._last_mean_pos_error[valid] = self._ep_pos_error_sum[valid] / sc
+                self._last_mean_rot_error[valid] = self._ep_rot_error_sum[valid] / sc
+                self._last_final_pos_error[valid] = self._ep_last_pos_error[valid]
+                self._last_final_rot_error[valid] = self._ep_last_rot_error[valid]
+                grasp_total = self._ep_grasp_total_steps[valid].clamp(min=1)
+                self._last_grasp_contact_rate[valid] = (
+                    self._ep_grasp_contact_steps[valid] / grasp_total
+                )
 
-        metrics["Episode_Metric/success_rate"] = self._ep_success_ever[valid].float().mean().item()
-        metrics["Episode_Metric/reached_release"] = self._ep_reached_release[valid].float().mean().item()
-        metrics["Episode_Metric/phase_at_termination"] = self._ep_last_phase[valid].float().mean().item()
-        metrics["Episode_Metric/mean_pos_error"] = (self._ep_pos_error_sum[valid] / sc).mean().item()
-        metrics["Episode_Metric/mean_rot_error"] = (self._ep_rot_error_sum[valid] / sc).mean().item()
-        metrics["Episode_Metric/final_pos_error"] = self._ep_last_pos_error[valid].mean().item()
-        metrics["Episode_Metric/final_rot_error"] = self._ep_last_rot_error[valid].mean().item()
+            # Reset accumulators for these env_ids
+            self._ep_step_count[ids] = 0
+            self._ep_pos_error_sum[ids] = 0
+            self._ep_rot_error_sum[ids] = 0
+            self._ep_last_pos_error[ids] = 0
+            self._ep_last_rot_error[ids] = 0
+            self._ep_last_phase[ids] = 0
+            self._ep_reached_release[ids] = False
+            self._ep_success_ever[ids] = False
+            self._ep_grasp_contact_steps[ids] = 0
+            self._ep_grasp_total_steps[ids] = 0
 
-        grasp_total = self._ep_grasp_total_steps[valid].clamp(min=1)
-        metrics["Episode_Metric/grasp_contact_rate"] = (
-            self._ep_grasp_contact_steps[valid] / grasp_total
-        ).mean().item()
-
-        # Reset accumulators for these env_ids
-        self._ep_step_count[ids] = 0
-        self._ep_pos_error_sum[ids] = 0
-        self._ep_rot_error_sum[ids] = 0
-        self._ep_last_pos_error[ids] = 0
-        self._ep_last_rot_error[ids] = 0
-        self._ep_last_phase[ids] = 0
-        self._ep_reached_release[ids] = False
-        self._ep_success_ever[ids] = False
-        self._ep_grasp_contact_steps[ids] = 0
-        self._ep_grasp_total_steps[ids] = 0
+        # Report global mean over all envs (like Episode_Termination/*)
+        metrics = {}
+        metrics["Episode_Metric/success_rate"] = self._last_success.float().mean().item()
+        metrics["Episode_Metric/reached_release"] = self._last_reached_release.float().mean().item()
+        metrics["Episode_Metric/phase_at_termination"] = self._last_phase.mean().item()
+        metrics["Episode_Metric/mean_pos_error"] = self._last_mean_pos_error.mean().item()
+        metrics["Episode_Metric/mean_rot_error"] = self._last_mean_rot_error.mean().item()
+        metrics["Episode_Metric/final_pos_error"] = self._last_final_pos_error.mean().item()
+        metrics["Episode_Metric/final_rot_error"] = self._last_final_rot_error.mean().item()
+        metrics["Episode_Metric/grasp_contact_rate"] = self._last_grasp_contact_rate.mean().item()
 
         return metrics
 
@@ -1834,9 +1856,9 @@ class target_sequence_obs_b(ManagerTermBase):
         in_grasp = (phase < 1)
         self._ep_grasp_total_steps += in_grasp.float()
         try:
-            from .rewards import _contacts_bool
-            good_contact = _contacts_bool(env, 1.0)
-            self._ep_grasp_contact_steps += (in_grasp & good_contact).float()
+            from .rewards import contact_factor
+            cfac = contact_factor(env)
+            self._ep_grasp_contact_steps += (in_grasp.float() * cfac)
         except Exception:
             pass  # Contact sensors may not be available
 

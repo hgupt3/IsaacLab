@@ -68,6 +68,7 @@ import math
 import os
 import random
 import subprocess
+import torch
 from datetime import datetime
 from pathlib import Path
 
@@ -279,6 +280,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner = Runner(MultiObserver([IsaacAlgoObserver(), Y2RCheckpointObserver()]))
 
     runner.load(agent_cfg)
+
+    # monkey-patch: fused Adam + FP32 upcast before RunningMeanStd
+    _orig_create = runner.algo_factory.create
+    def _create_with_patches(*args, **kwargs):
+        agent = _orig_create(*args, **kwargs)
+        # fused optimizer (single CUDA kernel per param update)
+        if hasattr(agent, 'optimizer'):
+            agent.optimizer = torch.optim.Adam(agent.optimizer.param_groups, foreach=True)
+        # upcast FP16 obs to FP32 before RunningMeanStd for stable normalization statistics
+        _orig_preproc = agent._preproc_obs
+        def _preproc_obs_f32(obs_batch):
+            obs_batch = _orig_preproc(obs_batch)
+            if isinstance(obs_batch, torch.Tensor) and obs_batch.dtype == torch.float16:
+                obs_batch = obs_batch.float()
+            elif isinstance(obs_batch, dict):
+                obs_batch = {k: v.float() if v.dtype == torch.float16 else v for k, v in obs_batch.items()}
+            return obs_batch
+        agent._preproc_obs = _preproc_obs_f32
+        return agent
+    runner.algo_factory.create = _create_with_patches
 
     # reset the agent and env
     runner.reset()
