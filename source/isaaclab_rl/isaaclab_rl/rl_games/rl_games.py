@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import gym.spaces  # needed for rl-games incompatibility: https://github.com/Denys88/rl_games/issues/261
 import gymnasium
+import numpy as np
 import torch
 from collections.abc import Callable
 
@@ -91,6 +92,7 @@ class RlGamesVecEnvWrapper(IVecEnv):
         clip_actions: float,
         obs_groups: dict[str, list[str]] | None = None,
         concate_obs_group: bool = True,
+        half_precision_obs: bool = False,
     ):
         """Initializes the wrapper instance.
 
@@ -102,6 +104,8 @@ class RlGamesVecEnvWrapper(IVecEnv):
             obs_groups: The remapping from isaaclab observation to rl-games, default to None for backward compatible.
             concate_obs_group: The boolean value indicates if input to rl-games network is dict or tensor. Default to
                 True for backward compatible.
+            half_precision_obs: Store observations in FP16 to halve rollout buffer memory. Should be enabled
+                when mixed_precision training is active since autocast will upcast as needed.
 
         Raises:
             ValueError: The environment is not inherited from :class:`ManagerBasedRLEnv` or :class:`DirectRLEnv`.
@@ -120,6 +124,7 @@ class RlGamesVecEnvWrapper(IVecEnv):
         self._clip_obs = clip_obs
         self._clip_actions = clip_actions
         self._sim_device = env.unwrapped.device
+        self._half_precision_obs = half_precision_obs
 
         # resolve the observation group
         self._concate_obs_groups = concate_obs_group
@@ -180,13 +185,14 @@ class RlGamesVecEnvWrapper(IVecEnv):
         # note: rl-games only wants single observation space
         space = self.unwrapped.single_observation_space
         clip = self._clip_obs
+        dtype = np.float16 if self._half_precision_obs else np.float32
         if not self._concate_obs_groups:
-            policy_space = {grp: gym.spaces.Box(-clip, clip, space.get(grp).shape) for grp in self._obs_groups["obs"]}
+            policy_space = {grp: gym.spaces.Box(-clip, clip, space.get(grp).shape, dtype=dtype) for grp in self._obs_groups["obs"]}
             return gym.spaces.Dict(policy_space)
         else:
             shapes = [space.get(group).shape for group in self._obs_groups["obs"]]
             cat_shape, self._obs_concat_fn = make_concat_plan(shapes)
-            return gym.spaces.Box(-clip, clip, cat_shape)
+            return gym.spaces.Box(-clip, clip, cat_shape, dtype=dtype)
 
     @property
     def action_space(self) -> gym.Space:
@@ -237,13 +243,14 @@ class RlGamesVecEnvWrapper(IVecEnv):
         # # note: rl-games only wants single observation space
         space = self.unwrapped.single_observation_space
         clip = self._clip_obs
+        dtype = np.float16 if self._half_precision_obs else np.float32
         if not self._concate_obs_groups:
-            state_space = {grp: gym.spaces.Box(-clip, clip, space.get(grp).shape) for grp in self._obs_groups["states"]}
+            state_space = {grp: gym.spaces.Box(-clip, clip, space.get(grp).shape, dtype=dtype) for grp in self._obs_groups["states"]}
             return gym.spaces.Dict(state_space)
         else:
             shapes = [space.get(group).shape for group in self._obs_groups["states"]]
             cat_shape, self._states_concat_fn = make_concat_plan(shapes)
-            return gym.spaces.Box(-self._clip_obs, self._clip_obs, cat_shape)
+            return gym.spaces.Box(-self._clip_obs, self._clip_obs, cat_shape, dtype=dtype)
 
     def get_number_of_agents(self) -> int:
         """Returns number of actors in the environment."""
@@ -332,6 +339,20 @@ class RlGamesVecEnvWrapper(IVecEnv):
             rl_games_obs["obs"] = self._obs_concat_fn(list(rl_games_obs["obs"].values()))
             if "states" in rl_games_obs:
                 rl_games_obs["states"] = self._states_concat_fn(list(rl_games_obs["states"].values()))
+
+        # cast to FP16 to halve rollout buffer memory (autocast upcasts as needed during forward pass)
+        if self._half_precision_obs:
+            obs = rl_games_obs["obs"]
+            if isinstance(obs, torch.Tensor):
+                rl_games_obs["obs"] = obs.half()
+            else:
+                rl_games_obs["obs"] = {k: v.half() for k, v in obs.items()}
+            if "states" in rl_games_obs:
+                states = rl_games_obs["states"]
+                if isinstance(states, torch.Tensor):
+                    rl_games_obs["states"] = states.half()
+                else:
+                    rl_games_obs["states"] = {k: v.half() for k, v in states.items()}
 
         return rl_games_obs
 

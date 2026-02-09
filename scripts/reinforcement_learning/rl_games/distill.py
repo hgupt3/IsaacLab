@@ -251,7 +251,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     clip_actions = agent_cfg["params"]["env"].get("clip_actions", math.inf)
     obs_groups = agent_cfg["params"]["env"].get("obs_groups")
     concate_obs_groups = agent_cfg["params"]["env"].get("concate_obs_groups", True)
-    
+    half_precision_obs = agent_cfg["params"]["config"].get("mixed_precision", False)
+
     # Set log directory for environment
     if isinstance(env_cfg, ManagerBasedRLEnvCfg):
         env_cfg.log_dir = os.path.join(log_root_path, log_dir)
@@ -274,7 +275,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
     
     # Wrap for RL-Games (depth is packed into obs, no special wrapper needed)
-    env = RlGamesVecEnvWrapper(env, rl_device, clip_obs, clip_actions, obs_groups, concate_obs_groups)
+    env = RlGamesVecEnvWrapper(env, rl_device, clip_obs, clip_actions, obs_groups, concate_obs_groups, half_precision_obs)
     
     # Register environment
     vecenv.register(

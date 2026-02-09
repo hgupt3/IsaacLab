@@ -292,6 +292,8 @@ def _build_observations_cfg(cfg: Y2RConfig):
             },
         )
         contact: ObsTerm = MISSING
+        link_2_contact: ObsTerm = MISSING
+        object_pose_palm: ObsTerm = MISSING
 
         def __post_init__(self):
             self.enable_corruption = True
@@ -368,6 +370,12 @@ def _build_observations_cfg(cfg: Y2RConfig):
         timing = ObsTerm(
             func=mdp.trajectory_timing,
         )
+        hand_pose_error = ObsTerm(
+            func=mdp.hand_pose_error_palm,
+        )
+        object_pose_error = ObsTerm(
+            func=mdp.object_pose_error,
+        )
 
         def __post_init__(self):
             self.enable_corruption = True
@@ -391,7 +399,7 @@ def _build_observations_cfg(cfg: Y2RConfig):
             self.concatenate_dim = 0
             self.concatenate_terms = True
             self.flatten_history_dim = True
-            self.history_length = cfg.observations.history.poses
+            self.history_length = cfg.observations.history.student_poses
 
     @configclass
     class FuturePosesStudentCfg(ObsGroup):
@@ -403,13 +411,40 @@ def _build_observations_cfg(cfg: Y2RConfig):
         timing = ObsTerm(
             func=mdp.trajectory_timing,
         )
+        hand_pose_error = ObsTerm(
+            func=mdp.hand_pose_error_palm,
+        )
 
         def __post_init__(self):
             self.enable_corruption = True
             self.concatenate_dim = 0
             self.concatenate_terms = True
             self.flatten_history_dim = True
-            self.history_length = cfg.observations.history.targets
+            self.history_length = cfg.observations.history.student_future_poses
+
+    @configclass
+    class StudentProprioObsCfg(ObsGroup):
+        """Student proprioception: joint_pos, joint_vel, hand_eigen only.
+
+        No hand_tips_state, no contacts, no object_pose_palm (all privileged).
+        """
+        joint_pos = ObsTerm(func=mdp.joint_pos, noise=Unoise(n_min=-0.0, n_max=0.0))
+        joint_vel = ObsTerm(func=mdp.joint_vel, noise=Unoise(n_min=-0.0, n_max=0.0))
+        hand_eigen = ObsTerm(
+            func=mdp.allegro_hand_eigen_b,
+            noise=Unoise(n_min=-0.0, n_max=0.0),
+            params={
+                "arm_joint_count": cfg.robot.arm_joint_count,
+                "hand_joint_count": cfg.robot.hand_joint_count,
+                "eigen_dim": cfg.robot.eigen_dim,
+                "use_default_delta": True,
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+            self.history_length = cfg.observations.history.student_proprio
 
     @configclass
     class StudentCurrentPCObsCfg(ObsGroup):
@@ -473,6 +508,7 @@ def _build_observations_cfg(cfg: Y2RConfig):
         future_poses: FuturePosesTeacherCfg = FuturePosesTeacherCfg()
 
         # Student groups (only when student mode enabled)
+        student_proprio: StudentProprioObsCfg | None = None
         student_current_pc: StudentCurrentPCObsCfg | None = None
         student_current_poses: CurrentPosesStudentCfg | None = None
         student_future_pc: StudentFuturePCObsCfg | None = None
@@ -483,6 +519,7 @@ def _build_observations_cfg(cfg: Y2RConfig):
 
     # Add student groups if in student mode
     if cfg.mode.use_student_mode:
+        obs_cfg.student_proprio = StudentProprioObsCfg()
         obs_cfg.student_current_pc = StudentCurrentPCObsCfg()
         obs_cfg.student_current_poses = CurrentPosesStudentCfg()
         obs_cfg.student_future_pc = StudentFuturePCObsCfg()

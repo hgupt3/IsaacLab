@@ -167,6 +167,16 @@ class UR5eLeapTrajectoryMixinCfg:
             clip=(-20.0, 20.0),
         )
 
+        # Link_2 (mid-phalanx) contact force observation (teacher-only privileged)
+        self.observations.proprio.link_2_contact = ObsTerm(
+            func=mdp.fingers_contact_force_b,
+            params={"contact_sensor_names": ["index_link_2_object_s", "middle_link_2_object_s", "ring_link_2_object_s"]},
+            clip=(-20.0, 20.0),
+        )
+
+        # Object pose in palm frame (teacher-only privileged)
+        self.observations.proprio.object_pose_palm = ObsTerm(func=mdp.object_pose_palm_b)
+
         # Hand tips state observation (link_3 bodies with computed tip offsets)
         self.observations.proprio.hand_tips_state_b = ObsTerm(
             func=mdp.hand_tips_state_with_offsets_b,

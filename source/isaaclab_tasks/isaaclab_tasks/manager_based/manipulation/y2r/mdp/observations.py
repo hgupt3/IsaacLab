@@ -30,6 +30,54 @@ if TYPE_CHECKING:
     from ..config_loader import Y2RConfig
 
 
+# ---------------------------------------------------------------------------
+# Fused broadcast quaternion utilities (avoid expand + contiguous copies)
+# ---------------------------------------------------------------------------
+
+@torch.jit.script
+def _quat_rotate_vec(quat: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
+    """Rotate vec by quat with broadcasting over the points dimension.
+
+    Uses torch.cross with broadcast views — only 2 intermediates (t, result)
+    instead of 12+ scalar slices + cat.
+
+    Args:
+        quat: (N, 4) quaternion (w, x, y, z).
+        vec:  (N, P, 3) vectors to rotate.
+
+    Returns:
+        Rotated vectors (N, P, 3).
+    """
+    xyz = quat[:, 1:].unsqueeze(1)  # (N, 1, 3) view — no alloc
+    w = quat[:, 0:1].unsqueeze(1)   # (N, 1, 1) view — no alloc
+    t = torch.cross(xyz.expand_as(vec), vec, dim=-1) * 2  # (N, P, 3)
+    return vec + w * t + torch.cross(xyz.expand_as(t), t, dim=-1)
+
+
+@torch.jit.script
+def _points_to_frame(frame_pos: torch.Tensor, frame_quat: torch.Tensor, points_w: torch.Tensor) -> torch.Tensor:
+    """Transform world-space points into a reference frame (fused inverse rotate + translate).
+
+    Replaces the expand + subtract_frame_transforms pattern with a single
+    broadcast operation. Only allocates delta, t, and result tensors.
+
+    Args:
+        frame_pos:  (N, 3) reference frame position.
+        frame_quat: (N, 4) reference frame quaternion (w, x, y, z).
+        points_w:   (N, P, 3) points in world frame.
+
+    Returns:
+        Points in the reference frame (N, P, 3).
+    """
+    # Conjugate = inverse for unit quaternions: negate xyz
+    inv_xyz = -frame_quat[:, 1:].unsqueeze(1)  # (N, 1, 3) view
+    w = frame_quat[:, 0:1].unsqueeze(1)         # (N, 1, 1) view
+
+    delta = points_w - frame_pos.unsqueeze(1)    # (N, P, 3)
+    t = torch.cross(inv_xyz.expand_as(delta), delta, dim=-1) * 2
+    return delta + w * t + torch.cross(inv_xyz.expand_as(t), t, dim=-1)
+
+
 # ==============================================================================
 # PALM FRAME OFFSET HELPER
 # ==============================================================================
@@ -274,6 +322,91 @@ def hand_pose_b(
     return torch.cat([palm_pos_b, palm_quat_b], dim=-1)
 
 
+def object_pose_palm_b(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+) -> torch.Tensor:
+    """Object pose in the palm frame (7D: pos + quat).
+
+    Args:
+        env: The environment.
+        robot_cfg: Scene entity for the robot. Defaults to ``SceneEntityCfg("robot")``.
+        object_cfg: Scene entity for the object. Defaults to ``SceneEntityCfg("object")``.
+
+    Returns:
+        Tensor of shape ``(num_envs, 7)``: [x, y, z, qw, qx, qy, qz] in palm frame.
+    """
+    robot: Articulation = env.scene[robot_cfg.name]
+    object: RigidObject = env.scene[object_cfg.name]
+
+    palm_pos_w, palm_quat_w, _ = get_palm_frame_pose_w(robot, env.cfg.y2r_cfg)
+    obj_pos_palm, obj_quat_palm = subtract_frame_transforms(
+        palm_pos_w, palm_quat_w, object.data.root_pos_w, object.data.root_quat_w
+    )
+    return torch.cat([obj_pos_palm, obj_quat_palm], dim=-1)
+
+
+def hand_pose_error_palm(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Delta from current palm pose to next palm target, in current palm frame (7D).
+
+    Args:
+        env: The environment.
+        robot_cfg: Scene entity for the robot. Defaults to ``SceneEntityCfg("robot")``.
+
+    Returns:
+        Tensor of shape ``(num_envs, 7)``: [dx, dy, dz, dqw, dqx, dqy, dqz] in palm frame.
+        Returns zeros if hand trajectory is disabled.
+    """
+    cfg = env.cfg.y2r_cfg
+    if not cfg.hand_trajectory.enabled:
+        return torch.zeros(env.num_envs, 7, device=env.device)
+
+    robot: Articulation = env.scene[robot_cfg.name]
+    trajectory_manager = env.trajectory_manager
+
+    palm_pos_w, palm_quat_w, _ = get_palm_frame_pose_w(robot, cfg)
+    hand_targets = trajectory_manager.get_hand_window_targets()  # (N, W, 7)
+    next_pos_w = hand_targets[:, 0, :3]
+    next_quat_w = hand_targets[:, 0, 3:7]
+
+    delta_pos, delta_quat = subtract_frame_transforms(
+        palm_pos_w, palm_quat_w, next_pos_w, next_quat_w
+    )
+    return torch.cat([delta_pos, delta_quat], dim=-1)
+
+
+def object_pose_error(
+    env: ManagerBasedRLEnv,
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+) -> torch.Tensor:
+    """Delta from current object pose to next object target, in current object frame (7D).
+
+    Args:
+        env: The environment.
+        object_cfg: Scene entity for the object. Defaults to ``SceneEntityCfg("object")``.
+
+    Returns:
+        Tensor of shape ``(num_envs, 7)``: [dx, dy, dz, dqw, dqx, dqy, dqz] in object frame.
+    """
+    object: RigidObject = env.scene[object_cfg.name]
+    trajectory_manager = env.trajectory_manager
+
+    obj_pos_w = object.data.root_pos_w
+    obj_quat_w = object.data.root_quat_w
+    obj_targets = trajectory_manager.get_window_targets()  # (N, W, 7)
+    next_pos_w = obj_targets[:, 0, :3]
+    next_quat_w = obj_targets[:, 0, 3:7]
+
+    delta_pos, delta_quat = subtract_frame_transforms(
+        obj_pos_w, obj_quat_w, next_pos_w, next_quat_w
+    )
+    return torch.cat([delta_pos, delta_quat], dim=-1)
+
+
 def body_state_b(
     env: ManagerBasedRLEnv,
     body_asset_cfg: SceneEntityCfg,
@@ -433,18 +566,11 @@ class object_point_cloud_b(ManagerTermBase):
         Returns:
             Tensor of shape ``(num_envs, num_points, 3)`` or flattened if requested.
         """
-        P = self.num_points
-        ref_pos_w = self.ref_asset.data.root_pos_w.unsqueeze(1).expand(-1, P, -1)
-        ref_quat_w = self.ref_asset.data.root_quat_w.unsqueeze(1).expand(-1, P, -1)
+        # Transform local points to world (broadcast, no expand)
+        self.points_w = _quat_rotate_vec(self.object.data.root_quat_w, self.points_local) + self.object.data.root_pos_w.unsqueeze(1)
 
-        object_pos_w = self.object.data.root_pos_w.unsqueeze(1).expand(-1, P, -1)
-        object_quat_w = self.object.data.root_quat_w.unsqueeze(1).expand(-1, P, -1)
-
-        # Transform local points to world
-        self.points_w = quat_apply(object_quat_w, self.points_local) + object_pos_w
-
-        # Transform to robot base frame
-        object_point_cloud_pos_b, _ = subtract_frame_transforms(ref_pos_w, ref_quat_w, self.points_w, None)
+        # Transform to robot base frame (fused inverse rotate + translate)
+        object_point_cloud_pos_b = _points_to_frame(self.ref_asset.data.root_pos_w, self.ref_asset.data.root_quat_w, self.points_w)
 
         return object_point_cloud_pos_b.view(env.num_envs, -1) if flatten else object_point_cloud_pos_b
 
@@ -518,6 +644,7 @@ class visible_object_point_cloud_b(ManagerTermBase):
         # Cached visibility sampling (resample at target_hz rate)
         self.cached_indices = None  # (N, num_points) selected point indices
         self.cached_points_local = None  # (N, num_points, 3) selected points in local frame
+        self._step_counter = 0  # CPU-side counter to avoid GPU sync for resample check
         
         # Initialize visualization if enabled
         self.markers = None
@@ -563,73 +690,62 @@ class visible_object_point_cloud_b(ManagerTermBase):
         # Apply per-env scale to points (normals don't scale)
         pool_points_local = pool_points_local * scales.unsqueeze(1)  # (N, P, 3)
         
-        # Determine which envs need resampling:
-        # 1. First call (no cache)
-        # 2. Environment just reset (episode_length_buf == 0)
-        # 3. Resample interval reached (every resample_interval steps)
+        # Determine if resampling is needed using a CPU-side counter to avoid
+        # GPU sync (.any().item() forces a pipeline stall every step).
+        # Resets are handled by always resampling at the interval — any env that
+        # reset within the last interval steps will get fresh samples.
         needs_resample = self.cached_indices is None
-        
+
         if not needs_resample:
-            # Check for resets
-            just_reset = env.episode_length_buf == 0
-            # Check for interval (resample when step % interval == 0)
-            at_interval = (env.episode_length_buf % self.resample_interval) == 0
-            needs_resample_mask = just_reset | at_interval
-            needs_resample = needs_resample_mask.any().item()
+            self._step_counter += 1
+            needs_resample = self._step_counter >= self.resample_interval
+            if needs_resample:
+                self._step_counter = 0
         
         if needs_resample:
             # Full visibility resampling
             object_pos_w = self.object.data.root_pos_w  # (N, 3)
             object_quat_w = self.object.data.root_quat_w  # (N, 4)
-            
-            # Expand for broadcasting with pool
-            obj_pos_exp = object_pos_w.unsqueeze(1).expand(-1, P, -1)  # (N, P, 3)
-            obj_quat_exp = object_quat_w.unsqueeze(1).expand(-1, P, -1)  # (N, P, 4)
-            
-            # Transform to world
-            pool_points_w = quat_apply(obj_quat_exp, pool_points_local) + obj_pos_exp  # (N, P, 3)
-            pool_normals_w = quat_apply(obj_quat_exp, pool_normals_local)  # (N, P, 3)
+
+            # Transform to world (broadcast, no expand)
+            pool_points_w = _quat_rotate_vec(object_quat_w, pool_points_local) + object_pos_w.unsqueeze(1)  # (N, P, 3)
+            pool_normals_w = _quat_rotate_vec(object_quat_w, pool_normals_local)  # (N, P, 3)
             pool_normals_w = pool_normals_w / (pool_normals_w.norm(dim=-1, keepdim=True) + 1e-8)
-            
+
             # Camera position in world
             env_origins = env.scene.env_origins  # (N, 3)
             camera_pos_w = env_origins + self.camera_offset  # (N, 3)
-            
+
             # Compute visibility
             view_dirs = camera_pos_w.unsqueeze(1) - pool_points_w  # (N, P, 3)
             view_dirs = view_dirs / (view_dirs.norm(dim=-1, keepdim=True) + 1e-8)
             visibility = (pool_normals_w * view_dirs).sum(dim=-1)  # (N, P)
-            
+
             # Sample visible points
             selected_indices = self._sample_visible_batched(visibility, num_pts)  # (N, num_pts)
-            
+
             # Cache indices and local points
             self.cached_indices = selected_indices
             batch_idx = torch.arange(N, device=device).unsqueeze(1).expand(-1, num_pts)
             self.cached_points_local = pool_points_local[batch_idx, selected_indices]  # (N, num_pts, 3)
-        
-        # Use cached local points and transform to current world frame
+
+        # Use cached local points and transform to current world frame (broadcast, no expand)
         object_pos_w = self.object.data.root_pos_w  # (N, 3)
         object_quat_w = self.object.data.root_quat_w  # (N, 4)
-        
-        obj_pos_exp = object_pos_w.unsqueeze(1).expand(-1, num_pts, -1)  # (N, num_pts, 3)
-        obj_quat_exp = object_quat_w.unsqueeze(1).expand(-1, num_pts, -1)  # (N, num_pts, 4)
-        
-        selected_points_w = quat_apply(obj_quat_exp, self.cached_points_local) + obj_pos_exp
-        
+
+        selected_points_w = _quat_rotate_vec(object_quat_w, self.cached_points_local) + object_pos_w.unsqueeze(1)
+
         # Store visible points in object-local frame for visible_target_sequence_obs_b
         env._visible_points_local = self.cached_points_local  # (N, num_points, 3)
-        
-        # Transform to robot base frame
-        ref_pos_w = self.ref_asset.data.root_pos_w.unsqueeze(1).expand(-1, num_pts, -1)
-        ref_quat_w = self.ref_asset.data.root_quat_w.unsqueeze(1).expand(-1, num_pts, -1)
-        points_b, _ = subtract_frame_transforms(ref_pos_w, ref_quat_w, selected_points_w, None)
-        
+
+        # Transform to robot base frame (fused inverse rotate + translate)
+        points_b = _points_to_frame(self.ref_asset.data.root_pos_w, self.ref_asset.data.root_quat_w, selected_points_w)
+
         # Store for visualization and visualize if enabled
         self.selected_points_w = selected_points_w
         if self.visualize and self.markers is not None:
             self._visualize(selected_points_w, N)
-        
+
         return points_b.view(N, -1) if flatten else points_b
     
     def _init_visualizer(self):
@@ -709,28 +825,20 @@ class visible_object_point_cloud_b(ManagerTermBase):
             torch.full((N, P), float('-inf'), device=device)
         )
         
-        # Sort descending - visible points (random order) come first
-        _, sorted_idx = random_scores.sort(dim=-1, descending=True)
-        selected = sorted_idx[:, :num_points]  # (N, num_points)
-        
+        # topk is O(N*k) vs sort's O(N*P*logP) — ~8x faster for k=32, P=256
+        _, selected = random_scores.topk(num_points, dim=-1)  # (N, num_points)
+
         # Handle edge case: if < num_points visible, repeat from visible ones
         num_visible = visible_mask.sum(dim=-1, keepdim=True)  # (N, 1)
         needs_repeat = num_visible < num_points
-        
+
         if needs_repeat.any():
-            # For envs needing repeats: use modulo to wrap indices
+            # topk puts visible (positive scores) first, hidden (-inf) last.
+            # Wrap indices to cycle through the visible portion of selected.
             repeat_idx = torch.arange(num_points, device=device).unsqueeze(0)  # (1, num_points)
-            wrapped_idx = repeat_idx % num_visible.clamp(min=1)  # (N, num_points)
-            
-            # Gather from sorted visible indices using wrapped index
-            max_visible = num_visible.max().item()
-            first_visible = sorted_idx[:, :max(1, max_visible)]  # (N, max_visible)
-            
-            # Clamp wrapped_idx to valid range for gather
-            wrapped_idx_clamped = wrapped_idx.clamp(max=first_visible.shape[1] - 1)
-            repeated = first_visible.gather(1, wrapped_idx_clamped.long())
-            
-            # Use repeated only for envs that need it
+            wrapped_idx = (repeat_idx % num_visible.clamp(min=1)).long()  # (N, num_points)
+            repeated = selected.gather(1, wrapped_idx)
+
             selected = torch.where(
                 needs_repeat.expand(-1, num_points),
                 repeated,
@@ -852,28 +960,19 @@ class visible_target_sequence_obs_b(ManagerTermBase):
         
         # Expand target poses for all points
         target_pos = target_pos_w.unsqueeze(2)   # (N, W, 1, 3)
-        target_quat = target_quat_w.unsqueeze(2)  # (N, W, 1, 4)
-        quat_exp = target_quat.expand(N, W, P, 4)  # (N, W, P, 4)
-        pos_exp = target_pos.expand(N, W, P, 3)    # (N, W, P, 3)
-        
-        # Apply rotation + translation: (N, W, P, 3)
-        all_points_w = quat_apply(
-            quat_exp.reshape(-1, 4), 
-            local_exp.reshape(-1, 3)
-        ).reshape(N, W, P, 3) + pos_exp
-        
-        # Transform to robot base frame
-        ref_pos_w = self.ref_asset.data.root_pos_w   # (N, 3)
-        ref_quat_w = self.ref_asset.data.root_quat_w  # (N, 4)
-        
-        ref_pos_exp = ref_pos_w.view(N, 1, 1, 3).expand(N, W, P, 3)
-        ref_quat_exp = ref_quat_w.view(N, 1, 1, 4).expand(N, W, P, 4)
-        
-        all_points_b, _ = subtract_frame_transforms(
-            ref_pos_exp.reshape(-1, 3), ref_quat_exp.reshape(-1, 4),
-            all_points_w.reshape(-1, 3), None
-        )
-        all_points_b = all_points_b.reshape(N, W, P, 3)
+        # Flatten (N, W) → (N*W) to use broadcast utilities, avoiding (N, W, P) expand
+        target_quat_flat = target_quat_w.reshape(-1, 4)  # (N*W, 4)
+        target_pos_flat = target_pos_w.reshape(-1, 3)    # (N*W, 3)
+        local_flat = local_exp.reshape(N * W, P, 3)      # (N*W, P, 3)
+
+        all_points_w_flat = _quat_rotate_vec(target_quat_flat, local_flat) + target_pos_flat.unsqueeze(1)
+        all_points_w = all_points_w_flat.reshape(N, W, P, 3)
+
+        # Transform to robot base frame (expand only (N)→(N*W), not (N)→(N*W*P))
+        ref_pos_flat = self.ref_asset.data.root_pos_w.unsqueeze(1).expand(N, W, 3).reshape(-1, 3)
+        ref_quat_flat = self.ref_asset.data.root_quat_w.unsqueeze(1).expand(N, W, 4).reshape(-1, 4)
+
+        all_points_b = _points_to_frame(ref_pos_flat, ref_quat_flat, all_points_w_flat).reshape(N, W, P, 3)
         
         # Visualize if enabled
         if self.visualize and self.markers is not None:
@@ -1770,26 +1869,23 @@ class target_sequence_obs_b(ManagerTermBase):
         target_quat = target_quat_w.unsqueeze(2)  # (N, W, 1, 4)
         
         local_exp = self.points_local.unsqueeze(1).expand(N, W, P, 3)  # (N, W, P, 3)
-        quat_exp = target_quat.expand(N, W, P, 4)  # (N, W, P, 4)
-        pos_exp = target_pos.expand(N, W, P, 3)    # (N, W, P, 3)
-        
-        # Apply rotation + translation: (N, W, P, 3)
-        all_points_w = quat_apply(quat_exp.reshape(-1, 4), local_exp.reshape(-1, 3)).reshape(N, W, P, 3) + pos_exp
-        
-        # Transform to robot base frame
-        ref_pos_exp = ref_pos_w.view(N, 1, 1, 3).expand(N, W, P, 3)
-        ref_quat_exp = ref_quat_w.view(N, 1, 1, 4).expand(N, W, P, 4)
-        
-        all_points_b, _ = subtract_frame_transforms(
-            ref_pos_exp.reshape(-1, 3), ref_quat_exp.reshape(-1, 4),
-            all_points_w.reshape(-1, 3), None
-        )
-        all_points_b = all_points_b.reshape(N, W, P, 3)
-        
-        # Current object points (world space)
-        object_quat_exp = object_quat_w.unsqueeze(1).expand(-1, P, -1)
-        object_pos_exp = object_pos_w.unsqueeze(1).expand(-1, P, -1)
-        current_points_w = quat_apply(object_quat_exp, self.points_local) + object_pos_exp
+
+        # Flatten (N, W) → (N*W) to use broadcast utilities, avoiding (N, W, P) expand
+        target_quat_flat = target_quat_w.reshape(-1, 4)  # (N*W, 4)
+        target_pos_flat = target_pos_w.reshape(-1, 3)    # (N*W, 3)
+        local_flat = local_exp.reshape(N * W, P, 3)      # (N*W, P, 3)
+
+        all_points_w_flat = _quat_rotate_vec(target_quat_flat, local_flat) + target_pos_flat.unsqueeze(1)
+        all_points_w = all_points_w_flat.reshape(N, W, P, 3)
+
+        # Transform to robot base frame (expand only (N)→(N*W), not (N)→(N*W*P))
+        ref_pos_flat = ref_pos_w.unsqueeze(1).expand(N, W, 3).reshape(-1, 3)
+        ref_quat_flat = ref_quat_w.unsqueeze(1).expand(N, W, 4).reshape(-1, 4)
+
+        all_points_b = _points_to_frame(ref_pos_flat, ref_quat_flat, all_points_w_flat).reshape(N, W, P, 3)
+
+        # Current object points (world space, broadcast)
+        current_points_w = _quat_rotate_vec(object_quat_w, self.points_local) + object_pos_w.unsqueeze(1)
         
         # === Cache point cloud errors ===
         current_exp = current_points_w.unsqueeze(1).expand(N, W, P, 3)

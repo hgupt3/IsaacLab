@@ -30,7 +30,7 @@ params:
     
     # Observation groups for student policy
     obs_groups:
-      obs: ["policy", "proprio", "student_current_poses", "student_future_poses", "student_current_pc", "student_future_pc", "student_camera"]
+      obs: ["policy", "student_proprio", "student_current_poses", "student_future_poses", "student_current_pc", "student_future_pc", "student_camera"]
       states: ["policy", "proprio", "current_poses", "future_poses", "current_pc", "future_pc"]  
     concate_obs_groups: True
 

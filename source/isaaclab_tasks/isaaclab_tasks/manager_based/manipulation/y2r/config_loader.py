@@ -156,6 +156,9 @@ class HistoryConfig:
     poses: int
     targets: int
     # Student observations
+    student_proprio: int
+    student_poses: int
+    student_future_poses: int
     student_pc: int
     student_targets: int
     student_camera: int

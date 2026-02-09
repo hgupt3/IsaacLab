@@ -300,8 +300,8 @@ class PointTransformerBuilder(A2CBuilder):
         def _build_point_encoder(self) -> nn.Module:
             """Build linear encoder for point timeseries.
 
-            Input: (B * num_points, num_timesteps * 3)
-            Output: (B * num_points, hidden_dim)
+            Input: (B, num_points, num_timesteps * 3)
+            Output: (B, num_points, hidden_dim)
             """
             input_dim = self.num_timesteps * 3
             layers = self.point_encoder_layers
@@ -416,7 +416,7 @@ class PointTransformerBuilder(A2CBuilder):
                 obs: Flat observation tensor (B, obs_dim)
 
             Returns:
-                point_obs: (B, num_points, num_timesteps, 3)
+                point_obs: (B, num_points, num_timesteps * 3) — ready for encoder
                 extended_proprio: (B, proprio_dim) - includes policy, proprio, and all poses
             """
             B = obs.shape[0]
@@ -433,8 +433,9 @@ class PointTransformerBuilder(A2CBuilder):
             extended_proprio = obs[:, :self.proprio_dim]  # (B, proprio_dim)
             point_flat = obs[:, self.proprio_dim:]        # (B, point_cloud_dim)
 
-            # Reshape point clouds to (B, num_points, num_timesteps, 3)
-            point_obs = point_flat.view(B, self.num_points, self.num_timesteps, 3)
+            # Reshape to (B, num_points, num_timesteps * 3) — no 4D reshape needed,
+            # nn.Linear works on arbitrary leading dims so encoder handles (B, P, F) directly.
+            point_obs = point_flat.reshape(B, self.num_points, self.num_timesteps * 3)
 
             return point_obs, extended_proprio
 
@@ -454,16 +455,11 @@ class PointTransformerBuilder(A2CBuilder):
             B = obs.shape[0]
             
             # Split observation
-            point_obs, proprio_obs = self._split_obs(obs)  # (B, num_points, num_timesteps, 3), (B, proprio_dim)
+            point_obs, proprio_obs = self._split_obs(obs)  # (B, num_points, num_timesteps*3), (B, proprio_dim)
 
-            # Flatten point timeseries: (B, num_points, num_timesteps, 3) → (B*num_points, num_timesteps*3)
-            point_flat = point_obs.reshape(B * self.num_points, self.num_timesteps * 3)
-
-            # Encode points: (B*num_points, num_timesteps*3) → Linear → (B*num_points, hidden_dim)
-            point_encoded = self.point_encoder(point_flat)
-
-            # Reshape to point tokens: (B*num_points, hidden_dim) → (B, num_points, hidden_dim)
-            point_tokens = point_encoded.view(B, self.num_points, self.hidden_dim)
+            # Encode points: (B, num_points, num_timesteps*3) → (B, num_points, hidden_dim)
+            # nn.Linear works on arbitrary leading dims — no reshape needed.
+            point_tokens = self.point_encoder(point_obs)
             
             # Encode proprio: (B, proprio_dim) → (B, 1, hidden_dim)
             if self.proprio_dim > 0:
@@ -491,8 +487,7 @@ class PointTransformerBuilder(A2CBuilder):
             actor_latent = self.actor_trunk(trunk_input)
             if self.separate:
                 # Recompute critic features with separate encoders/attention
-                critic_point_encoded = self.critic_point_encoder(point_flat)
-                critic_point_tokens = critic_point_encoded.view(B, self.num_points, self.hidden_dim)
+                critic_point_tokens = self.critic_point_encoder(point_obs)
                 if self.use_self_attention:
                     critic_point_tokens = self.critic_self_attn(critic_point_tokens)
                     critic_point_tokens = self.critic_self_ffn(critic_point_tokens)
@@ -579,6 +574,15 @@ class PointTransformerBuilder(A2CBuilder):
             self.params = {}
             self._inject_params(self.params)
 
-        return self.Network(self.params, **kwargs)
+        # Enable TF32 for matmuls outside AMP autocast (observation pipeline, etc.)
+        torch.backends.cuda.matmul.allow_tf32 = True
+
+        net = self.Network(self.params, **kwargs)
+        if self.params.get("torch_compile", False):
+            # torch.compile fuses Linear, LayerNorm, attention, and reshapes into
+            # optimized Triton kernels. "reduce-overhead" uses CUDA graphs for minimal
+            # launch overhead; dynamic=True handles varying batch sizes.
+            net = torch.compile(net, mode="reduce-overhead", dynamic=True)
+        return net
 
 

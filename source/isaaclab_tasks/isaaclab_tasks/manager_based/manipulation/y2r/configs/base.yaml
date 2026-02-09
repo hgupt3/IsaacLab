@@ -38,12 +38,15 @@ observations:
   # History lengths for observation groups
   history:
     # Teacher observations
-    policy: 5                   # Action history length
-    proprio: 5                  # Joint pos/vel, hand tips, contact history
+    policy: 4                   # Action history length
+    proprio: 4                  # Joint pos/vel, hand tips, contact history
     object_pc: 1                # Object point cloud history
-    poses: 5                    # Object + hand pose history (kept linked)
+    poses: 4                    # Object + hand pose history (kept linked)
     targets: 1                  # Target history (targets already encode future)
     # Student observations (when use_student_mode: true)
+    student_proprio: 4          # Student proprioception (joint pos/vel, hand eigen)
+    student_poses: 4            # Student current hand pose history
+    student_future_poses: 1     # Student future hand pose targets
     student_pc: 1               # Visible point cloud from pseudo-camera
     student_targets: 1          # Visible target sequence
     student_camera: 1           # Wrist depth camera history
@@ -55,8 +58,8 @@ observations:
 # TRAJECTORY (segment-based system)
 # ==============================================================================
 trajectory:
-  target_hz: 10                 # Target update rate (Hz)
-  window_size: 5                # Lookahead targets in observation
+  target_hz: 8                 # Target update rate (Hz)
+  window_size: 4                # Lookahead targets in observation
   easing_power: 1.5             # Ease curve power for waypoint segments
   path_mode: true               # Track along continuous path segment (vs discrete waypoints)
   timing_aware: true            # Use temporal interpolation for path tracking
