@@ -176,6 +176,7 @@ goal:
 # Set weight to disable any reward
 # Thresholds use [initial, final] format - curriculum interpolates between
 rewards:
+  nail_contact_gate: 0.1    # Gate factor for nail/back-of-finger contact (0.0 = ignore, 1.0 = no gating)
   action_l2:
     weight: -0.005
     params:
@@ -249,9 +250,9 @@ rewards:
     
   # Robot-specific (Kuka Allegro)
   good_finger_contact:
-    weight: 1.5
+    weight: 1.0
     params:
-      phases: [grasp, manipulation, release]  # Active in all phases
+      phases: [manipulation, release]  # Active in all phases
       use_hand_pose_gate: true         # Apply hand pose gate from hand_pose_following
       invert_in_release: true          # Invert reward in release (reward NO contact)
       threshold: 1.0                   # Contact force threshold (N)
@@ -269,7 +270,7 @@ rewards:
       contact_min_factor: 0.0        # Floor factor when no contact (prevents zero reward)
     
   distal_joint3_penalty:
-    weight: -0.5  
+    weight: -0.3  
     params:
       phases: [grasp, manipulation, release]  # Active in all phases (no phase restriction)
       std: 1.5                    # Larger = more lenient (radians)
@@ -310,7 +311,7 @@ rewards:
   # Hand pose following reward (when hand_trajectory.enabled)
   # Guides hand to follow palm pose trajectory through grasp/manipulation/release
   hand_pose_following:
-    weight: 3.0                   # Guiding signal, not strict
+    weight: 2.5                   # Guiding signal, not strict
     params:
       # Phase-varying tolerances: average of position/rotation kernels
       grasp_pos_tol: 0.03         # Position tolerance during grasp
@@ -338,12 +339,12 @@ rewards:
   
   # Finger regularizer - penalizes deviation from neutral/default finger pose
   finger_regularizer:
-    weight: -0.5                  # Negative = penalty
+    weight: -1.0                  # Negative = penalty
     params:
       phases: [grasp, release]    # Active in grasp and release phases
       # Default finger joint positions (Allegro hand)
       default_joints: [0.0315, 0.0764, 0.0196, 0.2944, -0.0010, 0.1109, 0.0309, 0.2541, -0.0067, 0.1260, 0.0697, 0.2933, 1.5165, -0.2420, 0.3112, 0.3816]
-      std: 1.5                    # Penalty growth with deviation (radians)
+      std: 1.0                    # Penalty growth with deviation (radians)
   
   # Object stillness - penalizes object movement during grasp/release
   object_stillness:
@@ -363,7 +364,7 @@ terminations:
     rotation_threshold: [2.5, 1.25]       # Rotation error (radians)
   
   hand_pose_deviation:
-    position_threshold: [0.3, 0.1]         # Position threshold (meters)
+    position_threshold: [0.2, 0.1]         # Position threshold (meters)
     rotation_threshold: [3.14, 3.14]        # Rotation threshold (radians)
 
   abnormal_robot:
@@ -381,7 +382,7 @@ curriculum:
     
   # Step-based scheduler (set step_interval to null to disable)
   scheduler: 
-    step_interval: 64000        # Floor increases at this interval
+    step_interval: 80000        # Floor increases at this interval
     use_performance: true       # Performance can still advance faster than floor
     
   # Tolerances to advance difficulty level
@@ -463,6 +464,7 @@ visualization:
   pose_axes: false               # Show axis arrows for poses
   hand_pose_targets: false       # Show hand (palm) pose target axes
   grasp_surface_point: false     # Show selected grasp surface point (green sphere)
+  contact_forces: false          # Show contact force (cyan) + pad normal (yellow) arrows on finger links
   env_ids: []                   # Which envs to visualize ([] = none, null = all)
   debug_print_rewards: false    # Print reward breakdown periodically
 

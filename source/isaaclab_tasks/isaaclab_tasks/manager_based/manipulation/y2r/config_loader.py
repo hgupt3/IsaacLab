@@ -319,6 +319,7 @@ class RewardConfig:
 
 @dataclass
 class RewardsConfig:
+    nail_contact_gate: float
     action_l2: RewardConfig
     action_rate_l2: RewardConfig
     fingers_to_object: RewardConfig
@@ -469,6 +470,7 @@ class VisualizationConfig:
     pose_axes: bool
     hand_pose_targets: bool
     grasp_surface_point: bool
+    contact_forces: bool
     env_ids: list[int] | None
     debug_print_rewards: bool
 

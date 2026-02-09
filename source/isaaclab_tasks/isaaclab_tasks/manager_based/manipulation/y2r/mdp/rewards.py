@@ -107,27 +107,96 @@ def _get_hand_pose_gate(env: ManagerBasedRLEnv) -> torch.Tensor:
 
 
 def _get_finger_contact_mags(env: ManagerBasedRLEnv):
-    """Cached per-step finger contact magnitudes: max(link_3, link_2) per finger."""
+    """Cached per-step finger contact magnitudes: max(link_3, link_2) per finger.
+
+    Applies nail-contact gating: contacts on the back/nail side of finger links
+    are multiplied by nail_contact_gate (0.0 = ignore, 1.0 = no gating).
+    Pad-normal directions are from URDF analysis (pad = -X for all links except
+    thumb_link_2 which is +X due to 180° yaw in thumb_joint_3).
+    """
     step = env.common_step_counter
     cached = getattr(env, '_cached_finger_mags', None)
     if cached is not None and cached[0] == step:
         return cached[1]
-    thumb_mag = torch.maximum(
-        env.scene.sensors["thumb_link_3_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
-        env.scene.sensors["thumb_link_2_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
-    )
-    index_mag = torch.maximum(
-        env.scene.sensors["index_link_3_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
-        env.scene.sensors["index_link_2_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
-    )
-    middle_mag = torch.maximum(
-        env.scene.sensors["middle_link_3_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
-        env.scene.sensors["middle_link_2_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
-    )
-    ring_mag = torch.maximum(
-        env.scene.sensors["ring_link_3_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
-        env.scene.sensors["ring_link_2_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
-    )
+
+    nail_gate = env.cfg.y2r_cfg.rewards.nail_contact_gate
+
+    # Fast path: no gating needed
+    if nail_gate >= 1.0:
+        thumb_mag = env.scene.sensors["thumb_link_3_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1)
+        index_mag = torch.maximum(
+            env.scene.sensors["index_link_3_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
+            env.scene.sensors["index_link_2_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
+        )
+        middle_mag = torch.maximum(
+            env.scene.sensors["middle_link_3_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
+            env.scene.sensors["middle_link_2_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
+        )
+        ring_mag = torch.maximum(
+            env.scene.sensors["ring_link_3_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
+            env.scene.sensors["ring_link_2_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
+        )
+        mags = (thumb_mag, index_mag, middle_mag, ring_mag)
+        env._cached_finger_mags = (step, mags)
+        return mags
+
+    # Pad-normal in each link's local frame (from URDF joint analysis)
+    # Thumb uses only link_3 (fingertip mesh is large enough)
+    _PAD_NORMALS = {
+        "thumb_link_3":  (-1.0, 0.0, 0.0),
+        "index_link_3":  (-1.0, 0.0, 0.0), "index_link_2":  (-1.0, 0.0, 0.0),
+        "middle_link_3": (-1.0, 0.0, 0.0), "middle_link_2": (-1.0, 0.0, 0.0),
+        "ring_link_3":   (-1.0, 0.0, 0.0), "ring_link_2":   (-1.0, 0.0, 0.0),
+    }
+
+    # Cache body indices and pad-normal tensors on first call
+    if not hasattr(env, '_nail_gate_cache'):
+        robot: Articulation = env.scene["robot"]
+        cache = {}
+        for link_name, normal in _PAD_NORMALS.items():
+            ids = robot.find_bodies(link_name)[0]
+            body_idx = ids[0] if len(ids) > 0 else None
+            pad_tensor = torch.tensor(normal, device=env.device, dtype=torch.float32)
+            cache[link_name] = (body_idx, pad_tensor)
+        env._nail_gate_cache = cache
+
+    robot: Articulation = env.scene["robot"]
+    cache = env._nail_gate_cache
+
+    def _gated_mag(link_name: str) -> torch.Tensor:
+        sensor = env.scene.sensors[f"{link_name}_object_s"]
+        force_w = sensor.data.force_matrix_w.view(env.num_envs, 3)
+        mag = force_w.norm(dim=-1)
+        body_idx, pad_local = cache[link_name]
+        link_quat = robot.data.body_quat_w[:, body_idx]  # (N, 4) wxyz
+        pad_w = math_utils.quat_apply(link_quat, pad_local.unsqueeze(0).expand(env.num_envs, 3))
+        dot = (force_w * pad_w).sum(dim=-1)
+        # Smooth gate: cos_angle ∈ [-1, +1] (pad_w is unit length)
+        #   -1 = force perfectly into pad → gate = 1.0
+        #   +1 = force perfectly into nail → gate = nail_gate
+        cos_angle = dot / (mag + 1e-8)
+        t = (cos_angle + 1.0) * 0.5  # [0, 1]: 0=pad, 1=nail
+        gate = 1.0 - t * (1.0 - nail_gate)
+        return mag * gate
+
+    # Store contact debug data for visualization (drawn by observations.py render_debug)
+    if env.cfg.y2r_cfg.visualization.contact_forces:
+        debug_data = []
+        for link_name in _PAD_NORMALS:
+            sensor = env.scene.sensors[f"{link_name}_object_s"]
+            force_w = sensor.data.force_matrix_w.view(env.num_envs, 3)
+            body_idx, pad_local = cache[link_name]
+            link_pos = robot.data.body_pos_w[:, body_idx]  # (N, 3)
+            link_quat = robot.data.body_quat_w[:, body_idx]
+            pad_w = math_utils.quat_apply(link_quat, pad_local.unsqueeze(0).expand(env.num_envs, 3))
+            debug_data.append((link_name, link_pos.clone(), force_w.clone(), pad_w.clone()))
+        env._contact_debug_data = debug_data
+
+    thumb_mag = _gated_mag("thumb_link_3")
+    index_mag = torch.maximum(_gated_mag("index_link_3"), _gated_mag("index_link_2"))
+    middle_mag = torch.maximum(_gated_mag("middle_link_3"), _gated_mag("middle_link_2"))
+    ring_mag = torch.maximum(_gated_mag("ring_link_3"), _gated_mag("ring_link_2"))
+
     mags = (thumb_mag, index_mag, middle_mag, ring_mag)
     env._cached_finger_mags = (step, mags)
     return mags

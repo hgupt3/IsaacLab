@@ -1058,6 +1058,7 @@ class target_sequence_obs_b(ManagerTermBase):
         self.visualize_pose_axes = y2r_cfg.visualization.pose_axes
         self.visualize_hand_pose_targets = y2r_cfg.visualization.hand_pose_targets
         self.visualize_grasp_surface_point = y2r_cfg.visualization.grasp_surface_point
+        self.visualize_contact_forces = y2r_cfg.visualization.contact_forces
         self.visualize_env_ids = y2r_cfg.visualization.env_ids
         
         self.object: RigidObject = env.scene[self.object_cfg.name]
@@ -1106,7 +1107,7 @@ class target_sequence_obs_b(ManagerTermBase):
             self._init_visualizer()
         if self.visualize_grasp_surface_point:
             self._init_grasp_point_visualizer()
-        if self.visualize_waypoint_region or self.visualize_goal_region or self.visualize_pose_axes or self.visualize_hand_pose_targets:
+        if self.visualize_waypoint_region or self.visualize_goal_region or self.visualize_pose_axes or self.visualize_hand_pose_targets or self.visualize_contact_forces:
             self._init_region_visualizer()
         
         # Cache palm body index for hand trajectory
@@ -1187,10 +1188,11 @@ class target_sequence_obs_b(ManagerTermBase):
         """
         N = self.env.num_envs
 
-        # Debug draw (pose axes + regions)
+        # Debug draw (pose axes + regions + contact forces)
         if self._debug_draw is not None and (
             self.visualize_pose_axes or self.visualize_hand_pose_targets
             or self.visualize_waypoint_region or self.visualize_goal_region
+            or self.visualize_contact_forces
         ):
             self._debug_draw.clear_lines()
 
@@ -1204,6 +1206,9 @@ class target_sequence_obs_b(ManagerTermBase):
 
             if self.visualize_waypoint_region or self.visualize_goal_region:
                 self._visualize_regions(self.env.scene.env_origins, self.trajectory_manager.start_poses[:, :3])
+
+            if self.visualize_contact_forces:
+                self._visualize_contact_forces(N)
 
         # Grasp surface point (marker-based)
         if self.visualize_grasp_surface_point and self.grasp_point_marker is not None:
@@ -1423,6 +1428,55 @@ class target_sequence_obs_b(ManagerTermBase):
         ends = torch.cat([verts[:, j] for i, j in edge_pairs], dim=0)
         return starts, ends
     
+    def _visualize_contact_forces(self, num_envs: int):
+        """Visualize contact force direction (cyan) and pad normal (yellow) on finger links.
+
+        Reads debug data stored by _get_finger_contact_mags() in rewards.py.
+        Only draws arrows for links with contact magnitude > 0.1N.
+        """
+        if self._debug_draw is None:
+            return
+        debug_data = getattr(self.env, '_contact_debug_data', None)
+        if debug_data is None:
+            return
+
+        # Select envs to visualize
+        if self.visualize_env_ids is None:
+            env_ids = list(range(num_envs))
+        else:
+            env_ids = [i for i in self.visualize_env_ids if i < num_envs]
+        if not env_ids:
+            return
+
+        ARROW_LEN = 0.04  # 4cm
+        MIN_FORCE = 0.1   # Only draw if contact > 0.1N
+
+        starts_list = []
+        ends_list = []
+        all_colors = []
+
+        for link_name, link_pos, force_w, pad_w in debug_data:
+            for ei in env_ids:
+                mag = force_w[ei].norm().item()
+                if mag < MIN_FORCE:
+                    continue
+                pos = link_pos[ei]
+                # Cyan arrow: normalized force direction
+                force_dir = force_w[ei] / mag
+                force_end = pos + force_dir * ARROW_LEN
+                starts_list.append(pos.cpu().tolist())
+                ends_list.append(force_end.cpu().tolist())
+                all_colors.append((0.0, 1.0, 1.0, 1.0))  # Cyan
+                # Yellow arrow: pad normal direction
+                pad_end = pos + pad_w[ei] * ARROW_LEN
+                starts_list.append(pos.cpu().tolist())
+                ends_list.append(pad_end.cpu().tolist())
+                all_colors.append((1.0, 1.0, 0.0, 1.0))  # Yellow
+
+        if starts_list:
+            n = len(starts_list)
+            self._debug_draw.draw_lines(starts_list, ends_list, all_colors, [5.0] * n)
+
     def _visualize_pose_axes(
         self,
         object_pos_w: torch.Tensor,

@@ -177,6 +177,7 @@ class PointTransformerBuilder(A2CBuilder):
             self.normalization = params.get("normalization", None)
             self.value_activation = params.get("value_activation", "None")
             self.attn_dropout = params.get("attn_dropout", 0.0)
+            self.use_self_attention = params.get("self_attention", True)
             self.ffn_ratio = params.get("ffn_ratio", 0.0)
             self.ffn_dropout = params.get("ffn_dropout", 0.0)
             self.point_encoder_layers = params.get("point_encoder_layers", None)
@@ -254,17 +255,19 @@ class PointTransformerBuilder(A2CBuilder):
             self.proprio_encoder = self._build_proprio_encoder()
             self.proprio_norm = nn.LayerNorm(self.hidden_dim) if self.proprio_encoder_norm else None
 
-            # Self-attention on point tokens, then cross-attention
-            self.self_attn = SelfAttentionBlock(self.hidden_dim, self.num_heads, dropout=self.attn_dropout)
-            self.self_ffn = FeedForwardBlock(self.hidden_dim, self.ffn_ratio, dropout=self.ffn_dropout)
+            # Self-attention on point tokens (optional), then cross-attention
+            if self.use_self_attention:
+                self.self_attn = SelfAttentionBlock(self.hidden_dim, self.num_heads, dropout=self.attn_dropout)
+                self.self_ffn = FeedForwardBlock(self.hidden_dim, self.ffn_ratio, dropout=self.ffn_dropout)
             self.cross_attn = CrossAttentionBlock(self.hidden_dim, self.num_heads, dropout=self.attn_dropout)
 
             # If separate, also build separate encoders/attention for critic (A2C parity)
             if self.separate:
                 self.critic_point_encoder = self._build_point_encoder()
                 self.critic_proprio_encoder = self._build_proprio_encoder()
-                self.critic_self_attn = SelfAttentionBlock(self.hidden_dim, self.num_heads, dropout=self.attn_dropout)
-                self.critic_self_ffn = FeedForwardBlock(self.hidden_dim, self.ffn_ratio, dropout=self.ffn_dropout)
+                if self.use_self_attention:
+                    self.critic_self_attn = SelfAttentionBlock(self.hidden_dim, self.num_heads, dropout=self.attn_dropout)
+                    self.critic_self_ffn = FeedForwardBlock(self.hidden_dim, self.ffn_ratio, dropout=self.ffn_dropout)
                 self.critic_cross_attn = CrossAttentionBlock(self.hidden_dim, self.num_heads, dropout=self.attn_dropout)
 
             # Build trunks and output layers
@@ -471,9 +474,10 @@ class PointTransformerBuilder(A2CBuilder):
             else:
                 proprio_token = torch.zeros(B, 1, self.hidden_dim, device=obs.device)
             
-            # Self-attention over point tokens, then cross-attention from proprio
-            point_tokens = self.self_attn(point_tokens)
-            point_tokens = self.self_ffn(point_tokens)
+            # Self-attention over point tokens (if enabled), then cross-attention from proprio
+            if self.use_self_attention:
+                point_tokens = self.self_attn(point_tokens)
+                point_tokens = self.self_ffn(point_tokens)
             attn_out = self.cross_attn(proprio_token, point_tokens)  # (B, 1, hidden_dim)
             attn_features = attn_out[:, 0]  # (B, hidden_dim)
 
@@ -489,8 +493,9 @@ class PointTransformerBuilder(A2CBuilder):
                 # Recompute critic features with separate encoders/attention
                 critic_point_encoded = self.critic_point_encoder(point_flat)
                 critic_point_tokens = critic_point_encoded.view(B, self.num_points, self.hidden_dim)
-                critic_point_tokens = self.critic_self_attn(critic_point_tokens)
-                critic_point_tokens = self.critic_self_ffn(critic_point_tokens)
+                if self.use_self_attention:
+                    critic_point_tokens = self.critic_self_attn(critic_point_tokens)
+                    critic_point_tokens = self.critic_self_ffn(critic_point_tokens)
                 if self.proprio_dim > 0:
                     critic_proprio_encoded = self.critic_proprio_encoder(proprio_obs)
                     if self.proprio_norm is not None:

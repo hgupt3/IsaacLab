@@ -12,13 +12,14 @@ curriculum:
 
 # Basic visualization
 visualization:
-  targets: true
-  current_object: true
-  pose_axes: false
+  targets: false
+  current_object: false
+  pose_axes: true
   env_ids: null
   debug_print_rewards: false
   hand_pose_targets: true
   grasp_surface_point: false 
+  contact_forces: true
 
 # Fewer envs for visualization
 simulation:

@@ -27,6 +27,7 @@ params:
     partial_separate: True     # Share PT, detach critic features if true
     # Cross-Attention Point Network architecture
     # (Shared attention between actor/critic, separate final heads)
+    self_attention: False       # Self-attention on point tokens before cross-attention
     hidden_dim: 64            # Token embedding dimension
     num_heads: 2              # Cross-attention heads
     ffn_ratio: 1.0            # Token FFN expansion ratio
