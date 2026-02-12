@@ -120,6 +120,7 @@ def _get_finger_contact_mags(env: ManagerBasedRLEnv):
         return cached[1]
 
     nail_gate = env.cfg.y2r_cfg.rewards.contact_factor.nail_gate
+    nail_gate_min = env.cfg.y2r_cfg.rewards.contact_factor.nail_gate_min
 
     # Fast path: no gating needed
     if nail_gate >= 1.0:
@@ -177,6 +178,7 @@ def _get_finger_contact_mags(env: ManagerBasedRLEnv):
         #   beyond cutoff → gate = 0.0 (force does not register)
         cos_angle = dot / (mag + 1e-8)
         gate = torch.clamp((nail_gate - cos_angle) / (nail_gate + 1.0 + 1e-8), min=0.0, max=1.0)
+        gate = nail_gate_min + (1.0 - nail_gate_min) * gate
         return mag * gate
 
     # Store contact debug data for visualization (drawn by observations.py render_debug)

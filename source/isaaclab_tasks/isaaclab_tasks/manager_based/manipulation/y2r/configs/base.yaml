@@ -173,6 +173,7 @@ goal:
 rewards:
   contact_factor:
     nail_gate: 0.0                        # Cosine cutoff for pad-direction gating (0.0 = 90° cutoff, <0 = stricter, ≥1.0 = disabled)
+    nail_gate_min: 0.02                    # Floor on nail gate (0.0 = full cutoff, 0.1 = 10% of nail-direction force leaks through)
     finger_weights: [0.6, 0.5, 0.4]   # Diminishing weights for [1st, 2nd, 3rd] best non-thumb finger
     threshold: 1.0                         # Force threshold below which finger factor is 0 (N)
     ramp: 1.0                              # Range over which factor ramps 0→1 (N)
