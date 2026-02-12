@@ -1887,6 +1887,23 @@ class TrajectoryManager:
             override_quat = self.segment_hand_orientation[env_ids]
             prev_hand_quat_per_seg = torch.where(override_mask, override_quat, prev_hand_quat_per_seg)
 
+        # Keep orientation continuity across consecutive position_only segments:
+        # when previous segment is position_only, carry forward the actually used
+        # orientation instead of recomputing a new frozen quaternion from keypoints.
+        coupling_modes_local = self.coupling_modes[env_ids]
+        seg_indices = torch.arange(max_segs, device=self.device).unsqueeze(0).expand(n, -1)
+        valid_segments = seg_indices < self.num_segments[env_ids].unsqueeze(1)
+        has_override = self.segment_has_hand_orientation[env_ids]
+        for seg_idx in range(1, max_segs):
+            carry_mask = (
+                valid_segments[:, seg_idx]
+                & (coupling_modes_local[:, seg_idx] == 1)
+                & (coupling_modes_local[:, seg_idx - 1] == 1)
+                & (~has_override[:, seg_idx])
+            )
+            if carry_mask.any():
+                prev_hand_quat_per_seg[carry_mask, seg_idx] = prev_hand_quat_per_seg[carry_mask, seg_idx - 1]
+
         # Blend window for transitions from position_only -> full coupling
         boundary_blend_time_s = getattr(self.cfg.hand_trajectory, "boundary_blend_time_s", self.target_dt)
         blend_duration = max(boundary_blend_time_s, self.target_dt)
@@ -1992,43 +2009,25 @@ class TrajectoryManager:
             target_pos_d = self.release_pose[global_env_idx_d, :3]
             target_quat_d = self.release_pose[global_env_idx_d, 3:7]
 
-            # Compute starting pose for interpolation:
-            # Transform grasp keypoint using object pose at END of last manipulation segment
-            # This matches old code: final_grasp_pos_w = quat_apply(obj_quat_at_release, final_rel_pos) + obj_pos_at_release
-
-            # Find the last timestep of the previous segment
+            # Start from the ACTUAL last used hand pose of the previous segment.
+            # This guarantees continuity, especially for transitions from position_only.
             prev_seg_idx_d = (seg_idx_d - 1).clamp(min=0)
-            prev_seg_end_time = self.segment_boundaries[env_ids[env_idx_d], prev_seg_idx_d + 1]
-            prev_seg_end_idx = (prev_seg_end_time / self.target_dt).long().clamp(0, self.total_targets - 1)
+            prev_last_t_idx = last_timestep_per_segment[env_idx_d, prev_seg_idx_d]
+            has_prev_seg = seg_idx_d > 0
+            prev_has_steps = has_any_timesteps[env_idx_d, prev_seg_idx_d]
+            use_prev_pose = has_prev_seg & prev_has_steps
 
-            # Get object pose at that timestep
-            obj_pos_at_release = self.trajectory[global_env_idx_d, prev_seg_end_idx, :3]
-            obj_quat_at_release = self.trajectory[global_env_idx_d, prev_seg_end_idx, 3:7]
+            start_pos_d = torch.zeros(len(global_env_idx_d), 3, device=self.device)
+            start_quat_d = torch.zeros(len(global_env_idx_d), 4, device=self.device)
 
-            # Get grasp pose in object-local frame (last keypoint in chain)
-            # kp_chain structure: [grasp, kp_0, kp_1, ..., kp_{N-1}]
-            # - If num_kp == 0: final is grasp (from self.grasp_pose)
-            # - If num_kp == N: final is kp_{N-1} (from self.grasp_keypoints[:, N-1])
-            num_kp = self.num_grasp_keypoints[global_env_idx_d]
-            has_keypoints = num_kp > 0
+            if use_prev_pose.any():
+                start_pos_d[use_prev_pose] = positions_all[env_idx_d[use_prev_pose], prev_last_t_idx[use_prev_pose]]
+                start_quat_d[use_prev_pose] = orientations_all[env_idx_d[use_prev_pose], prev_last_t_idx[use_prev_pose]]
 
-            # For envs WITH keypoints: use last keypoint (index num_kp-1)
-            # For envs WITHOUT keypoints: use grasp pose
-            final_rel_pos = torch.zeros(len(global_env_idx_d), 3, device=self.device)
-            final_rel_quat = torch.zeros(len(global_env_idx_d), 4, device=self.device)
-
-            if has_keypoints.any():
-                kp_idx = (num_kp[has_keypoints] - 1).clamp(min=0)  # Last keypoint index (0-based)
-                final_rel_pos[has_keypoints] = self.grasp_keypoints[global_env_idx_d[has_keypoints], kp_idx, :3]
-                final_rel_quat[has_keypoints] = self.grasp_keypoints[global_env_idx_d[has_keypoints], kp_idx, 3:7]
-
-            if (~has_keypoints).any():
-                final_rel_pos[~has_keypoints] = self.grasp_pose[global_env_idx_d[~has_keypoints], :3]
-                final_rel_quat[~has_keypoints] = self.grasp_pose[global_env_idx_d[~has_keypoints], 3:7]
-
-            # Transform to world frame
-            final_grasp_pos_w = quat_apply(obj_quat_at_release, final_rel_pos) + obj_pos_at_release
-            final_grasp_quat_w = quat_mul(obj_quat_at_release, final_rel_quat)
+            if (~use_prev_pose).any():
+                fallback_env = global_env_idx_d[~use_prev_pose]
+                start_pos_d[~use_prev_pose] = self.start_palm_pose[fallback_env, :3]
+                start_quat_d[~use_prev_pose] = self.start_palm_pose[fallback_env, 3:7]
 
             # Local progress (linear)
             # Speed up retreat to complete before buffer ends, leaving room for hold at release
@@ -2044,9 +2043,9 @@ class TrajectoryManager:
             release_ease_power = getattr(self.cfg.trajectory, 'release_ease_power', 2.0)
             eased_t_d = local_t_d ** release_ease_power
 
-            # Interpolate with easing from final_grasp_pos_w to release pose
-            hand_pos_d = final_grasp_pos_w + eased_t_d.unsqueeze(1) * (target_pos_d - final_grasp_pos_w)
-            hand_quat_d = self._batched_slerp(final_grasp_quat_w, target_quat_d, eased_t_d)
+            # Interpolate with easing from previous hand pose to release pose
+            hand_pos_d = start_pos_d + eased_t_d.unsqueeze(1) * (target_pos_d - start_pos_d)
+            hand_quat_d = self._batched_slerp(start_quat_d, target_quat_d, eased_t_d)
 
             # Scatter write
             positions_all[env_idx_d, time_idx_d] = hand_pos_d
@@ -2640,9 +2639,15 @@ class TrajectoryManager:
         manip_end_idx = (self.t_manip_end[env_ids] / self.target_dt).long()  # (n,)
         current_idx = self.current_idx[env_ids]  # (n,)
 
-        # Get grasp pose relative to object (stored at reset)
-        grasp_pos_rel = self.grasp_pose[env_ids, :3]  # (n, 3)
-        grasp_quat_rel = self.grasp_pose[env_ids, 3:7]  # (n, 4)
+        # Build keypoint chain: [grasp, kp_0, kp_1, ..., kp_{N-1}]
+        num_kp = self.num_grasp_keypoints[env_ids]  # (n,)
+        max_kp = self.grasp_keypoints.shape[1]
+        kp_chain = torch.zeros(n, max_kp + 1, 7, device=self.device)
+        kp_chain[:, 0, :3] = self.grasp_pose[env_ids, :3]
+        kp_chain[:, 0, 3:7] = self.grasp_pose[env_ids, 3:7]
+        if max_kp > 0:
+            kp_chain[:, 1:, :3] = self.grasp_keypoints[env_ids, :, :3]
+            kp_chain[:, 1:, 3:7] = self.grasp_keypoints[env_ids, :, 3:7]
 
         # FULLY VECTORIZED: Update all envs at once - NO LOOP!
         # Clamp manipulation end indices to trajectory bounds
@@ -2664,18 +2669,47 @@ class TrajectoryManager:
         obj_pos = self.trajectory[env_range, time_indices, :3]  # (n, max_len, 3)
         obj_quat = self.trajectory[env_range, time_indices, 3:7]  # (n, max_len, 4)
 
-        # Expand grasp poses to match all timesteps
-        grasp_pos_expanded = grasp_pos_rel.unsqueeze(1).expand(n, max_len, 3)  # (n, max_len, 3)
-        grasp_quat_expanded = grasp_quat_rel.unsqueeze(1).expand(n, max_len, 4)  # (n, max_len, 4)
+        # Manipulation progress over [0, 1], matching initial generation semantics.
+        t_grasp_end = self.t_grasp_end[env_ids].unsqueeze(1)  # (n, 1)
+        manip_duration_total = (self.t_manip_end[env_ids] - self.t_grasp_end[env_ids]).clamp(min=1e-6).unsqueeze(1)  # (n, 1)
+        global_manip_progress = ((time_indices.float() * self.target_dt - t_grasp_end) / manip_duration_total).clamp(0, 1)  # (n, max_len)
+
+        # Interpolate keypoints in object-local frame for all replanned timesteps.
+        num_segments_kp = num_kp.clamp(min=1).unsqueeze(1).expand(n, max_len)  # (n, max_len)
+        seg_idx_kp = (global_manip_progress * num_segments_kp).long().clamp(min=0)
+        seg_start_kp = seg_idx_kp.float() / num_segments_kp
+        seg_end_kp = (seg_idx_kp + 1).float() / num_segments_kp
+        local_progress_kp = ((global_manip_progress - seg_start_kp) / (seg_end_kp - seg_start_kp).clamp(min=1e-6)).clamp(0, 1)
+
+        actual_max_chain_idx = max_kp
+        max_chain_idx = torch.where(
+            num_kp == 0,
+            torch.zeros_like(num_kp),
+            num_kp.clamp(max=actual_max_chain_idx),
+        ).unsqueeze(1).expand(n, max_len)
+        from_idx_kp = seg_idx_kp.clamp(max=max_chain_idx)
+        to_idx_kp = (seg_idx_kp + 1).clamp(max=max_chain_idx)
+
+        env_idx_2d = torch.arange(n, device=self.device).unsqueeze(1).expand(n, max_len)
+        env_idx_flat_local = env_idx_2d.reshape(-1)
+        from_idx_flat = from_idx_kp.reshape(-1)
+        to_idx_flat = to_idx_kp.reshape(-1)
+        local_t_flat = local_progress_kp.reshape(-1)
+
+        from_pos_local_flat = kp_chain[env_idx_flat_local, from_idx_flat, :3]
+        from_quat_local_flat = kp_chain[env_idx_flat_local, from_idx_flat, 3:7]
+        to_pos_local_flat = kp_chain[env_idx_flat_local, to_idx_flat, :3]
+        to_quat_local_flat = kp_chain[env_idx_flat_local, to_idx_flat, 3:7]
+
+        interp_pos_local_flat = from_pos_local_flat + local_t_flat.unsqueeze(1) * (to_pos_local_flat - from_pos_local_flat)
+        interp_quat_local_flat = self._batched_slerp(from_quat_local_flat, to_quat_local_flat, local_t_flat)
 
         # Batched transforms: flatten, transform, reshape
         obj_pos_flat = obj_pos.reshape(n * max_len, 3)
         obj_quat_flat = obj_quat.reshape(n * max_len, 4)
-        grasp_pos_flat = grasp_pos_expanded.reshape(n * max_len, 3)
-        grasp_quat_flat = grasp_quat_expanded.reshape(n * max_len, 4)
 
         # Position ALWAYS follows object (for both full and position_only coupling)
-        hand_pos_flat = quat_apply(obj_quat_flat, grasp_pos_flat) + obj_pos_flat  # (n*max_len, 3)
+        hand_pos_flat = quat_apply(obj_quat_flat, interp_pos_local_flat) + obj_pos_flat  # (n*max_len, 3)
         hand_pos = hand_pos_flat.reshape(n, max_len, 3)
 
         # Orientation depends on coupling mode
@@ -2715,7 +2749,7 @@ class TrajectoryManager:
         # FULL coupling (mode 0): orientation follows object
         full_mask = (coupling_modes_flat == 0)
         if full_mask.any():
-            hand_quat_full = quat_mul(obj_quat_flat[full_mask], grasp_quat_flat[full_mask])
+            hand_quat_full = quat_mul(obj_quat_flat[full_mask], interp_quat_local_flat[full_mask])
 
             # Smooth transition when coming from position_only segment
             boundary_blend_time_s = getattr(self.cfg.hand_trajectory, "boundary_blend_time_s", self.target_dt)
@@ -2766,6 +2800,14 @@ class TrajectoryManager:
                 frozen_quat = torch.where(has_override.unsqueeze(1), override_quat, frozen_quat)
 
             hand_quat.reshape(n * max_len, 4)[pos_only_mask] = frozen_quat
+
+        # DECOUPLED (mode 2): keep existing targets in replanned window.
+        # This avoids invalid zero quaternions if mode=none appears unexpectedly.
+        decouple_mask = (coupling_modes_flat == 2)
+        if decouple_mask.any():
+            existing_hand_flat = self.hand_trajectory[env_idx_flat, time_indices.reshape(-1)]
+            hand_quat.reshape(n * max_len, 4)[decouple_mask] = existing_hand_flat[decouple_mask, 3:7]
+            hand_pos.reshape(n * max_len, 3)[decouple_mask] = existing_hand_flat[decouple_mask, :3]
 
         # Scatter write using mask (only write valid timesteps)
         valid_env_idx = env_range[range_mask]  # (num_valid,)

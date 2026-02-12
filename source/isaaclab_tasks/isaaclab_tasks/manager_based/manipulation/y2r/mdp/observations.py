@@ -1235,6 +1235,7 @@ class target_sequence_obs_b(ManagerTermBase):
         # Same approach as termination_manager._last_episode_dones:
         # updated at reset, reported as global mean for consistent denominators.
         self._last_success = torch.zeros(N, dtype=torch.bool, device=device)
+        self._last_time_out = torch.zeros(N, dtype=torch.bool, device=device)
         self._last_reached_release = torch.zeros(N, dtype=torch.bool, device=device)
         self._last_phase = torch.zeros(N, device=device)
         self._last_mean_pos_error = torch.zeros(N, device=device)
@@ -1264,7 +1265,14 @@ class target_sequence_obs_b(ManagerTermBase):
                 sc = self._ep_step_count[valid].clamp(min=1)
 
                 # Snapshot finished-episode metrics into last-episode buffers
-                self._last_success[valid] = self._ep_success_ever[valid]
+                # "True success" = succeeded and episode ended via timeout (successful termination).
+                # This keeps success_rate semantics aligned with termination outcomes.
+                if hasattr(self.env, "reset_time_outs") and self.env.reset_time_outs is not None:
+                    time_out_valid = self.env.reset_time_outs[valid]
+                else:
+                    time_out_valid = torch.zeros_like(self._ep_success_ever[valid])
+                self._last_time_out[valid] = time_out_valid
+                self._last_success[valid] = self._ep_success_ever[valid] & time_out_valid
                 self._last_reached_release[valid] = self._ep_reached_release[valid]
                 self._last_phase[valid] = self._ep_last_phase[valid]
                 self._last_mean_pos_error[valid] = self._ep_pos_error_sum[valid] / sc

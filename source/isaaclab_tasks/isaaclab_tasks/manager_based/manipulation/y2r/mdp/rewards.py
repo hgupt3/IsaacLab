@@ -171,12 +171,12 @@ def _get_finger_contact_mags(env: ManagerBasedRLEnv):
         link_quat = robot.data.body_quat_w[:, body_idx]  # (N, 4) wxyz
         pad_w = math_utils.quat_apply(link_quat, pad_local.unsqueeze(0).expand(env.num_envs, 3))
         dot = (force_w * pad_w).sum(dim=-1)
-        # Smooth gate: cos_angle ∈ [-1, +1] (pad_w is unit length)
+        # Directional gate: cos_angle ∈ [-1, +1] (pad_w is unit length)
         #   -1 = force perfectly into pad → gate = 1.0
-        #   +1 = force perfectly into nail → gate = nail_gate
+        #   nail_gate = cutoff cosine angle → gate = 0.0
+        #   beyond cutoff → gate = 0.0 (force does not register)
         cos_angle = dot / (mag + 1e-8)
-        t = (cos_angle + 1.0) * 0.5  # [0, 1]: 0=pad, 1=nail
-        gate = 1.0 - t * (1.0 - nail_gate)
+        gate = torch.clamp((nail_gate - cos_angle) / (nail_gate + 1.0 + 1e-8), min=0.0, max=1.0)
         return mag * gate
 
     # Store contact debug data for visualization (drawn by observations.py render_debug)

@@ -25,8 +25,6 @@ params:
     name: point_transformer
     separate: False
     partial_separate: True     # Share PT, detach critic features if true
-    # Cross-Attention Point Network architecture
-    # (Shared attention between actor/critic, separate final heads)
     self_attention: True       # Self-attention on point tokens before cross-attention
     hidden_dim: 64            # Token embedding dimension
     num_heads: 2              # Cross-attention heads
@@ -79,22 +77,22 @@ params:
     normalize_advantage: True
     gamma: 0.998
     tau: 0.95
-    learning_rate: 1e-3
+    learning_rate: 5e-4
     lr_schedule: adaptive
     schedule_type: legacy
-    kl_threshold: 0.01
+    kl_threshold: 0.012
     score_to_win: 100000000
     max_epochs: 750000
     save_best_after: 100
     save_frequency: 50
     print_stats: True
     grad_norm: 1.0
-    entropy_coef: 0.0025
+    entropy_coef: 0.002
     truncate_grads: True
     e_clip: 0.2
     horizon_length: 32
     minibatch_size: 32768
-    mini_epochs: 5
+    mini_epochs: 4
     critic_coef: 4
     clip_value: True
     clip_actions: False
