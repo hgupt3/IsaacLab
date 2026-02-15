@@ -353,3 +353,58 @@ def reset_camera_offset(
 
     # Set position only — orientation stays unchanged (preserves spawn-time OpenGL convention)
     camera.set_world_poses(positions=new_cam_pos_w, env_ids=env_ids)
+
+
+def reset_visibility_camera_pose(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    workspace_center: tuple[float, float, float],
+    distance_range: tuple[float, float],
+    yaw_range: tuple[float, float],
+    pitch_range: tuple[float, float],
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("visibility_camera"),
+):
+    """Randomize visibility camera pose using spherical coordinates at reset.
+
+    Places the camera at a random (distance, yaw, pitch) relative to the workspace
+    center and orients it to look at that center.
+
+    Args:
+        env: The environment instance.
+        env_ids: Environment indices to reset.
+        workspace_center: (x, y, z) center of the workspace in env-local frame.
+        distance_range: (min, max) distance from workspace center in meters.
+        yaw_range: (min, max) yaw in degrees.
+        pitch_range: (min, max) pitch (elevation) in degrees.
+        sensor_cfg: Configuration for the camera sensor.
+    """
+    camera = env.scene[sensor_cfg.name]
+    device = env.device
+    n = len(env_ids)
+    if n == 0:
+        return
+
+    # Sample spherical coordinates
+    dist = torch.empty(n, device=device).uniform_(distance_range[0], distance_range[1])
+    yaw_deg = torch.empty(n, device=device).uniform_(yaw_range[0], yaw_range[1])
+    pitch_deg = torch.empty(n, device=device).uniform_(pitch_range[0], pitch_range[1])
+
+    yaw = torch.deg2rad(yaw_deg)
+    pitch = torch.deg2rad(pitch_deg)
+
+    # Spherical to Cartesian offset from workspace center
+    cos_pitch = torch.cos(pitch)
+    dx = dist * cos_pitch * torch.cos(yaw)
+    dy = dist * cos_pitch * torch.sin(yaw)
+    dz = dist * torch.sin(pitch)
+
+    # Workspace center in world frame (env origins + local center)
+    env_origins = env.scene.env_origins[env_ids]  # (n, 3)
+    ws_center = torch.tensor(workspace_center, dtype=torch.float32, device=device)
+    target_w = env_origins + ws_center.unsqueeze(0)  # (n, 3)
+
+    # Camera positions in world frame
+    offsets = torch.stack([dx, dy, dz], dim=-1)  # (n, 3)
+    cam_pos_w = target_w + offsets  # (n, 3)
+
+    camera.set_world_poses_from_view(eyes=cam_pos_w, targets=target_w, env_ids=env_ids)

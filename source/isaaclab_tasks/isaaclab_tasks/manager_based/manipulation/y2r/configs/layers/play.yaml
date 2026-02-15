@@ -10,20 +10,25 @@ curriculum:
   difficulty:
     initial: 3
 
+# mode:                                                                                                                                                                                                    
+#   use_student_mode: true
+
 # Basic visualization
 visualization:
   targets: false
   current_object: false
-  pose_axes: true
+  pose_axes: false
   env_ids: null
   debug_print_rewards: false
-  hand_pose_targets: true
+  hand_pose_targets: false
   grasp_surface_point: false 
-  contact_forces: true
+  contact_forces: false
+  # student_visible: true
+  # student_target: true
 
 # Fewer envs for visualization
 simulation:
-  num_envs: 2
+  num_envs: 1
 
 procedural_objects:
   generation:

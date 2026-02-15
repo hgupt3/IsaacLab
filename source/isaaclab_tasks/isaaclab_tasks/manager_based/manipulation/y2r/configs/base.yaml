@@ -47,7 +47,7 @@ observations:
     student_proprio: 8          # Student proprioception (joint pos/vel, hand eigen)
     student_poses: 8            # Student current hand pose history
     student_future_poses: 1     # Student future hand pose targets
-    student_pc: 1               # Visible point cloud from pseudo-camera
+    student_pc: 1               # Visible point cloud from visibility camera
     student_targets: 1          # Visible target sequence
     student_camera: 1           # Wrist depth camera history
 
@@ -175,8 +175,8 @@ rewards:
     nail_gate: 0.0                        # Cosine cutoff for pad-direction gating (0.0 = 90° cutoff, <0 = stricter, ≥1.0 = disabled)
     nail_gate_min: 0.02                    # Floor on nail gate (0.0 = full cutoff, 0.1 = 10% of nail-direction force leaks through)
     finger_weights: [0.6, 0.5, 0.4]   # Diminishing weights for [1st, 2nd, 3rd] best non-thumb finger
-    threshold: 1.0                         # Force threshold below which finger factor is 0 (N)
-    ramp: 1.0                              # Range over which factor ramps 0→1 (N)
+    threshold: 0.0                         # Force threshold below which finger factor is 0 (N)
+    ramp: 4.0                              # Range over which factor ramps 0→1 (N)
     min_factor: 0.0                       # Floor so factor never fully zeroes
 
   action_l2:
@@ -501,16 +501,23 @@ push_t:
   outline_has_gravity: false    # Enable gravity on outline
 
 # ==============================================================================
-# PSEUDO CAMERA (for visible point cloud filtering)
+# VISIBILITY CAMERA (true occlusion via instance segmentation + depth)
 # ==============================================================================
-pseudo_camera:
-  position: [-1.0, 0.0, 0.3]     # [x, y, z] relative to env origin (meters)
+visibility_camera:
+  width: 32
+  height: 32
+  focal_length: 5.52              # Yields ~57deg HFOV with 6.0mm aperture
+  horizontal_aperture: 6.0
+  clipping_range: [0.1, 2.0]
+  # Radial domain randomization (spherical coords from workspace center)
+  distance: [0.8, 1.2]            # meters
+  yaw: [-90.0, 90.0]            # degrees (full circle)
+  pitch: [20.0, 60.0]            # degrees (elevation)
 
 # ==============================================================================
 # WRIST CAMERA  (Gemini 305 depth — pinhole, square pixels, HFOV 88°)
 # ==============================================================================
 wrist_camera:
-  enabled: false
   width: 80                     # Gemini 305 native 16:10 aspect ratio (1280:800)
   height: 50
   focal_length: 3.19            # 88° HFOV: 6.17 / (2×tan(44°))

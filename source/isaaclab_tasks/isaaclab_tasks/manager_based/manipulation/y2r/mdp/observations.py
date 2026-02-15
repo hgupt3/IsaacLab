@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from typing import TYPE_CHECKING
 
 from isaaclab.assets import Articulation, RigidObject
@@ -76,6 +77,19 @@ def _points_to_frame(frame_pos: torch.Tensor, frame_quat: torch.Tensor, points_w
     delta = points_w - frame_pos.unsqueeze(1)    # (N, P, 3)
     t = torch.cross(inv_xyz.expand_as(delta), delta, dim=-1) * 2
     return delta + w * t + torch.cross(inv_xyz.expand_as(t), t, dim=-1)
+
+
+@torch.jit.script
+def _quat_conjugate(quat: torch.Tensor) -> torch.Tensor:
+    """Conjugate (inverse for unit quaternions): negate xyz components.
+
+    Args:
+        quat: (N, 4) quaternion (w, x, y, z).
+
+    Returns:
+        Conjugated quaternion (N, 4).
+    """
+    return torch.cat([quat[:, 0:1], -quat[:, 1:]], dim=-1)
 
 
 # ==============================================================================
@@ -575,82 +589,160 @@ class object_point_cloud_b(ManagerTermBase):
         return object_point_cloud_pos_b.view(env.num_envs, -1) if flatten else object_point_cloud_pos_b
 
 
+def _bilinear_sample_depth(depth: torch.Tensor, rows: torch.Tensor, cols: torch.Tensor) -> torch.Tensor:
+    """Bilinear interpolation of depth at continuous (row, col) coordinates.
+
+    Args:
+        depth: (N, H, W) depth map.
+        rows: (N, K) continuous row coords in [0, H-1].
+        cols: (N, K) continuous col coords in [0, W-1].
+
+    Returns:
+        (N, K) interpolated depth values.
+    """
+    H, W = depth.shape[1], depth.shape[2]
+    # Normalize to [-1, 1] for grid_sample
+    grid_x = 2.0 * cols / (W - 1) - 1.0
+    grid_y = 2.0 * rows / (H - 1) - 1.0
+    grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(2)  # (N, K, 1, 2)
+
+    sampled = F.grid_sample(
+        depth.unsqueeze(1), grid,  # (N, 1, H, W), (N, K, 1, 2)
+        mode='bilinear', padding_mode='border', align_corners=True
+    )
+    return sampled.squeeze(1).squeeze(-1)  # (N, K)
+
+
 class visible_object_point_cloud_b(ManagerTermBase):
-    """Visible object point cloud from a pseudo-camera viewpoint.
-    
-    Samples points on object surface and filters to only include points
-    visible from the pseudo-camera position (using self-occlusion / back-face culling).
-    Points whose surface normals face away from the camera are hidden.
-    
+    """Visible object point cloud via TiledCamera instance segmentation + depth.
+
+    Uses a visibility camera that renders instance_id_segmentation_fast and
+    distance_to_image_plane to determine truly unoccluded object pixels. Samples
+    random continuous (u,v) coordinates within the segmented object region,
+    bilinearly interpolates depth, and back-projects to 3D keypoints.
+
+    Between resamples, cached object-local points are transformed by current
+    object pose. When no object pixels are visible, the last cached points are
+    kept (still transformed by current pose, so positionally plausible).
+
     Args (from ``cfg.params``):
         object_cfg: Scene entity for the object. Defaults to ``SceneEntityCfg("object")``.
         ref_asset_cfg: Scene entity for reference frame. Defaults to ``SceneEntityCfg("robot")``.
         num_points: Number of visible points to return. Defaults to config value.
-        
+
     Returns (from ``__call__``):
         Flattened tensor of shape ``(num_envs, num_points * 3)``.
     """
-    
-    # Blue color for visible point cloud visualization
-    VISIBLE_POINT_COLOR = (0.0, 0.0, 1.0)  # Bright blue
+
+    VISIBLE_POINT_COLOR = (0.0, 0.0, 1.0)
     POINT_RADIUS = 0.003
-    
+
     def __init__(self, cfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
-        
+
         self.object_cfg: SceneEntityCfg = cfg.params.get("object_cfg", SceneEntityCfg("object"))
         self.ref_asset_cfg: SceneEntityCfg = cfg.params.get("ref_asset_cfg", SceneEntityCfg("robot"))
-        
-        # Get config - use student_num_points for student observations
+
         y2r_cfg = env.cfg.y2r_cfg
         self.num_points: int = cfg.params.get("num_points", y2r_cfg.observations.student_num_points)
         self.pool_size: int = y2r_cfg.observations.point_pool_size
-        self.pseudo_camera_pos: tuple = y2r_cfg.pseudo_camera.position
         self.visualize: bool = y2r_cfg.visualization.student_visible
         self.visualize_env_ids: list | None = y2r_cfg.visualization.env_ids
-        
+
         self.object: RigidObject = env.scene[self.object_cfg.name]
         self.ref_asset: Articulation = env.scene[self.ref_asset_cfg.name]
+        self.camera = env.scene["visibility_camera"]
         self.env = env
-        
-        # Compute resample interval: resample every window_size target updates
-        # This means visibility is resampled when the entire target window advances
+
+        # Resample interval: resample every window_size target updates
         target_hz = y2r_cfg.trajectory.target_hz
         window_size = y2r_cfg.trajectory.window_size
-        policy_dt = env.step_dt  # Time per policy step
-        steps_per_target = 1.0 / (target_hz * policy_dt)  # Steps between target updates
+        policy_dt = env.step_dt
+        steps_per_target = 1.0 / (target_hz * policy_dt)
         self.resample_interval: int = max(1, int(window_size * steps_per_target))
-        
-        # Get the point cloud cache with normals and move to GPU
+
+        # Fallback pool: surface points for envs with zero visibility
         all_env_ids = list(range(env.num_envs))
         cache = get_point_cloud_cache(all_env_ids, self.object.cfg.prim_path, self.pool_size)
-        
-        # Move cache tensors to GPU once (avoid CPU-GPU transfer every frame)
         self.geo_indices = cache.geo_indices.to(env.device)
         self.scales = cache.scales.to(env.device)
         self.all_base_points = cache.all_base_points.to(env.device)
-        self.all_base_normals = cache.all_base_normals.to(env.device)
-        
-        # Pre-compute camera position tensor (relative to env origins)
-        camera_offset = torch.tensor(self.pseudo_camera_pos, device=env.device, dtype=torch.float32)
-        self.camera_offset = camera_offset.unsqueeze(0)  # (1, 3) for broadcasting
-        
-        # Pre-allocate output buffer
-        self.output = torch.zeros(env.num_envs, self.num_points, 3, device=env.device)
-        
-        # For visualization - store world-space points
+
+        # State
+        self.cached_points_local = None  # (N, num_points, 3) in object-local frame
+        self._step_counter = 0
+        self._object_instance_ids = None  # Lazy-init on first render
         self.selected_points_w = None
-        
-        # Cached visibility sampling (resample at target_hz rate)
-        self.cached_indices = None  # (N, num_points) selected point indices
-        self.cached_points_local = None  # (N, num_points, 3) selected points in local frame
-        self._step_counter = 0  # CPU-side counter to avoid GPU sync for resample check
-        
-        # Initialize visualization if enabled
+
+        # Visualization
         self.markers = None
         if self.visualize:
             self._init_visualizer()
-        
+
+    def _discover_object_instance_ids(self):
+        """Discover instance IDs belonging to the object from camera metadata.
+
+        Called once after the first render so the info dict is populated.
+        Builds a set of integer IDs whose prim paths contain '/Object'.
+        """
+        info = self.camera.data.info
+
+        # Camera API differs across sensor implementations:
+        # - TiledCamera: dict keyed by data_type
+        # - Camera/RayCasterCamera: list[dict] per env
+        if isinstance(info, list):
+            if not info:
+                self._object_instance_ids = set()
+                return
+            info_dict = info[0]
+        elif isinstance(info, dict):
+            info_dict = info
+        else:
+            self._object_instance_ids = set()
+            return
+
+        seg_info = info_dict.get("instance_id_segmentation_fast", info_dict.get("instance_segmentation_fast", {}))
+        if not isinstance(seg_info, dict):
+            self._object_instance_ids = set()
+            return
+
+        object_ids = set()
+        for id_str, prim_meta in seg_info.items():
+            if isinstance(prim_meta, str):
+                prim_path = prim_meta
+            elif isinstance(prim_meta, dict):
+                prim_path = (
+                    prim_meta.get("primPath")
+                    or prim_meta.get("prim_path")
+                    or prim_meta.get("path")
+                    or ""
+                )
+            else:
+                prim_path = ""
+
+            if "/Object" in prim_path:
+                object_ids.add(int(id_str))
+
+        self._object_instance_ids = object_ids
+
+    def _build_object_mask(self, inst_id: torch.Tensor) -> torch.Tensor:
+        """Build boolean mask of pixels belonging to the object.
+
+        Args:
+            inst_id: (N, H, W) integer instance IDs.
+
+        Returns:
+            (N, H, W) boolean mask.
+        """
+        if not self._object_instance_ids:
+            return torch.zeros_like(inst_id, dtype=torch.bool)
+
+        # Build mask by OR-ing matches for each known object ID
+        mask = torch.zeros_like(inst_id, dtype=torch.bool)
+        for oid in self._object_instance_ids:
+            mask |= (inst_id == oid)
+        return mask
+
     def __call__(
         self,
         env: ManagerBasedRLEnv,
@@ -659,193 +751,156 @@ class visible_object_point_cloud_b(ManagerTermBase):
         num_points: int = 64,
         flatten: bool = True,
     ) -> torch.Tensor:
-        """Compute visible point cloud from pseudo-camera viewpoint.
-        
-        Visibility sampling happens at target_hz rate (not every step) for efficiency.
-        Between resamples, cached indices are used with updated object poses.
-        
-        Args:
-            env: The environment.
-            ref_asset_cfg: Reference frame (robot).
-            object_cfg: Object to sample.
-            num_points: Number of points (from init).
-            flatten: If True, return flattened tensor.
-            
-        Returns:
-            Tensor of shape (num_envs, num_points * 3) if flattened.
-        """
         N = env.num_envs
-        P = self.pool_size
         num_pts = self.num_points
         device = env.device
-        
-        # Get per-env geometry data (already on GPU)
-        geo_indices = self.geo_indices[:N]  # (N,)
-        scales = self.scales[:N]  # (N, 3)
-        
-        # Index into cached points/normals (all on GPU)
-        pool_points_local = self.all_base_points[geo_indices]   # (N, P, 3)
-        pool_normals_local = self.all_base_normals[geo_indices]  # (N, P, 3)
-        
-        # Apply per-env scale to points (normals don't scale)
-        pool_points_local = pool_points_local * scales.unsqueeze(1)  # (N, P, 3)
-        
-        # Determine if resampling is needed using a CPU-side counter to avoid
-        # GPU sync (.any().item() forces a pipeline stall every step).
-        # Resets are handled by always resampling at the interval — any env that
-        # reset within the last interval steps will get fresh samples.
-        needs_resample = self.cached_indices is None
 
+        # Check resample via CPU counter (no GPU sync)
+        needs_resample = self.cached_points_local is None
         if not needs_resample:
             self._step_counter += 1
             needs_resample = self._step_counter >= self.resample_interval
             if needs_resample:
                 self._step_counter = 0
-        
+
         if needs_resample:
-            # Full visibility resampling
-            object_pos_w = self.object.data.root_pos_w  # (N, 3)
-            object_quat_w = self.object.data.root_quat_w  # (N, 4)
+            # Lazy-init instance IDs from first render
+            if self._object_instance_ids is None:
+                self._discover_object_instance_ids()
 
-            # Transform to world (broadcast, no expand)
-            pool_points_w = _quat_rotate_vec(object_quat_w, pool_points_local) + object_pos_w.unsqueeze(1)  # (N, P, 3)
-            pool_normals_w = _quat_rotate_vec(object_quat_w, pool_normals_local)  # (N, P, 3)
-            pool_normals_w = pool_normals_w / (pool_normals_w.norm(dim=-1, keepdim=True) + 1e-8)
+            camera = self.camera
 
-            # Camera position in world
-            env_origins = env.scene.env_origins  # (N, 3)
-            camera_pos_w = env_origins + self.camera_offset  # (N, 3)
+            # 1. Fetch rendered data
+            depth = camera.data.output["distance_to_image_plane"]          # (N, H, W, 1)
+            inst_id = camera.data.output["instance_id_segmentation_fast"]  # (N, H, W, 1)
+            depth = depth.squeeze(-1)     # (N, H, W)
+            inst_id = inst_id.squeeze(-1).int()  # (N, H, W)
 
-            # Compute visibility
-            view_dirs = camera_pos_w.unsqueeze(1) - pool_points_w  # (N, P, 3)
-            view_dirs = view_dirs / (view_dirs.norm(dim=-1, keepdim=True) + 1e-8)
-            visibility = (pool_normals_w * view_dirs).sum(dim=-1)  # (N, P)
+            H, W = depth.shape[1], depth.shape[2]
 
-            # Sample visible points
-            selected_indices = self._sample_visible_batched(visibility, num_pts)  # (N, num_pts)
+            # 2. Build object mask
+            object_mask = self._build_object_mask(inst_id)  # (N, H, W) bool
+            mask_flat = object_mask.view(N, -1).float()     # (N, H*W)
+            has_object = mask_flat.sum(dim=-1) > 0           # (N,)
 
-            # Cache indices and local points
-            self.cached_indices = selected_indices
-            batch_idx = torch.arange(N, device=device).unsqueeze(1).expand(-1, num_pts)
-            self.cached_points_local = pool_points_local[batch_idx, selected_indices]  # (N, num_pts, 3)
+            # 3. Sample pixel cells from masked region (multinomial with replacement)
+            weights = mask_flat.clone()
+            weights[~has_object] = 1.0  # placeholder so multinomial doesn't fail
+            sampled_cells = torch.multinomial(weights, num_pts, replacement=True)  # (N, K)
 
-        # Use cached local points and transform to current world frame (broadcast, no expand)
-        object_pos_w = self.object.data.root_pos_w  # (N, 3)
-        object_quat_w = self.object.data.root_quat_w  # (N, 4)
+            rows_center = (sampled_cells // W).float()  # (N, K)
+            cols_center = (sampled_cells % W).float()   # (N, K)
 
+            # Sub-pixel jitter for continuous area sampling
+            rows_cont = (rows_center + torch.rand_like(rows_center) - 0.5).clamp(0, H - 1)
+            cols_cont = (cols_center + torch.rand_like(cols_center) - 0.5).clamp(0, W - 1)
+
+            # 4. Bilinear depth interpolation
+            depth_interp = _bilinear_sample_depth(depth, rows_cont, cols_cont)  # (N, K)
+
+            # 5. Back-project to 3D in camera frame
+            # Isaac Sim TiledCamera uses OpenGL convention: x-right, y-up, z-backward
+            # Pixel (col, row) maps to: x = (col - cx) * z / fx, y = -(row - cy) * z / fy (y flipped for image coords)
+            intrinsics = camera.data.intrinsic_matrices  # (N, 3, 3)
+            fx = intrinsics[:, 0, 0]  # (N,)
+            fy = intrinsics[:, 1, 1]
+            cx = intrinsics[:, 0, 2]
+            cy = intrinsics[:, 1, 2]
+
+            # OpenGL camera: image row increases downward but camera Y points up
+            x_cam = (cols_cont - cx.unsqueeze(1)) * depth_interp / fx.unsqueeze(1)
+            y_cam = -(rows_cont - cy.unsqueeze(1)) * depth_interp / fy.unsqueeze(1)
+            z_cam = -depth_interp  # OpenGL: depth is along -Z
+            points_cam = torch.stack([x_cam, y_cam, z_cam], dim=-1)  # (N, K, 3)
+
+            # 6. Camera frame -> world frame
+            cam_pos_w = camera.data.pos_w          # (N, 3)
+            cam_quat_w = camera.data.quat_w_opengl  # (N, 4) wxyz, OpenGL convention
+            points_w = _quat_rotate_vec(cam_quat_w, points_cam) + cam_pos_w.unsqueeze(1)
+
+            # 7. World frame -> object-local frame (for caching)
+            obj_pos_w = self.object.data.root_pos_w
+            obj_quat_w = self.object.data.root_quat_w
+            inv_quat = _quat_conjugate(obj_quat_w)
+            new_cached = _quat_rotate_vec(inv_quat, points_w - obj_pos_w.unsqueeze(1))
+
+            # 8. Handle zero-visibility: keep last cached points for those envs
+            if self.cached_points_local is not None:
+                self.cached_points_local[has_object] = new_cached[has_object]
+            else:
+                # First call — use pool points as fallback for no-visibility envs
+                self.cached_points_local = new_cached
+                no_vis = ~has_object
+                if no_vis.any():
+                    geo_idx = self.geo_indices[:N]
+                    scales = self.scales[:N]
+                    pool_local = self.all_base_points[geo_idx] * scales.unsqueeze(1)  # (N, P, 3)
+                    n_no = int(no_vis.sum())
+                    fallback_idx = torch.randint(0, self.pool_size, (n_no, num_pts), device=device)
+                    batch = torch.arange(n_no, device=device).unsqueeze(1)
+                    self.cached_points_local[no_vis] = pool_local[no_vis][batch, fallback_idx]
+
+        # Transform cached local points to current world frame
+        object_pos_w = self.object.data.root_pos_w
+        object_quat_w = self.object.data.root_quat_w
         selected_points_w = _quat_rotate_vec(object_quat_w, self.cached_points_local) + object_pos_w.unsqueeze(1)
 
-        # Store visible points in object-local frame for visible_target_sequence_obs_b
-        env._visible_points_local = self.cached_points_local  # (N, num_points, 3)
+        # Store for visible_target_sequence_obs_b
+        env._visible_points_local = self.cached_points_local
 
-        # Transform to robot base frame (fused inverse rotate + translate)
+        # Transform to robot base frame
         points_b = _points_to_frame(self.ref_asset.data.root_pos_w, self.ref_asset.data.root_quat_w, selected_points_w)
 
-        # Store for visualization and visualize if enabled
+        # Visualization
         self.selected_points_w = selected_points_w
         if self.visualize and self.markers is not None:
             self._visualize(selected_points_w, N)
 
         return points_b.view(N, -1) if flatten else points_b
-    
+
     def _init_visualizer(self):
         """Initialize blue sphere markers for visible point cloud."""
         import isaaclab.sim as sim_utils
         from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
-        
+
         markers_dict = {
             "visible": sim_utils.SphereCfg(
                 radius=self.POINT_RADIUS,
                 visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=self.VISIBLE_POINT_COLOR),
             ),
         }
-        
+
         self.markers = VisualizationMarkers(
             VisualizationMarkersCfg(
                 prim_path="/Visuals/StudentVisiblePointCloud",
                 markers=markers_dict,
             )
         )
-    
+
     def _visualize(self, points_w: torch.Tensor, num_envs: int):
-        """Visualize visible point cloud with blue markers.
-        
-        Args:
-            points_w: (N, num_points, 3) selected visible points in world space.
-            num_envs: Number of environments.
-        """
-        # Determine which envs to visualize
+        """Visualize visible point cloud with blue markers."""
         if self.visualize_env_ids is None:
             env_ids = list(range(num_envs))
         elif len(self.visualize_env_ids) == 0:
-            return  # Empty list means no visualization
+            return
         else:
             env_ids = [i for i in self.visualize_env_ids if i < num_envs]
-        
+
         if not env_ids:
             return
-        
+
         P = points_w.shape[1]
         E = len(env_ids)
         device = points_w.device
-        
-        # Gather points for selected envs
-        selected_pts = points_w[env_ids]  # (E, P, 3)
-        
-        # Flatten: (E, P, 3) -> (E*P, 3)
+
+        selected_pts = points_w[env_ids]
         positions = selected_pts.reshape(-1, 3)
-        
-        # All points use the same marker (index 0 = "visible")
         marker_indices = torch.zeros(E * P, dtype=torch.long, device=device)
-        
+
         self.markers.visualize(
             translations=positions,
             marker_indices=marker_indices,
         )
-    
-    def _sample_visible_batched(self, visibility: torch.Tensor, num_points: int) -> torch.Tensor:
-        """Randomly sample N points from visible set, fully batched.
-        
-        Args:
-            visibility: (N, pool) - dot product scores, >0 means visible.
-            num_points: Number of points to select.
-            
-        Returns:
-            indices: (N, num_points) - selected point indices per env.
-        """
-        N, P = visibility.shape
-        device = visibility.device
-        
-        visible_mask = visibility > 0  # (N, P)
-        
-        # Assign random priority to visible, -inf to hidden
-        random_scores = torch.where(
-            visible_mask,
-            torch.rand(N, P, device=device),
-            torch.full((N, P), float('-inf'), device=device)
-        )
-        
-        # topk is O(N*k) vs sort's O(N*P*logP) — ~8x faster for k=32, P=256
-        _, selected = random_scores.topk(num_points, dim=-1)  # (N, num_points)
-
-        # Handle edge case: if < num_points visible, repeat from visible ones
-        num_visible = visible_mask.sum(dim=-1, keepdim=True)  # (N, 1)
-        needs_repeat = num_visible < num_points
-
-        if needs_repeat.any():
-            # topk puts visible (positive scores) first, hidden (-inf) last.
-            # Wrap indices to cycle through the visible portion of selected.
-            repeat_idx = torch.arange(num_points, device=device).unsqueeze(0)  # (1, num_points)
-            wrapped_idx = (repeat_idx % num_visible.clamp(min=1)).long()  # (N, num_points)
-            repeated = selected.gather(1, wrapped_idx)
-
-            selected = torch.where(
-                needs_repeat.expand(-1, num_points),
-                repeated,
-                selected
-            )
-        
-        return selected
 
 
 class visible_target_sequence_obs_b(ManagerTermBase):

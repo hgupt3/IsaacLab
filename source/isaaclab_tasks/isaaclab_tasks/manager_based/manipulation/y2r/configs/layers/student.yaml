@@ -8,9 +8,5 @@
 mode:
   use_student_mode: true
 
-wrist_camera:
-  enabled: true
-
 simulation:
   num_envs: 4096
-

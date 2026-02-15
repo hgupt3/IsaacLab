@@ -160,19 +160,19 @@ class KukaAllegroTrajectoryMixinCfg:
         # Fingers to object reward uses palm and fingertips
         self.rewards.fingers_to_object.params["asset_cfg"] = SceneEntityCfg("robot", body_names=["palm_link", ".*_tip"])
 
-        # Add wrist camera if enabled (using TiledCamera for efficiency)
-        if cfg.wrist_camera.enabled:
+        # Add wrist camera in student mode (using TiledCamera for efficiency)
+        if cfg.mode.use_student_mode:
             from scipy.spatial.transform import Rotation
-            
+
             # Config has [rx, ry, rz], transform for opengl convention
             rot_euler = cfg.wrist_camera.offset.rot
             rot_swapped = (rot_euler[0], rot_euler[2], -rot_euler[1]) # no idea whats going on here, but it works
-            
+
             r = Rotation.from_euler('xyz', rot_swapped, degrees=True)
             quat = r.as_quat()  # [x, y, z, w]
             quat_wxyz = (float(quat[3]), float(quat[0]), float(quat[1]), float(quat[2]))
             pos = tuple(float(x) for x in cfg.wrist_camera.offset.pos)
-            
+
             self.scene.wrist_camera = TiledCameraCfg(
                 prim_path="{ENV_REGEX_NS}/Robot/ee_link/palm_link/wrist_camera",
                 offset=TiledCameraCfg.OffsetCfg(
@@ -188,6 +188,22 @@ class KukaAllegroTrajectoryMixinCfg:
                 ),
                 width=cfg.wrist_camera.width,
                 height=cfg.wrist_camera.height,
+            )
+
+        # Add visibility camera for true occlusion-based point cloud filtering
+        # Camera under env root Xform (not attached to robot), pose set at reset
+        if cfg.mode.use_student_mode:
+            self.scene.visibility_camera = TiledCameraCfg(
+                prim_path="{ENV_REGEX_NS}/visibility_camera",
+                data_types=["distance_to_image_plane", "instance_id_segmentation_fast"],
+                spawn=PinholeCameraCfg(
+                    focal_length=cfg.visibility_camera.focal_length,
+                    horizontal_aperture=cfg.visibility_camera.horizontal_aperture,
+                    clipping_range=cfg.visibility_camera.clipping_range,
+                ),
+                colorize_instance_id_segmentation=False,
+                width=cfg.visibility_camera.width,
+                height=cfg.visibility_camera.height,
             )
 
 

@@ -188,8 +188,8 @@ class UR5eLeapTrajectoryMixinCfg:
         # Fingers to object reward (link_3 bodies with tip offsets applied internally)
         self.rewards.fingers_to_object.params["asset_cfg"] = SceneEntityCfg("robot", body_names=["ur5e_link_6", "(index|middle|ring|thumb)_link_3"])
 
-        # Add wrist camera if enabled
-        if cfg.wrist_camera.enabled:
+        # Add wrist camera in student mode
+        if cfg.mode.use_student_mode:
             from scipy.spatial.transform import Rotation
 
             rot_euler = cfg.wrist_camera.offset.rot
@@ -215,6 +215,22 @@ class UR5eLeapTrajectoryMixinCfg:
                 ),
                 width=cfg.wrist_camera.width,
                 height=cfg.wrist_camera.height,
+            )
+
+        # Add visibility camera for true occlusion-based point cloud filtering
+        # Camera under env root Xform (not attached to robot), pose set at reset
+        if cfg.mode.use_student_mode:
+            self.scene.visibility_camera = TiledCameraCfg(
+                prim_path="{ENV_REGEX_NS}/visibility_camera",
+                data_types=["distance_to_image_plane", "instance_id_segmentation_fast"],
+                spawn=PinholeCameraCfg(
+                    focal_length=cfg.visibility_camera.focal_length,
+                    horizontal_aperture=cfg.visibility_camera.horizontal_aperture,
+                    clipping_range=cfg.visibility_camera.clipping_range,
+                ),
+                colorize_instance_id_segmentation=False,
+                width=cfg.visibility_camera.width,
+                height=cfg.visibility_camera.height,
             )
 
 

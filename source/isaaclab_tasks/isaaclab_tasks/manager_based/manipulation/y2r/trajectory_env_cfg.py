@@ -448,7 +448,7 @@ def _build_observations_cfg(cfg: Y2RConfig):
 
     @configclass
     class StudentCurrentPCObsCfg(ObsGroup):
-        """Student visible point cloud from pseudo-camera."""
+        """Student visible point cloud from visibility camera."""
         visible_point_cloud = ObsTerm(
             func=mdp.visible_object_point_cloud_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),
@@ -525,7 +525,7 @@ def _build_observations_cfg(cfg: Y2RConfig):
         obs_cfg.student_future_pc = StudentFuturePCObsCfg()
         obs_cfg.student_future_poses = FuturePosesStudentCfg()
 
-    if cfg.wrist_camera.enabled:
+    if cfg.mode.use_student_mode:
         obs_cfg.student_camera = StudentCameraObsCfg()
 
     return obs_cfg
@@ -672,8 +672,8 @@ def _build_events_cfg(cfg: Y2RConfig):
             },
         )
 
-    # Camera offset randomization (only when camera is enabled)
-    if cfg.wrist_camera.enabled:
+    # Camera offset randomization (student mode only)
+    if cfg.mode.use_student_mode:
         EventCfg.reset_camera_offset = EventTerm(
             func=mdp.reset_camera_offset,
             mode="reset",
@@ -687,6 +687,26 @@ def _build_events_cfg(cfg: Y2RConfig):
                 },
                 "parent_body_name": cfg.robot.palm_body_name,
                 "sensor_cfg": SceneEntityCfg("wrist_camera"),
+            },
+        )
+
+    # Visibility camera pose randomization (radial from workspace center)
+    if cfg.mode.use_student_mode:
+        ws = cfg.workspace
+        ws_center = (
+            (ws.x[0] + ws.x[1]) / 2.0,
+            (ws.y[0] + ws.y[1]) / 2.0,
+            (ws.z[0] + ws.z[1]) / 2.0,
+        )
+        EventCfg.reset_visibility_camera = EventTerm(
+            func=mdp.reset_visibility_camera_pose,
+            mode="reset",
+            params={
+                "workspace_center": ws_center,
+                "distance_range": tuple(cfg.visibility_camera.distance),
+                "yaw_range": tuple(cfg.visibility_camera.yaw),
+                "pitch_range": tuple(cfg.visibility_camera.pitch),
+                "sensor_cfg": SceneEntityCfg("visibility_camera"),
             },
         )
 

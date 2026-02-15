@@ -323,6 +323,7 @@ class RewardConfig:
 @dataclass
 class ContactFactorConfig:
     nail_gate: float
+    nail_gate_min: float
     finger_weights: list[float]
     threshold: float
     ramp: float
@@ -559,8 +560,15 @@ class ProceduralObjectsConfig:
 
 
 @dataclass
-class PseudoCameraConfig:
-    position: tuple[float, float, float]
+class VisibilityCameraConfig:
+    width: int
+    height: int
+    focal_length: float
+    horizontal_aperture: float
+    clipping_range: tuple[float, float]
+    distance: tuple[float, float]
+    yaw: tuple[float, float]
+    pitch: tuple[float, float]
 
 
 @dataclass
@@ -571,7 +579,6 @@ class CameraOffsetConfig:
 
 @dataclass
 class WristCameraConfig:
-    enabled: bool
     width: int
     height: int
     focal_length: float
@@ -602,7 +609,7 @@ class Y2RConfig:
     push_t: PushTConfig
     procedural_objects: ProceduralObjectsConfig
     wrist_camera: WristCameraConfig
-    pseudo_camera: PseudoCameraConfig
+    visibility_camera: VisibilityCameraConfig
 
 
 # ==============================================================================
