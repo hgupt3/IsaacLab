@@ -11,7 +11,7 @@ curriculum:
     initial: 3
 
 mode:                                                                                                                                                                                                    
-  use_student_mode: true
+  use_student_mode: false
 
 # Basic visualization
 visualization:
@@ -24,10 +24,10 @@ visualization:
   grasp_surface_point: false 
   contact_forces: false
   camera_pose: true
-  student_visible: true
-  student_target: true
+  student_visible: false
+  student_target: false
   camera_viewer:
-    enabled: true               # Enable unified camera debug viewer (web page)
+    enabled: false               # Enable unified camera debug viewer (web page)
     port: 8001                   # HTTP port for viewer
     update_hz: 50               # Image update rate (50 = every step at 50Hz control rate)
     env_id: 0                    # Single env index to visualize
