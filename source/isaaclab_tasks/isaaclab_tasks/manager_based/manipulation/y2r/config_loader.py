@@ -473,6 +473,14 @@ class RandomizationConfig:
 
 
 @dataclass
+class CameraViewerConfig:
+    enabled: bool
+    port: int
+    update_hz: int
+    env_id: int
+
+
+@dataclass
 class VisualizationConfig:
     targets: bool
     current_object: bool
@@ -484,8 +492,10 @@ class VisualizationConfig:
     hand_pose_targets: bool
     grasp_surface_point: bool
     contact_forces: bool
+    camera_pose: bool
     env_ids: list[int] | None
     debug_print_rewards: bool
+    camera_viewer: CameraViewerConfig
 
 
 @dataclass
@@ -569,6 +579,7 @@ class VisibilityCameraConfig:
     distance: tuple[float, float]
     yaw: tuple[float, float]
     pitch: tuple[float, float]
+    look_at_offset: tuple[float, float, float]  # (x, y, z) fixed offset from workspace center
 
 
 @dataclass
@@ -585,9 +596,6 @@ class WristCameraConfig:
     horizontal_aperture: float
     clipping_range: tuple[float, float]
     offset: CameraOffsetConfig
-    web_viewer: bool
-    viewer_port: int
-    viewer_update_hz: int
 
 
 @dataclass

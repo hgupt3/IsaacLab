@@ -673,56 +673,39 @@ class visible_object_point_cloud_b(ManagerTermBase):
         self._step_counter = 0
         self._object_instance_ids = None  # Lazy-init on first render
         self.selected_points_w = None
+        self._pending_reset = False
+
+        # Init visibility camera pose buffers (populated by reset_visibility_camera_pose event)
+        env._visibility_cam_pos_w = torch.zeros(env.num_envs, 3, device=env.device)
+        env._visibility_cam_quat_w_opengl = torch.zeros(env.num_envs, 4, device=env.device)
 
         # Visualization
         self.markers = None
         if self.visualize:
             self._init_visualizer()
 
+    def reset(self, env_ids=None):
+        """Flag that sensors need a render + buffer refresh before next resample."""
+        self._pending_reset = True
+
+    _discover_printed = False
+
     def _discover_object_instance_ids(self):
         """Discover instance IDs belonging to the object from camera metadata.
 
-        Called once after the first render so the info dict is populated.
-        Builds a set of integer IDs whose prim paths contain '/Object'.
+        Rebuilds every resample — the idToLabels dict is tiny so cost is negligible.
         """
-        info = self.camera.data.info
-
-        # Camera API differs across sensor implementations:
-        # - TiledCamera: dict keyed by data_type
-        # - Camera/RayCasterCamera: list[dict] per env
-        if isinstance(info, list):
-            if not info:
-                self._object_instance_ids = set()
-                return
-            info_dict = info[0]
-        elif isinstance(info, dict):
-            info_dict = info
-        else:
-            self._object_instance_ids = set()
-            return
-
-        seg_info = info_dict.get("instance_id_segmentation_fast", info_dict.get("instance_segmentation_fast", {}))
-        if not isinstance(seg_info, dict):
-            self._object_instance_ids = set()
-            return
-
+        label_map = self.camera.data.info["instance_id_segmentation_fast"]["idToLabels"]
+        if not visible_object_point_cloud_b._discover_printed:
+            print(f"[visibility] idToLabels ({len(label_map)} entries):")
+            for uid, meta in label_map.items():
+                print(f"  {uid}: {meta}")
+            visible_object_point_cloud_b._discover_printed = True
         object_ids = set()
-        for id_str, prim_meta in seg_info.items():
-            if isinstance(prim_meta, str):
-                prim_path = prim_meta
-            elif isinstance(prim_meta, dict):
-                prim_path = (
-                    prim_meta.get("primPath")
-                    or prim_meta.get("prim_path")
-                    or prim_meta.get("path")
-                    or ""
-                )
-            else:
-                prim_path = ""
-
+        for uid, meta in label_map.items():
+            prim_path = meta
             if "/Object" in prim_path:
-                object_ids.add(int(id_str))
-
+                object_ids.add(int(uid))
         self._object_instance_ids = object_ids
 
     def _build_object_mask(self, inst_id: torch.Tensor) -> torch.Tensor:
@@ -755,18 +738,27 @@ class visible_object_point_cloud_b(ManagerTermBase):
         num_pts = self.num_points
         device = env.device
 
+        # After reset: render post-reset scene and refresh all sensor buffers
+        force_resample = False
+        if self._pending_reset:
+            self._pending_reset = False
+            env.sim.render()
+            env.scene.update(dt=0.0)
+            force_resample = True
+
         # Check resample via CPU counter (no GPU sync)
-        needs_resample = self.cached_points_local is None
-        if not needs_resample:
+        needs_resample = self.cached_points_local is None or force_resample
+        if force_resample:
+            self._step_counter = 0
+        elif not needs_resample:
             self._step_counter += 1
             needs_resample = self._step_counter >= self.resample_interval
             if needs_resample:
                 self._step_counter = 0
 
         if needs_resample:
-            # Lazy-init instance IDs from first render
-            if self._object_instance_ids is None:
-                self._discover_object_instance_ids()
+            # Rebuild object instance IDs every resample (idToLabels is tiny)
+            self._discover_object_instance_ids()
 
             camera = self.camera
 
@@ -776,11 +768,16 @@ class visible_object_point_cloud_b(ManagerTermBase):
             depth = depth.squeeze(-1)     # (N, H, W)
             inst_id = inst_id.squeeze(-1).int()  # (N, H, W)
 
+            # Camera debug viewer
+            if self.env.cfg.y2r_cfg.visualization.camera_viewer.enabled:
+                _update_camera_viewer_visibility(self.env, depth, inst_id)
+
             H, W = depth.shape[1], depth.shape[2]
 
-            # 2. Build object mask
+            # 2. Build object mask, eroded by 1px to avoid depth bleeding at edges
             object_mask = self._build_object_mask(inst_id)  # (N, H, W) bool
-            mask_flat = object_mask.view(N, -1).float()     # (N, H*W)
+            eroded_mask = (-F.max_pool2d(-object_mask.float().unsqueeze(1), 3, stride=1, padding=1)).squeeze(1) > 0.5
+            mask_flat = eroded_mask.view(N, -1).float()     # (N, H*W)
             has_object = mask_flat.sum(dim=-1) > 0           # (N,)
 
             # 3. Sample pixel cells from masked region (multinomial with replacement)
@@ -814,8 +811,9 @@ class visible_object_point_cloud_b(ManagerTermBase):
             points_cam = torch.stack([x_cam, y_cam, z_cam], dim=-1)  # (N, K, 3)
 
             # 6. Camera frame -> world frame
-            cam_pos_w = camera.data.pos_w          # (N, 3)
-            cam_quat_w = camera.data.quat_w_opengl  # (N, 4) wxyz, OpenGL convention
+            # Use cached pose from reset event — camera.data is stale in Fabric mode
+            cam_pos_w = env._visibility_cam_pos_w       # (N, 3)
+            cam_quat_w = env._visibility_cam_quat_w_opengl  # (N, 4) wxyz, OpenGL convention
             points_w = _quat_rotate_vec(cam_quat_w, points_cam) + cam_pos_w.unsqueeze(1)
 
             # 7. World frame -> object-local frame (for caching)
@@ -1213,6 +1211,7 @@ class target_sequence_obs_b(ManagerTermBase):
         self.visualize_hand_pose_targets = y2r_cfg.visualization.hand_pose_targets
         self.visualize_grasp_surface_point = y2r_cfg.visualization.grasp_surface_point
         self.visualize_contact_forces = y2r_cfg.visualization.contact_forces
+        self.visualize_camera_pose = y2r_cfg.visualization.camera_pose
         self.visualize_env_ids = y2r_cfg.visualization.env_ids
         
         self.object: RigidObject = env.scene[self.object_cfg.name]
@@ -1261,7 +1260,7 @@ class target_sequence_obs_b(ManagerTermBase):
             self._init_visualizer()
         if self.visualize_grasp_surface_point:
             self._init_grasp_point_visualizer()
-        if self.visualize_waypoint_region or self.visualize_goal_region or self.visualize_pose_axes or self.visualize_hand_pose_targets or self.visualize_contact_forces:
+        if self.visualize_waypoint_region or self.visualize_goal_region or self.visualize_pose_axes or self.visualize_hand_pose_targets or self.visualize_contact_forces or self.visualize_camera_pose:
             self._init_region_visualizer()
         
         # Cache palm body index for hand trajectory
@@ -1376,7 +1375,7 @@ class target_sequence_obs_b(ManagerTermBase):
         if self._debug_draw is not None and (
             self.visualize_pose_axes or self.visualize_hand_pose_targets
             or self.visualize_waypoint_region or self.visualize_goal_region
-            or self.visualize_contact_forces
+            or self.visualize_contact_forces or self.visualize_camera_pose
         ):
             self._debug_draw.clear_lines()
 
@@ -1393,6 +1392,9 @@ class target_sequence_obs_b(ManagerTermBase):
 
             if self.visualize_contact_forces:
                 self._visualize_contact_forces(N)
+
+            if self.visualize_camera_pose:
+                self._visualize_camera_poses(N)
 
         # Grasp surface point (marker-based)
         if self.visualize_grasp_surface_point and self.grasp_point_marker is not None:
@@ -1660,6 +1662,86 @@ class target_sequence_obs_b(ManagerTermBase):
         if starts_list:
             n = len(starts_list)
             self._debug_draw.draw_lines(starts_list, ends_list, all_colors, [5.0] * n)
+
+    def _visualize_camera_poses(self, num_envs: int):
+        """Visualize wrist camera and visibility camera poses as RGB axes + look direction.
+
+        Draws for each camera:
+          - Red/Green/Blue arrows for X/Y/Z axes (OpenGL frame)
+          - Cyan arrow (wrist) or Magenta arrow (visibility) for look direction (-Z in OpenGL)
+        """
+        if self._debug_draw is None:
+            return
+
+        if self.visualize_env_ids is None:
+            env_ids = list(range(num_envs))
+        else:
+            env_ids = [i for i in self.visualize_env_ids if i < num_envs]
+        if not env_ids:
+            return
+
+        E = len(env_ids)
+        env_idx = torch.tensor(env_ids, device=self.env.device)
+
+        AXIS_LENGTH = 0.06
+        LOOK_LENGTH = 0.10  # Longer arrow for look direction
+
+        x_axis = torch.tensor([1.0, 0.0, 0.0], device=self.env.device)
+        y_axis = torch.tensor([0.0, 1.0, 0.0], device=self.env.device)
+        z_axis = torch.tensor([0.0, 0.0, 1.0], device=self.env.device)
+
+        starts_list = []
+        ends_list = []
+        all_colors = []
+
+        # Helper: draw RGB axes + look direction for a camera
+        def _draw_camera(cam_pos, cam_quat, look_color, axis_len, look_len):
+            # Standard RGB axes
+            for axis, color in [(x_axis, (1.0, 0.0, 0.0, 1.0)),
+                                (y_axis, (0.0, 1.0, 0.0, 1.0)),
+                                (z_axis, (0.0, 0.0, 1.0, 1.0))]:
+                axis_exp = axis.unsqueeze(0).expand(E, 3)
+                axis_world = quat_apply(cam_quat, axis_exp) * axis_len
+                starts_list.append(cam_pos)
+                ends_list.append(cam_pos + axis_world)
+                all_colors.extend([color] * E)
+            # Look direction = -Z in OpenGL convention
+            neg_z = torch.tensor([0.0, 0.0, -1.0], device=self.env.device)
+            neg_z_exp = neg_z.unsqueeze(0).expand(E, 3)
+            look_world = quat_apply(cam_quat, neg_z_exp) * look_len
+            starts_list.append(cam_pos)
+            ends_list.append(cam_pos + look_world)
+            all_colors.extend([look_color] * E)
+
+        # Wrist camera (cyan look arrow)
+        # Compute world pose from parent body + local offset because
+        # camera.data.pos_w/quat_w are stale in Fabric (GPU) mode.
+        sensors = self.env.scene.sensors
+        if "wrist_camera" in sensors:
+            wc = sensors["wrist_camera"]
+            local_pos, local_quat = wc._view.get_local_poses(env_idx)
+            local_pos = torch.as_tensor(local_pos, device=self.env.device, dtype=torch.float32)
+            local_quat = torch.as_tensor(local_quat, device=self.env.device, dtype=torch.float32)
+            parent_idx = wc._parent_body_idx if hasattr(wc, "_parent_body_idx") else self._palm_body_idx
+            parent_pos = self.ref_asset.data.body_pos_w[env_idx, parent_idx]
+            parent_quat = self.ref_asset.data.body_quat_w[env_idx, parent_idx]
+            wc_pos, wc_quat = combine_frame_transforms(parent_pos, parent_quat, local_pos, local_quat)
+            _draw_camera(wc_pos, wc_quat, (0.0, 1.0, 1.0, 1.0), AXIS_LENGTH, LOOK_LENGTH)
+
+        # Visibility camera (magenta look arrow) — use cached pose from reset event
+        # (camera.data.pos_w/quat_w are stale in Fabric mode)
+        if "visibility_camera" in sensors and hasattr(self.env, '_visibility_cam_pos_w'):
+            vc_pos = self.env._visibility_cam_pos_w[env_idx]
+            vc_quat = self.env._visibility_cam_quat_w_opengl[env_idx]
+            _draw_camera(vc_pos, vc_quat, (1.0, 0.0, 1.0, 1.0), AXIS_LENGTH, LOOK_LENGTH)
+
+        if starts_list:
+            starts = torch.cat(starts_list, dim=0)
+            ends = torch.cat(ends_list, dim=0)
+            n = len(all_colors)
+            self._debug_draw.draw_lines(
+                starts.cpu().tolist(), ends.cpu().tolist(), all_colors, [5.0] * n
+            )
 
     def _visualize_pose_axes(
         self,
@@ -2328,10 +2410,18 @@ def hand_pose_targets_b(
 # Wrist Camera Observations
 # ==============================================================================
 
-# Global web viewer state
-_web_viewer_app = None
-_web_viewer_thread = None
-_web_viewer_latest_image = None
+# Global camera debug viewer state
+_camera_viewer_app = None
+_camera_viewer_thread = None
+_camera_viewer_data = {
+    'wrist_depth': None,
+    'vis_depth': None,
+    'vis_seg': None,
+    'step': 0,
+    'env_id': 0,
+    'wrist_depth_range': (0.0, 0.0),
+    'vis_depth_range': (0.0, 0.0),
+}
 
 
 def wrist_depth_image(
@@ -2361,137 +2451,267 @@ def wrist_depth_image(
     near, far = cfg.clipping_range
     depth_normalized = (depth.clamp(near, far) - near) / (far - near)
     
-    # Web viewer update
-    if cfg.web_viewer:
-        _update_web_viewer(env, depth_normalized, cfg)
-    
+    # Camera debug viewer
+    if env.cfg.y2r_cfg.visualization.camera_viewer.enabled:
+        _update_camera_viewer_wrist(env, depth_normalized)
+
     # Flatten: (N, resolution * resolution)
     return depth_normalized.reshape(env.num_envs, -1)
 
 
-def _update_web_viewer(env, depth: torch.Tensor, cfg):
-    """Update web viewer with latest depth image."""
-    global _web_viewer_app, _web_viewer_thread, _web_viewer_latest_image
-    
-    # Start web viewer on first call
-    if _web_viewer_app is None and cfg.web_viewer:
-        _start_web_viewer(cfg.viewer_port)
-    
-    # Update at specified rate
-    update_interval = int((1.0 / cfg.viewer_update_hz) / env.step_dt)
-    if env.common_step_counter % max(1, update_interval) == 0:
-        # Convert first env's depth to numpy
-        depth_np = depth[0].cpu().numpy()
-        
-        # Convert to RGB for display using colormap
-        import matplotlib.cm as cm
-        colored = cm.viridis(depth_np)[:, :, :3]  # Drop alpha
-        colored = (colored * 255).astype('uint8')
-        
-        # Update global image buffer
-        _web_viewer_latest_image = {
-            'image': colored,
-            'step': env.common_step_counter,
-            'min_depth': depth[0].min().item() * (cfg.clipping_range[1] - cfg.clipping_range[0]) + cfg.clipping_range[0],
-            'max_depth': depth[0].max().item() * (cfg.clipping_range[1] - cfg.clipping_range[0]) + cfg.clipping_range[0],
-        }
+def _update_camera_viewer_wrist(env: ManagerBasedRLEnv, depth_normalized: torch.Tensor):
+    """Update camera debug viewer with wrist depth data."""
+    global _camera_viewer_app
+
+    viewer_cfg = env.cfg.y2r_cfg.visualization.camera_viewer
+
+    if _camera_viewer_app is None:
+        _start_camera_viewer(viewer_cfg.port)
+
+    update_interval = int((1.0 / viewer_cfg.update_hz) / env.step_dt)
+    if env.common_step_counter % max(1, update_interval) != 0:
+        return
+
+    import matplotlib.cm as cm
+    import numpy as np
+
+    eid = viewer_cfg.env_id
+    depth_np = depth_normalized[eid].cpu().numpy()
+    colored = (cm.viridis(depth_np)[:, :, :3] * 255).astype(np.uint8)
+
+    wrist_cfg = env.cfg.y2r_cfg.wrist_camera
+    near, far = wrist_cfg.clipping_range
+
+    _camera_viewer_data['wrist_depth'] = colored
+    _camera_viewer_data['step'] = env.common_step_counter
+    _camera_viewer_data['env_id'] = eid
+    _camera_viewer_data['wrist_depth_range'] = (
+        depth_normalized[eid].min().item() * (far - near) + near,
+        depth_normalized[eid].max().item() * (far - near) + near,
+    )
 
 
-def _start_web_viewer(port: int):
-    """Start Flask web server in background thread."""
-    global _web_viewer_app, _web_viewer_thread
-    
-    from flask import Flask, Response
+def _update_camera_viewer_visibility(env: ManagerBasedRLEnv, depth: torch.Tensor, inst_id: torch.Tensor):
+    """Update camera debug viewer with visibility camera depth + segmentation."""
+    global _camera_viewer_app
+
+    viewer_cfg = env.cfg.y2r_cfg.visualization.camera_viewer
+
+    if _camera_viewer_app is None:
+        _start_camera_viewer(viewer_cfg.port)
+
+    update_interval = int((1.0 / viewer_cfg.update_hz) / env.step_dt)
+    if env.common_step_counter % max(1, update_interval) != 0:
+        return
+
+    import matplotlib.cm as cm
+    import numpy as np
+
+    eid = viewer_cfg.env_id
+    vis_cfg = env.cfg.y2r_cfg.visibility_camera
+    near, far = vis_cfg.clipping_range
+
+    # Depth panel
+    depth_single = depth[eid].cpu().numpy()  # (H, W), raw meters
+    depth_norm = (depth_single.clip(near, far) - near) / (far - near)
+    vis_depth_colored = (cm.viridis(depth_norm)[:, :, :3] * 255).astype(np.uint8)
+
+    _camera_viewer_data['vis_depth'] = vis_depth_colored
+    _camera_viewer_data['vis_depth_range'] = (
+        float(depth_single[depth_single > 0].min()) if (depth_single > 0).any() else 0.0,
+        float(depth_single.max()),
+    )
+
+    # Segmentation panel — 3 semantic classes: object / robot / other
+    # Rebuild ID→class map every call (tiny dict, negligible cost vs GPU render)
+    label_map = env.scene["visibility_camera"].data.info["instance_id_segmentation_fast"]["idToLabels"]
+    class_map = {}
+    for uid, meta in label_map.items():
+        prim_path = meta
+        uid_int = int(uid)
+        if "/Object" in prim_path:
+            class_map[uid_int] = 'object'
+        elif "/Robot" in prim_path:
+            class_map[uid_int] = 'robot'
+        else:
+            class_map[uid_int] = 'other'
+
+    # Fixed colors: object=green, robot=blue, other=gray
+    CLASS_COLORS = {
+        'object': np.array([0, 220, 80], dtype=np.uint8),
+        'robot': np.array([60, 120, 255], dtype=np.uint8),
+        'other': np.array([100, 100, 100], dtype=np.uint8),
+    }
+
+    seg_single = inst_id[eid].cpu().numpy().astype(np.int32)  # (H, W)
+    seg_colored = np.zeros((*seg_single.shape, 3), dtype=np.uint8)
+
+    for uid in np.unique(seg_single):
+        if uid == 0:
+            continue  # Background stays black
+        cls = class_map.get(uid, 'other')
+        seg_colored[seg_single == uid] = CLASS_COLORS[cls]
+
+    _camera_viewer_data['vis_seg'] = seg_colored
+    _camera_viewer_data['step'] = env.common_step_counter
+    _camera_viewer_data['env_id'] = eid
+
+
+def _start_camera_viewer(port: int):
+    """Start unified camera debug viewer (Flask web server) in background thread."""
+    global _camera_viewer_app, _camera_viewer_thread
+
+    from flask import Flask, Response, jsonify
     import threading
     import io
     from PIL import Image
-    
+
     app = Flask(__name__)
-    
+
     @app.route('/')
     def index():
-        return '''
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Wrist Camera Viewer</title>
-            <style>
-                body { 
-                    background: #1e1e1e; 
-                    color: #ffffff; 
-                    font-family: monospace; 
-                    text-align: center;
-                    padding: 20px;
-                }
-                img { 
-                    image-rendering: pixelated; 
-                    width: 512px; 
-                    height: 512px; 
-                    border: 2px solid #444;
-                }
-                .info {
-                    margin-top: 10px;
-                    font-size: 14px;
-                }
-            </style>
-        </head>
-        <body>
-            <h1>Wrist Camera - Depth View</h1>
-            <img src="/stream" id="stream">
-            <div class="info" id="info">Waiting for data...</div>
-            <script>
-                // Auto-refresh image (add timestamp to bust cache)
-                setInterval(() => {
-                    document.getElementById('stream').src = '/stream?' + Date.now();
-                }, 100);
-                // Auto-refresh info
-                setInterval(() => {
-                    fetch('/info')
-                        .then(r => r.json())
-                        .then(data => {
-                            document.getElementById('info').innerHTML = 
-                                `Step: ${data.step} | Depth: ${data.min_depth.toFixed(3)}m - ${data.max_depth.toFixed(3)}m`;
-                        });
-                }, 100);
-            </script>
-        </body>
-        </html>
-        '''
-    
-    @app.route('/stream')
-    def stream():
-        if _web_viewer_latest_image is None:
-            # Return black image if no data yet
+        return '''<!DOCTYPE html>
+<html>
+<head>
+    <title>Camera Debug Viewer</title>
+    <style>
+        body {
+            background: #1e1e1e;
+            color: #ffffff;
+            font-family: monospace;
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        h2 { margin-bottom: 16px; }
+        .panel {
+            margin-bottom: 20px;
+        }
+        .panel-header {
+            display: flex;
+            align-items: baseline;
+            gap: 12px;
+            margin-bottom: 4px;
+        }
+        .panel-header h3 { margin: 0; }
+        .panel-header .sub { font-size: 12px; color: #999; }
+        .panel img {
+            image-rendering: pixelated;
+            width: 480px;
+            height: auto;
+            border: 2px solid #444;
+            display: block;
+        }
+        .legend {
+            display: flex;
+            gap: 16px;
+            margin-top: 4px;
+            font-size: 12px;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        .legend-swatch {
+            width: 12px;
+            height: 12px;
+            border: 1px solid #666;
+        }
+        #step_info {
+            text-align: center;
+            margin-top: 10px;
+            font-size: 13px;
+            color: #aaa;
+        }
+    </style>
+</head>
+<body>
+    <h2>Camera Debug Viewer</h2>
+    <div class="panel">
+        <div class="panel-header">
+            <h3>Wrist Depth</h3>
+            <span class="sub" id="wrist_info">--</span>
+        </div>
+        <img src="/image/wrist_depth" id="wrist_depth">
+    </div>
+    <div class="panel">
+        <div class="panel-header">
+            <h3>Visibility Depth</h3>
+            <span class="sub" id="vis_info">--</span>
+        </div>
+        <img src="/image/vis_depth" id="vis_depth">
+    </div>
+    <div class="panel">
+        <div class="panel-header">
+            <h3>Visibility Segmentation</h3>
+        </div>
+        <img src="/image/vis_seg" id="vis_seg">
+        <div class="legend">
+            <div class="legend-item"><div class="legend-swatch" style="background:#00dc50"></div>Object</div>
+            <div class="legend-item"><div class="legend-swatch" style="background:#3c78ff"></div>Robot</div>
+            <div class="legend-item"><div class="legend-swatch" style="background:#646464"></div>Other</div>
+            <div class="legend-item"><div class="legend-swatch" style="background:#000000"></div>Background</div>
+        </div>
+    </div>
+    <div id="step_info">Step: --</div>
+    <script>
+        const feeds = ['wrist_depth', 'vis_depth', 'vis_seg'];
+        setInterval(() => {
+            const t = Date.now();
+            feeds.forEach(f => {
+                document.getElementById(f).src = '/image/' + f + '?' + t;
+            });
+            fetch('/info')
+                .then(r => r.json())
+                .then(d => {
+                    document.getElementById('step_info').textContent =
+                        'Step: ' + d.step + ' | Env: ' + d.env_id;
+                    document.getElementById('wrist_info').textContent =
+                        d.wrist_depth_range[0].toFixed(3) + 'm - ' +
+                        d.wrist_depth_range[1].toFixed(3) + 'm';
+                    document.getElementById('vis_info').textContent =
+                        d.vis_depth_range[0].toFixed(3) + 'm - ' +
+                        d.vis_depth_range[1].toFixed(3) + 'm';
+                });
+        }, 100);
+    </script>
+</body>
+</html>'''
+
+    @app.route('/image/<feed_name>')
+    def image(feed_name):
+        data = _camera_viewer_data.get(feed_name)
+        if data is None:
             img = Image.new('RGB', (32, 32), color='black')
         else:
-            img = Image.fromarray(_web_viewer_latest_image['image'])
-        
+            img = Image.fromarray(data)
+
         buf = io.BytesIO()
         img.save(buf, format='PNG')
         buf.seek(0)
-        
         return Response(buf.getvalue(), mimetype='image/png')
-    
+
     @app.route('/info')
     def info():
-        if _web_viewer_latest_image is None:
-            return {'step': 0, 'min_depth': 0.0, 'max_depth': 0.0}
-        # Only return JSON-serializable fields (not the image array)
-        return {
-            'step': int(_web_viewer_latest_image['step']),
-            'min_depth': float(_web_viewer_latest_image['min_depth']),
-            'max_depth': float(_web_viewer_latest_image['max_depth']),
-        }
-    
+        return jsonify(
+            step=int(_camera_viewer_data.get('step', 0)),
+            env_id=int(_camera_viewer_data.get('env_id', 0)),
+            wrist_depth_range=list(_camera_viewer_data.get('wrist_depth_range', (0.0, 0.0))),
+            vis_depth_range=list(_camera_viewer_data.get('vis_depth_range', (0.0, 0.0))),
+        )
+
     def run_server():
         app.run(host='0.0.0.0', port=port, threaded=True, use_reloader=False, debug=False)
-    
-    _web_viewer_app = app
-    _web_viewer_thread = threading.Thread(target=run_server, daemon=True)
-    _web_viewer_thread.start()
-    
+
+    _camera_viewer_app = app
+    _camera_viewer_thread = threading.Thread(target=run_server, daemon=True)
+    _camera_viewer_thread.start()
+
     print(f"\n{'='*60}")
-    print(f"Wrist Camera Web Viewer started!")
+    print(f"Camera Debug Viewer started!")
     print(f"View at: http://localhost:{port}")
-    print(f"Or forward port via SSH: ssh -L {port}:localhost:{port} user@remote")
+    print(f"SSH forward: ssh -L {port}:localhost:{port} user@remote")
     print(f"{'='*60}\n")

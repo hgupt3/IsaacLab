@@ -344,15 +344,10 @@ def reset_camera_offset(
     base_pos = torch.tensor(base_offset_pos, dtype=torch.float32, device=device)
     new_local_pos = base_pos.unsqueeze(0) + pert_palm
 
-    # Get parent body world pose (stale — cancels with set_world_poses)
-    palm_pos_w = robot.data.body_pos_w[env_ids, parent_idx]
-    palm_quat_w = robot.data.body_quat_w[env_ids, parent_idx]
-
-    # Camera world position = palm_world + palm_rot @ local_offset
-    new_cam_pos_w = palm_pos_w + math_utils.quat_apply(palm_quat_w, new_local_pos)
-
-    # Set position only — orientation stays unchanged (preserves spawn-time OpenGL convention)
-    camera.set_world_poses(positions=new_cam_pos_w, env_ids=env_ids)
+    # Set LOCAL position offset — preserves parent-child hierarchy in Fabric
+    # so camera follows ur5e_link_6 automatically during simulation.
+    # (set_world_poses would write a world-space override in Fabric, breaking tracking.)
+    camera._view.set_local_poses(translations=new_local_pos, indices=env_ids)
 
 
 def reset_visibility_camera_pose(
@@ -362,12 +357,13 @@ def reset_visibility_camera_pose(
     distance_range: tuple[float, float],
     yaw_range: tuple[float, float],
     pitch_range: tuple[float, float],
+    look_at_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("visibility_camera"),
 ):
     """Randomize visibility camera pose using spherical coordinates at reset.
 
     Places the camera at a random (distance, yaw, pitch) relative to the workspace
-    center and orients it to look at that center.
+    center and orients it to look at that center (with optional random offset).
 
     Args:
         env: The environment instance.
@@ -376,6 +372,7 @@ def reset_visibility_camera_pose(
         distance_range: (min, max) distance from workspace center in meters.
         yaw_range: (min, max) yaw in degrees.
         pitch_range: (min, max) pitch (elevation) in degrees.
+        look_at_offset: (x, y, z) fixed offset from workspace center.
         sensor_cfg: Configuration for the camera sensor.
     """
     camera = env.scene[sensor_cfg.name]
@@ -401,10 +398,38 @@ def reset_visibility_camera_pose(
     # Workspace center in world frame (env origins + local center)
     env_origins = env.scene.env_origins[env_ids]  # (n, 3)
     ws_center = torch.tensor(workspace_center, dtype=torch.float32, device=device)
-    target_w = env_origins + ws_center.unsqueeze(0)  # (n, 3)
+    target_w = env_origins + ws_center.unsqueeze(0) + torch.tensor(look_at_offset, dtype=torch.float32, device=device)
 
     # Camera positions in world frame
     offsets = torch.stack([dx, dy, dz], dim=-1)  # (n, 3)
     cam_pos_w = target_w + offsets  # (n, 3)
 
     camera.set_world_poses_from_view(eyes=cam_pos_w, targets=target_w, env_ids=env_ids)
+
+    # Cache pose on env — camera.data.pos_w/quat_w are stale in Fabric (GPU) mode
+    from isaaclab.utils.math import create_rotation_matrix_from_view, quat_from_matrix
+    quat_opengl = quat_from_matrix(create_rotation_matrix_from_view(cam_pos_w, target_w, "Z", device=device))
+    env._visibility_cam_pos_w[env_ids] = cam_pos_w
+    env._visibility_cam_quat_w_opengl[env_ids] = quat_opengl
+
+    # Position the D435i visual mesh alongside the camera sensor.
+    # The pinhole camera = depth sensor (left IR) = camera_link origin in the RealSense URDF.
+    # The URDF places the visual mesh relative to camera_link with:
+    #   rotation rpy=(π/2, 0, π/2)  →  equivalent to 180° Y in OpenGL
+    #   translation (0.0043, -0.0175, 0) in camera_link frame (X=fwd, Y=left, Z=up)
+    # Converting that translation to OpenGL (X=right, Y=up, Z=back): (+0.0175, 0, -0.0043)
+    camera_body: RigidObject = env.scene["visibility_camera_body"]
+
+    # Mesh-to-OpenGL rotation: 180° around Y (w,x,y,z)
+    quat_mesh_to_opengl = torch.tensor([0.0, 0.0, 1.0, 0.0], device=device)
+    body_quat_w = math_utils.quat_mul(quat_opengl, quat_mesh_to_opengl.expand(n, -1))
+
+    # Offset from depth sensor to mesh origin in OpenGL camera frame
+    # Derived from URDF visual origin: camera_link (0.0043, -0.0175, 0) → OpenGL (0.0175, 0, -0.0043)
+    body_offset_cam = torch.tensor([0.0175, 0.0, -0.0043], device=device)
+    body_offset_w = math_utils.quat_apply(quat_opengl, body_offset_cam.expand(n, -1))
+    body_pos_w = cam_pos_w + body_offset_w
+
+    camera_body.write_root_pose_to_sim(
+        torch.cat([body_pos_w, body_quat_w], dim=-1), env_ids=env_ids
+    )

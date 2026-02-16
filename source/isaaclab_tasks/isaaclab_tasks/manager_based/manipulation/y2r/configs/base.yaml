@@ -454,8 +454,14 @@ visualization:
   hand_pose_targets: false       # Show hand (palm) pose target axes
   grasp_surface_point: false     # Show selected grasp surface point (green sphere)
   contact_forces: false          # Show contact force (cyan) + pad normal (yellow) arrows on finger links
+  camera_pose: false              # Show wrist camera pose axes (RGB + cyan look direction)
   env_ids: []                   # Which envs to visualize ([] = none, null = all)
   debug_print_rewards: false    # Print reward breakdown periodically
+  camera_viewer:
+    enabled: false               # Enable unified camera debug viewer (web page)
+    port: 8001                   # HTTP port for viewer
+    update_hz: 50                # Web viewer refresh rate (Hz). 50 = every step, 10 = every 5th step
+    env_id: 0                    # Single env index to visualize
 
 # ==============================================================================
 # ROBOT-SPECIFIC SETTINGS 
@@ -504,22 +510,22 @@ push_t:
 # VISIBILITY CAMERA (true occlusion via instance segmentation + depth)
 # ==============================================================================
 visibility_camera:
-  width: 32
-  height: 32
-  focal_length: 5.52              # Yields ~57deg HFOV with 6.0mm aperture
+  width: 160
+  height: 90                        # 16:9 aspect ratio (RealSense D435i native 1280x720)
+  focal_length: 3.16                # 87° HFOV (D435i depth): 6.0 / (2×tan(43.5°))
   horizontal_aperture: 6.0
   clipping_range: [0.1, 2.0]
-  # Radial domain randomization (spherical coords from workspace center)
-  distance: [0.8, 1.2]            # meters
-  yaw: [-90.0, 90.0]            # degrees (full circle)
-  pitch: [20.0, 60.0]            # degrees (elevation)
+  distance: [0.5, 0.5]            # meters
+  yaw: [180.0, 180.0]            # degrees (full circle)
+  pitch: [0.0, 0.0]            # degrees (elevation)
+  look_at_offset: [0.0, 0.0, -0.05]  # (x, y, z) fixed offset from workspace center
 
 # ==============================================================================
 # WRIST CAMERA  (Gemini 305 depth — pinhole, square pixels, HFOV 88°)
 # ==============================================================================
 wrist_camera:
-  width: 80                     # Gemini 305 native 16:10 aspect ratio (1280:800)
-  height: 50
+  width: 120                     # Gemini 305 native 16:10 aspect ratio (1280:800)
+  height: 75
   focal_length: 3.19            # 88° HFOV: 6.17 / (2×tan(44°))
   horizontal_aperture: 6.17     # Virtual sensor width (mm)
   clipping_range: [0.04, 1.0]   # Gemini 305 depth range: 4–100 cm
@@ -530,10 +536,6 @@ wrist_camera:
     pos: [0.009, -0.0705, -0.0274]
     rot: [0.0, 0.0, 180.0]
 
-  # Web viewer for remote visualization over SSH
-  web_viewer: false
-  viewer_port: 8000
-  viewer_update_hz: 10
 
 # ==============================================================================
 # PROCEDURAL OBJECTS

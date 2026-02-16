@@ -706,6 +706,7 @@ def _build_events_cfg(cfg: Y2RConfig):
                 "distance_range": tuple(cfg.visibility_camera.distance),
                 "yaw_range": tuple(cfg.visibility_camera.yaw),
                 "pitch_range": tuple(cfg.visibility_camera.pitch),
+                "look_at_offset": tuple(cfg.visibility_camera.look_at_offset),
                 "sensor_cfg": SceneEntityCfg("visibility_camera"),
             },
         )
