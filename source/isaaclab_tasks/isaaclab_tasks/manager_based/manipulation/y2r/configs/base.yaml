@@ -56,7 +56,7 @@ observations:
 # ==============================================================================
 trajectory:
   target_hz: 8                 # Target update rate (Hz)
-  window_size: 4                # Lookahead targets in observation
+  window_size: 8                # Lookahead targets in observation
   easing_power: 1.5             # Ease curve power for waypoint segments
   path_mode: true               # Track along continuous path segment (vs discrete waypoints)
   timing_aware: true            # Use temporal interpolation for path tracking
