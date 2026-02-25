@@ -8,8 +8,15 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import os
 import sys
 from distutils.util import strtobool
+
+# Apply GPU offset for multi-GPU on specific devices (e.g. --multi_gpu 2,3)
+# This shifts LOCAL_RANK so torchrun process 0 maps to physical GPU 2, etc.
+_gpu_offset = int(os.environ.get("Y2R_GPU_OFFSET", "0"))
+if _gpu_offset and "LOCAL_RANK" in os.environ:
+    os.environ["LOCAL_RANK"] = str(int(os.environ["LOCAL_RANK"]) + _gpu_offset)
 
 from isaaclab.app import AppLauncher
 
