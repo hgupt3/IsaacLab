@@ -464,7 +464,9 @@ def contact_factor(env: ManagerBasedRLEnv) -> torch.Tensor:
 
     # Sort descending: best-contacting finger first, then weighted sum
     other_sorted = other_f.sort(dim=-1, descending=True).values
-    raw_factor = thumb_f * (other_sorted * w).sum(dim=-1)
+    thumb_gate_floor = float(max(cf_cfg.thumb_gate_floor, 0.0))
+    soft_thumb = thumb_gate_floor + (1.0 - thumb_gate_floor) * thumb_f
+    raw_factor = soft_thumb * (other_sorted * w).sum(dim=-1)
 
     result = min_factor + (1.0 - min_factor) * raw_factor
     env._cached_contact_factor = (step, result)

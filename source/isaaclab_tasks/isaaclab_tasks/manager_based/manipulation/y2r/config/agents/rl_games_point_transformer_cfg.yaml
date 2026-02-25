@@ -24,7 +24,7 @@ params:
   network:
     name: point_transformer
     separate: False
-    partial_separate: True     # Share PT, detach critic features if true
+    partial_separate: False     # Share PT, detach critic features if true
     self_attention: True       # Self-attention on point tokens before cross-attention
     hidden_dim: 64            # Token embedding dimension
     num_heads: 2              # Cross-attention heads
@@ -80,14 +80,14 @@ params:
     learning_rate: 5e-4
     lr_schedule: adaptive
     schedule_type: legacy
-    kl_threshold: 0.012
+    kl_threshold: 0.016
     score_to_win: 100000000
     max_epochs: 750000
     save_best_after: 100
     save_frequency: 50
     print_stats: True
     grad_norm: 1.0
-    entropy_coef: 0.002
+    entropy_coef: 0.0025
     truncate_grads: True
     e_clip: 0.2
     horizon_length: 32

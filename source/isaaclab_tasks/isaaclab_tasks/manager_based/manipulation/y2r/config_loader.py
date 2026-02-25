@@ -328,6 +328,7 @@ class ContactFactorConfig:
     threshold: float
     ramp: float
     min_factor: float
+    thumb_gate_floor: float
 
 
 @dataclass
