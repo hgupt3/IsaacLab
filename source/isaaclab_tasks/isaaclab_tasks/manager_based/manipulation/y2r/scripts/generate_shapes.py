@@ -84,7 +84,8 @@ def main():
         proc_cfg["generation"]["seed"] = args.seed
     
     # Check if shapes already exist
-    asset_dir = y2r_dir / proc_cfg.get("asset_dir", "assets/procedural")
+    from isaaclab_tasks.manager_based.manipulation.y2r.procedural_shapes import _remap_to_data_root
+    asset_dir = _remap_to_data_root(y2r_dir / proc_cfg.get("asset_dir", "assets/procedural"))
     existing = list(asset_dir.glob("shape_*.usd")) + list(asset_dir.glob("shape_*.obj"))
     num_shapes = proc_cfg.get("generation", {}).get("num_shapes", 100)
     

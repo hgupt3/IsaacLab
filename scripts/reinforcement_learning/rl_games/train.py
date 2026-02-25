@@ -200,12 +200,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.seed = agent_cfg["params"]["seed"]
 
     # specify directory for logging experiments
+    # Y2R_DATA_ROOT controls where all large outputs go; defaults to repo root
+    _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+    _data_root = os.environ.get("Y2R_DATA_ROOT", _repo_root)
     config_name = agent_cfg["params"]["config"]["name"]
-    log_root_path = os.path.join("logs", "rl_games", config_name)
+    log_root_path = os.path.join(_data_root, "IsaacLab", "logs", "rl_games", config_name)
     if "pbt" in agent_cfg and agent_cfg["pbt"]["directory"] != ".":
         log_root_path = os.path.join(agent_cfg["pbt"]["directory"], log_root_path)
-    else:
-        log_root_path = os.path.abspath(log_root_path)
 
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
     # specify directory for logging runs

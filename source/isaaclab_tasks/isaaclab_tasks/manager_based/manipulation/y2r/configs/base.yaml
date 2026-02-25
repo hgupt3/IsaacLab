@@ -544,7 +544,7 @@ wrist_camera:
 procedural_objects:
   enabled: true
   percentage: 0.6                 # Fraction procedural vs built-in primitives
-  asset_dir: "assets/procedural"  # Relative to y2r folder, auto-created
+  asset_dir: "assets/procedural"  # Relative to IsaacLab data root
   regenerate: true               # Force regenerate even if shapes exist
   
   # Generation parameters

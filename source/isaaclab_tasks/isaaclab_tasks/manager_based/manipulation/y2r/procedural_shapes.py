@@ -20,8 +20,25 @@ Usage:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
+
+
+def _remap_to_data_root(path: Path) -> Path:
+    """If Y2R_DATA_ROOT is set, remap a repo path to the data root.
+
+    Y2R_DATA_ROOT mirrors the repo root structure, e.g.:
+        repo at /home/user/sam → Y2R_DATA_ROOT=/usr0/user/sam
+    """
+    if "Y2R_DATA_ROOT" not in os.environ:
+        return path
+    repo_root = Path(__file__).resolve().parents[7]
+    try:
+        rel = path.relative_to(repo_root)
+        return Path(os.environ["Y2R_DATA_ROOT"]) / rel
+    except ValueError:
+        return path
 
 
 class ProceduralShapesNotFoundError(Exception):
@@ -32,25 +49,25 @@ class ProceduralShapesNotFoundError(Exception):
 def get_procedural_shape_paths(cfg, y2r_dir: Path) -> list[Path]:
     """
     Get paths to procedural shapes, erroring if not enough exist.
-    
+
     This function does NOT generate shapes - it only checks for existing ones.
     If shapes are missing, run the standalone generation script first:
         ./isaaclab.sh -p scripts/tools/generate_procedural_shapes.py
-    
+
     Args:
         cfg: ProceduralObjectsConfig dataclass
         y2r_dir: Path to the y2r module directory
-    
+
     Returns:
         List of paths to existing shape files (USD or OBJ)
-    
+
     Raises:
         ProceduralShapesNotFoundError: If not enough shapes exist
     """
     if not cfg.enabled:
         return []
-    
-    asset_dir = y2r_dir / cfg.asset_dir
+
+    asset_dir = _remap_to_data_root(y2r_dir / cfg.asset_dir)
     num_shapes = cfg.generation.num_shapes
     
     # Check for existing shapes (prefer USD, fallback to OBJ)
@@ -236,13 +253,13 @@ def generate_procedural_shapes(cfg: dict[str, Any], y2r_dir: Path) -> list[Path]
     Args:
         cfg: The procedural_objects config section from y2r_config.yaml
         y2r_dir: Path to the y2r module directory
-    
+
     Returns:
         List of paths to generated shape files
     """
     import numpy as np
-    
-    asset_dir = y2r_dir / cfg.get("asset_dir", "assets/procedural")
+
+    asset_dir = _remap_to_data_root(y2r_dir / cfg.get("asset_dir", "assets/procedural"))
     gen_cfg = cfg.get("generation", {})
     num_shapes = gen_cfg.get("num_shapes", 100)
     
