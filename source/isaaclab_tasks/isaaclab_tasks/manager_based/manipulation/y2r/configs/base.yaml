@@ -12,7 +12,7 @@
 simulation:
   physics_dt: 0.01              # Physics timestep (seconds)
   decimation: 2                 # Control decimation (steps per action)
-  num_envs: 20480
+  num_envs: 65536
   env_spacing: 3.0
   replicate_physics: false
   solver_position_iteration_count: 16
