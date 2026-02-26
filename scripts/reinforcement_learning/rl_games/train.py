@@ -237,6 +237,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     obs_groups = agent_cfg["params"]["env"].get("obs_groups")
     concate_obs_groups = agent_cfg["params"]["env"].get("concate_obs_groups", True)
     half_precision_obs = agent_cfg["params"]["config"].get("mixed_precision", False)
+    if agent_cfg["params"]["config"].get("expl_type", "none").startswith("mixed_expl"):
+        # Keep rollout observations in FP32 for mixed_expl to preserve coefficient-id fidelity.
+        half_precision_obs = False
 
     # set the IO descriptors export flag if requested
     if isinstance(env_cfg, ManagerBasedRLEnvCfg):

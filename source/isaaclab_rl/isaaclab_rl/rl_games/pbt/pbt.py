@@ -64,7 +64,7 @@ class PbtAlgoObserver(AlgoObserver):
         self.curr_policy_dir = os.path.join(self.ws_dir, f"{self.cfg.policy_idx:03d}")
         os.makedirs(self.curr_policy_dir, exist_ok=True)
 
-    def process_infos(self, infos, done_indices):
+    def process_infos(self, infos, done_indices, **kwargs):
         """Extract the scalar objective from environment infos and store in `self.score`.
 
         Notes:
@@ -255,8 +255,8 @@ class MultiObserver(AlgoObserver):
     def after_init(self, algo):
         self._call_multi("after_init", algo)
 
-    def process_infos(self, infos, done_indices):
-        self._call_multi("process_infos", infos, done_indices)
+    def process_infos(self, infos, done_indices, **kwargs):
+        self._call_multi("process_infos", infos, done_indices, **kwargs)
 
     def after_steps(self):
         self._call_multi("after_steps")

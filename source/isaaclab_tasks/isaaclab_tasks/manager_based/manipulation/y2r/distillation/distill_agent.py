@@ -452,7 +452,7 @@ class DistillAgent(A2CAgent):
                                             for name in self.reward_term_names}
                 print(f"[DEBUG] Tracking {num_terms} reward terms: {self.reward_term_names}")
             
-            self.obs, rewards, self.dones, infos = self.env_step(stepping_actions)
+            self.obs, rewards, _intr_rewards, self.dones, infos = self.env_step(stepping_actions)
             
             # Accumulate post-augmentation depth frame for video recording (env 0 only)
             if self.debug_depth_video and not self.depth_video_saved:

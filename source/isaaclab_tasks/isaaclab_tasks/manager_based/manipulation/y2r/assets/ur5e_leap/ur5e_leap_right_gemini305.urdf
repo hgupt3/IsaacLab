@@ -389,7 +389,7 @@
     <parent link="index_link_0" />
     <child link="index_link_1" />
     <axis xyz="0 0 -1" />
-    <limit effort="0.5" velocity="8.48" lower="-0.595" upper="0.595" />
+    <limit effort="0.5" velocity="8.48" lower="-0.349" upper="0.349" />
     <dynamics damping="0.1" friction="0.01" />
   </joint>
   <joint name="index_joint_1" type="revolute">
@@ -509,7 +509,7 @@
     <parent link="middle_link_0" />
     <child link="middle_link_1" />
     <axis xyz="0 0 -1" />
-    <limit effort="0.5" velocity="8.48" lower="-0.595" upper="0.595" />
+    <limit effort="0.5" velocity="8.48" lower="-0.349" upper="0.349" />
     <dynamics damping="0.1" friction="0.01" />
   </joint>
   <joint name="middle_joint_1" type="revolute">
@@ -629,7 +629,7 @@
     <parent link="ring_link_0" />
     <child link="ring_link_1" />
     <axis xyz="0 0 -1" />
-    <limit effort="0.5" velocity="8.48" lower="-0.595" upper="0.595" />
+    <limit effort="0.5" velocity="8.48" lower="-0.349" upper="0.349" />
     <dynamics damping="0.1" friction="0.01" />
   </joint>
   <joint name="ring_joint_1" type="revolute">

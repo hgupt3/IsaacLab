@@ -1047,7 +1047,7 @@ class TrajectoryEnvCfg(ManagerBasedEnvCfg):
         self.sim.dt = cfg.simulation.physics_dt
         self.sim.render_interval = self.decimation
         self.sim.physx.bounce_threshold_velocity = 0.01
-        self.sim.physx.gpu_max_rigid_patch_count = 4 * 5 * 2**15
+        self.sim.physx.gpu_max_rigid_patch_count = 2 * 2**20  # ~2M (errors requested >=1.6M)
 
     def _setup_push_t_scene(self, cfg: Y2RConfig):
         """Setup push_t scene: USD object and outline.

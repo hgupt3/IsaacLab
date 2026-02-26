@@ -33,7 +33,7 @@ params:
         sigma_init:
           name: const_initializer
           val: 0
-        fixed_sigma: True
+        fixed_sigma: 'fixed'
     cnn:
       type: conv2d
       activation: relu

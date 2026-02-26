@@ -35,9 +35,10 @@ params:
     point_encoder_norm: True  # LayerNorm on point tokens
     proprio_encoder_layers: [64, 64]  # 2-layer proprio encoder
     proprio_encoder_norm: True  # LayerNorm on proprio token
+    flash_attention: True        # False = math backend (bypasses CUDA grid limit for batch > 65535)
     torch_compile: True           # torch.compile the network (reduce-overhead + dynamic)
     mlp:
-      units: [512, 256, 128]
+      units: [1024, 1024, 512, 512]
       activation: elu
       d2rl: False
       initializer:
@@ -55,7 +56,7 @@ params:
         sigma_init:
           name: const_initializer
           val: 0
-        fixed_sigma: True
+        fixed_sigma: 'fixed' # 'coef_cond' for SAPG / 'fixed' for PPO
 
   load_checkpoint: False # flag which sets whether to load the checkpoint
   load_path: '' # path to the checkpoint to load
@@ -91,13 +92,23 @@ params:
     truncate_grads: True
     e_clip: 0.2
     horizon_length: 32
-    minibatch_size: 65536
+    minibatch_size: 61440
     mini_epochs: 4
     critic_coef: 4
     clip_value: True
     clip_actions: False
     seq_len: 4
     bounds_loss_coef: 0.0001
+
+    # SAPG (disabled by default - set expl_type to 'mixed_expl_learn_param' to enable, 'none' for PPO)
+    use_others_experience: 'lf'
+    off_policy_ratio: 1.0
+    expl_type: 'none'
+    expl_reward_coef_embd_size: 32
+    expl_reward_coef_scale: 0.005
+    expl_reward_type: entropy
+    expl_coef_block_size: 4096
+    good_reset_boundary: 0
 
 pbt:
   enabled: False

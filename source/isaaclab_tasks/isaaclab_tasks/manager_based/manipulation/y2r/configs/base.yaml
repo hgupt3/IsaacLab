@@ -12,7 +12,7 @@
 simulation:
   physics_dt: 0.01              # Physics timestep (seconds)
   decimation: 2                 # Control decimation (steps per action)
-  num_envs: 65536
+  num_envs: 61440
   env_spacing: 3.0
   replicate_physics: false
   solver_position_iteration_count: 16
@@ -360,7 +360,7 @@ terminations:
     rotation_threshold: [3.0, 2.0]        # Rotation threshold (radians)
 
   abnormal_robot:
-    enabled: false                          # Enable abnormal robot termination
+    enabled: true                          # Enable abnormal robot termination
     debug: false                            # Enable per-joint termination stats
 
 # ==============================================================================
@@ -374,7 +374,7 @@ curriculum:
     
   # Step-based scheduler (set step_interval to null to disable)
   scheduler: 
-    step_interval: 50000        # Floor increases at this interval
+    step_interval: 30000        # Floor increases at this interval
     use_performance: true       # Performance can still advance faster than floor
     
   # Tolerances to advance difficulty level

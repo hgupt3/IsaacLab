@@ -19,6 +19,7 @@ Architecture:
 
 from __future__ import annotations
 
+import contextlib
 import torch
 import torch.nn as nn
 from typing import Dict, Any
@@ -178,6 +179,7 @@ class PointTransformerBuilder(A2CBuilder):
             self.value_activation = params.get("value_activation", "None")
             self.attn_dropout = params.get("attn_dropout", 0.0)
             self.use_self_attention = params.get("self_attention", True)
+            self.use_flash_attention = params.get("flash_attention", True)
             self.ffn_ratio = params.get("ffn_ratio", 0.0)
             self.ffn_dropout = params.get("ffn_dropout", 0.0)
             self.point_encoder_layers = params.get("point_encoder_layers", None)
@@ -195,7 +197,12 @@ class PointTransformerBuilder(A2CBuilder):
                 self.is_continuous = "continuous" in params["space"]
                 if self.is_continuous:
                     self.space_config = params["space"]["continuous"]
-                    self.fixed_sigma = self.space_config.get("fixed_sigma", True)
+                    fixed_sigma = self.space_config.get("fixed_sigma", True)
+                    if fixed_sigma is True:
+                        fixed_sigma = "fixed"
+                    elif fixed_sigma is False:
+                        fixed_sigma = "obs_cond"
+                    self.fixed_sigma = fixed_sigma
                 elif self.is_discrete:
                     self.space_config = params["space"]["discrete"]
                 elif self.is_multi_discrete:
@@ -204,7 +211,7 @@ class PointTransformerBuilder(A2CBuilder):
                 self.is_continuous = True
                 self.is_discrete = False
                 self.is_multi_discrete = False
-                self.fixed_sigma = True
+                self.fixed_sigma = "fixed"
                 self.space_config = {
                     "mu_activation": "None",
                     "sigma_activation": "None",
@@ -229,7 +236,9 @@ class PointTransformerBuilder(A2CBuilder):
             self.actions_num = kwargs.get("actions_num")
             self.value_size = kwargs.get("value_size", 1)
             input_shape = kwargs.get("input_shape")
-            self.obs_dim = input_shape[0] if isinstance(input_shape, (tuple, list)) else input_shape
+            self.input_obs_dim = input_shape[0] if isinstance(input_shape, (tuple, list)) else input_shape
+            self.net_type = kwargs.get("type", "simple")
+            self.coef_id_idx = kwargs.get("coef_id_idx", None)
 
             # Architecture params (from base.yaml via builder)
             self.num_points = params["num_points"]
@@ -239,14 +248,32 @@ class PointTransformerBuilder(A2CBuilder):
 
             # Point cloud dimension: num_points × num_timesteps × 3
             self.point_cloud_dim = self.num_points * self.num_timesteps * 3
-            self.proprio_dim = self.obs_dim - self.point_cloud_dim
+            self.base_obs_dim = self.input_obs_dim
+            self.extra_tail_dim = 0
+            if self.coef_id_idx is not None:
+                self.base_obs_dim = self.coef_id_idx
+                self.extra_tail_dim = self.input_obs_dim - self.coef_id_idx
+            self.base_proprio_dim = self.base_obs_dim - self.point_cloud_dim
 
             # Validate dimensions
-            if self.proprio_dim < 0:
+            if self.base_proprio_dim < 0:
                 raise ValueError(
-                    f"Observation dim ({self.obs_dim}) is smaller than point cloud dim "
+                    f"Observation dim ({self.base_obs_dim}) is smaller than point cloud dim "
                     f"({self.point_cloud_dim}). Check num_points and num_timesteps."
                 )
+
+            if self.net_type == "extra_param":
+                self.param_ids = kwargs["coef_ids"]
+                self.pid_idx = kwargs["coef_id_idx"]
+                self.param_size = kwargs.get("param_size", 32)
+                self.extra_params = nn.Parameter(
+                    torch.randn((len(self.param_ids), self.param_size), dtype=torch.float32, requires_grad=True),
+                    requires_grad=True,
+                )
+                self.proprio_dim = self.base_proprio_dim + self.param_size
+            else:
+                self.proprio_dim = self.base_proprio_dim + self.extra_tail_dim
+            self.obs_dim = self.proprio_dim + self.point_cloud_dim
             
             # Build components
             # Point encoder: Conv1d temporal encoder
@@ -286,9 +313,16 @@ class PointTransformerBuilder(A2CBuilder):
             self.mu_act = self.activations_factory.create(self.space_config.get("mu_activation", "None"))
             self.sigma_act = self.activations_factory.create(self.space_config.get("sigma_activation", "None"))
 
-            if self.fixed_sigma:
+            if self.fixed_sigma == "fixed":
                 self.sigma = nn.Parameter(
                     torch.zeros(self.actions_num, requires_grad=True, dtype=torch.float32),
+                    requires_grad=True,
+                )
+            elif self.fixed_sigma == "coef_cond":
+                self.sigma_ids = kwargs["coef_ids"]
+                self.sigma_id_idx = kwargs["coef_id_idx"]
+                self.sigma = nn.Parameter(
+                    torch.zeros(len(self.sigma_ids), self.actions_num, requires_grad=True, dtype=torch.float32),
                     requires_grad=True,
                 )
             else:
@@ -397,10 +431,32 @@ class PointTransformerBuilder(A2CBuilder):
                     **self.space_config.get("sigma_init", {"name": "const_initializer", "val": 0})
                 )
                 mu_init(self.actor_output.weight)
-                if self.fixed_sigma:
+                if self.fixed_sigma in ["fixed", "coef_cond"]:
                     sigma_init(self.sigma)
                 else:
                     sigma_init(self.sigma_head.weight)
+
+        def _match_coef_indices(self, obs_ids: torch.Tensor, coef_ids: torch.Tensor) -> torch.Tensor:
+            if obs_ids.dtype != coef_ids.dtype:
+                obs_ids = obs_ids.to(coef_ids.dtype)
+            distances = torch.abs(obs_ids.unsqueeze(1) - coef_ids.unsqueeze(0))
+            return torch.argmin(distances, dim=1)
+
+        def _prepare_obs(self, obs: torch.Tensor) -> torch.Tensor:
+            # Keep point-cloud features contiguous at the tail for deterministic splitting.
+            if self.net_type == "extra_param":
+                coef_indices = self._match_coef_indices(obs[:, self.pid_idx], self.param_ids)
+                base_obs = obs[:, :self.pid_idx]
+                base_proprio = base_obs[:, :self.base_proprio_dim]
+                point_flat = base_obs[:, self.base_proprio_dim:]
+                return torch.cat([base_proprio, self.extra_params[coef_indices], point_flat], dim=1)
+            if self.extra_tail_dim > 0:
+                base_obs = obs[:, :self.base_obs_dim]
+                tail = obs[:, self.base_obs_dim:]
+                base_proprio = base_obs[:, :self.base_proprio_dim]
+                point_flat = base_obs[:, self.base_proprio_dim:]
+                return torch.cat([base_proprio, tail, point_flat], dim=1)
+            return obs
 
         def _split_obs(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             """Split flat observation into point clouds and extended proprio.
@@ -451,7 +507,8 @@ class PointTransformerBuilder(A2CBuilder):
                 value: Value estimate (B, value_size)
                 states: RNN states (None for non-recurrent)
             """
-            obs = obs_dict['obs']
+            raw_obs = obs_dict['obs']
+            obs = self._prepare_obs(raw_obs)
             B = obs.shape[0]
             
             # Split observation
@@ -471,10 +528,15 @@ class PointTransformerBuilder(A2CBuilder):
                 proprio_token = torch.zeros(B, 1, self.hidden_dim, device=obs.device)
             
             # Self-attention over point tokens (if enabled), then cross-attention from proprio
-            if self.use_self_attention:
-                point_tokens = self.self_attn(point_tokens)
-                point_tokens = self.self_ffn(point_tokens)
-            attn_out = self.cross_attn(proprio_token, point_tokens)  # (B, 1, hidden_dim)
+            # flash_attention: False uses math backend to bypass CUDA grid dim limit (batch > 65535)
+            attn_ctx = (torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH)
+                        if not self.use_flash_attention
+                        else contextlib.nullcontext())
+            with attn_ctx:
+                if self.use_self_attention:
+                    point_tokens = self.self_attn(point_tokens)
+                    point_tokens = self.self_ffn(point_tokens)
+                attn_out = self.cross_attn(proprio_token, point_tokens)  # (B, 1, hidden_dim)
             attn_features = attn_out[:, 0]  # (B, hidden_dim)
 
             # Concat raw proprio + attention output
@@ -488,17 +550,18 @@ class PointTransformerBuilder(A2CBuilder):
             if self.separate:
                 # Recompute critic features with separate encoders/attention
                 critic_point_tokens = self.critic_point_encoder(point_obs)
-                if self.use_self_attention:
-                    critic_point_tokens = self.critic_self_attn(critic_point_tokens)
-                    critic_point_tokens = self.critic_self_ffn(critic_point_tokens)
-                if self.proprio_dim > 0:
-                    critic_proprio_encoded = self.critic_proprio_encoder(proprio_obs)
-                    if self.proprio_norm is not None:
-                        critic_proprio_encoded = self.proprio_norm(critic_proprio_encoded)
-                    critic_proprio_token = critic_proprio_encoded.unsqueeze(1)
-                else:
-                    critic_proprio_token = torch.zeros(B, 1, self.hidden_dim, device=obs.device)
-                critic_attn_out = self.critic_cross_attn(critic_proprio_token, critic_point_tokens)
+                with attn_ctx:
+                    if self.use_self_attention:
+                        critic_point_tokens = self.critic_self_attn(critic_point_tokens)
+                        critic_point_tokens = self.critic_self_ffn(critic_point_tokens)
+                    if self.proprio_dim > 0:
+                        critic_proprio_encoded = self.critic_proprio_encoder(proprio_obs)
+                        if self.proprio_norm is not None:
+                            critic_proprio_encoded = self.proprio_norm(critic_proprio_encoded)
+                        critic_proprio_token = critic_proprio_encoded.unsqueeze(1)
+                    else:
+                        critic_proprio_token = torch.zeros(B, 1, self.hidden_dim, device=obs.device)
+                    critic_attn_out = self.critic_cross_attn(critic_proprio_token, critic_point_tokens)
                 critic_attn_features = critic_attn_out[:, 0]
                 if self.proprio_dim > 0:
                     critic_trunk_input = torch.cat([proprio_obs, critic_attn_features], dim=-1)
@@ -519,8 +582,11 @@ class PointTransformerBuilder(A2CBuilder):
             value = self.value_act(self.critic_output(critic_latent))
 
             # Sigma
-            if self.fixed_sigma:
+            if self.fixed_sigma == "fixed":
                 sigma = self.sigma_act(self.sigma)
+            elif self.fixed_sigma == "coef_cond":
+                sigma_indices = self._match_coef_indices(raw_obs[:, self.sigma_id_idx], self.sigma_ids)
+                sigma = self.sigma_act(self.sigma[sigma_indices])
             else:
                 sigma = self.sigma_act(self.sigma_head(actor_latent))
 
@@ -584,5 +650,3 @@ class PointTransformerBuilder(A2CBuilder):
             # launch overhead; dynamic=True handles varying batch sizes.
             net = torch.compile(net, mode="reduce-overhead", dynamic=True)
         return net
-
-

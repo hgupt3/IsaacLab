@@ -82,7 +82,7 @@ params:
         sigma_init:
           name: const_initializer
           val: 0
-        fixed_sigma: True
+        fixed_sigma: 'fixed'
     
     mlp:
       units: [512, 256, 128]
@@ -137,6 +137,16 @@ params:
     clip_actions: False
     seq_len: 4
     bounds_loss_coef: 0.0001
+
+    # SAPG (disabled by default - set expl_type to 'mixed_expl_learn_param' to enable)
+    use_others_experience: 'none'
+    off_policy_ratio: 1.0
+    expl_type: 'none'
+    expl_reward_coef_embd_size: 32
+    expl_reward_coef_scale: 0.005
+    expl_reward_type: entropy
+    expl_coef_block_size: 4096
+    good_reset_boundary: 0
 
   # ==========================================================================
   # DISTILLATION SETTINGS (used by DistillAgent)
