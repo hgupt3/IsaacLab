@@ -12,7 +12,7 @@
 simulation:
   physics_dt: 0.01              # Physics timestep (seconds)
   decimation: 2                 # Control decimation (steps per action)
-  num_envs: 61440
+  num_envs: 32768
   env_spacing: 3.0
   replicate_physics: false
   solver_position_iteration_count: 16
@@ -240,7 +240,7 @@ rewards:
       term_keys: ["trajectory_deviation", "hand_pose_deviation", "abnormal_robot"]
     
   arm_table_penalty:
-    weight: -0.5
+    weight: -1.0
     params:
       table_z: 0.255
       threshold_mid: 0.1         # Safe height above table for mid links
@@ -264,7 +264,7 @@ rewards:
       use_contact_gating: true         # Multiply by global contact_factor
     
   distal_joint3_penalty:
-    weight: -0.3
+    weight: -0.25
     params:
       phases: [grasp, manipulation, release]  # Active in all phases (no phase restriction)
       std: 1.5                    # Larger = more lenient (radians)
@@ -285,10 +285,10 @@ rewards:
 
   # Penalize being too close to joint soft limits (encourages "comfort zone" postures)
   joint_limits_margin:
-    weight: 0.0
+    weight: -0.5
     params:
       threshold: 0.95             # Fraction of joint range where penalty starts
-      power: 2.0                  # Penalty sharpness near limits
+      power: 1.0                  # Penalty sharpness near limits
 
   # Rewards *reducing* current target error (helps recovery if policy freezes).
   tracking_progress:
@@ -360,7 +360,7 @@ terminations:
     rotation_threshold: [3.0, 2.0]        # Rotation threshold (radians)
 
   abnormal_robot:
-    enabled: true                          # Enable abnormal robot termination
+    enabled: false                          # Enable abnormal robot termination
     debug: false                            # Enable per-joint termination stats
 
 # ==============================================================================
@@ -374,7 +374,7 @@ curriculum:
     
   # Step-based scheduler (set step_interval to null to disable)
   scheduler: 
-    step_interval: 30000        # Floor increases at this interval
+    step_interval: 50000        # Floor increases at this interval
     use_performance: true       # Performance can still advance faster than floor
     
   # Tolerances to advance difficulty level
