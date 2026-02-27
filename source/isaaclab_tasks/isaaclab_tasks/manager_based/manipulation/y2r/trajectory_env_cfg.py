@@ -411,9 +411,6 @@ def _build_observations_cfg(cfg: Y2RConfig):
         timing = ObsTerm(
             func=mdp.trajectory_timing,
         )
-        hand_pose_error = ObsTerm(
-            func=mdp.hand_pose_error_palm,
-        )
 
         def __post_init__(self):
             self.enable_corruption = True
@@ -424,12 +421,11 @@ def _build_observations_cfg(cfg: Y2RConfig):
 
     @configclass
     class StudentProprioObsCfg(ObsGroup):
-        """Student proprioception: joint_pos, joint_vel, hand_eigen only.
+        """Student proprioception: joint_pos, hand_eigen only.
 
-        No hand_tips_state, no contacts, no object_pose_palm (all privileged).
+        No joint_vel, hand_tips_state, contacts, or object_pose_palm (all privileged).
         """
         joint_pos = ObsTerm(func=mdp.joint_pos, noise=Unoise(n_min=-0.0, n_max=0.0))
-        joint_vel = ObsTerm(func=mdp.joint_vel, noise=Unoise(n_min=-0.0, n_max=0.0))
         hand_eigen = ObsTerm(
             func=mdp.allegro_hand_eigen_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),

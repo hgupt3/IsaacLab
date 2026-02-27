@@ -10,11 +10,12 @@ proprioceptive and point cloud observations.
 
 Architecture:
     - Depth encoder: Conv3x3 s=2 → ResBlock(32) → ResBlock(64,s=2) → ResBlock(128,s=2) → AvgPool
-    - Feature fusion: depth_features (128) + base_obs (proprio + student_perception + student_targets)
+    - Feature fusion: depth_features (C) + base_obs (proprio + student_perception + student_targets)
+      where C is the last entry of depth_encoder.channels
     - Policy MLP: [512, 256, 128] → actions
 
 Depth handling:
-    Depth is ALWAYS packed at the END of the obs tensor (last resolution*resolution floats).
+    Depth is ALWAYS packed at the END of the obs tensor (last H*W floats).
     The model:
     1. Slices depth from end of obs
     2. Applies RunningMeanStd normalization ONLY to base_obs (not depth)
@@ -32,7 +33,9 @@ Usage in YAML config:
           sigma_d: 0.1
         ...
       depth_encoder:
-        resolution: 64
+        # Optional explicit override. If omitted, uses active Y2R wrist camera size.
+        # height: 64
+        # width: 64
         channels: [32, 64, 128]
       mlp:
         units: [512, 256, 128]
@@ -49,6 +52,19 @@ from typing import Dict, Any
 from rl_games.algos_torch.network_builder import NetworkBuilder
 from rl_games.algos_torch import torch_ext
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
+
+
+def _get_wrist_camera_shape_from_y2r_config() -> tuple[int, int] | None:
+    """Get wrist camera (height, width) from active Y2R config, if available."""
+    try:
+        import os
+        from ..config_loader import get_config
+
+        mode = os.getenv("Y2R_MODE")
+        y2r_cfg = get_config(mode)
+        return int(y2r_cfg.wrist_camera.height), int(y2r_cfg.wrist_camera.width)
+    except Exception:
+        return None
 
 
 # =============================================================================
@@ -112,16 +128,16 @@ class ResBlock(nn.Module):
 # =============================================================================
 
 class SmallResNet(nn.Module):
-    """Small ResNet encoder for 64x64 depth images.
+    """Small ResNet encoder for depth images.
     
-    Architecture:
-        Input: (B, 1, 64, 64) depth image
+    Example architecture for a 64x64 input:
+        Input: (B, 1, 64, 64)
         Conv 3x3, s=2: 1 → 32 channels, 64x64 → 32x32
         ResBlock: 32 → 32 channels, 32x32
         ResBlock s=2: 32 → 64 channels, 32x32 → 16x16
         ResBlock s=2: 64 → 128 channels, 16x16 → 8x8
         AdaptiveAvgPool: 8x8 → 1x1
-        Output: (B, 128) features
+        Output: (B, out_features), where out_features = channels[-1]
     
     Args:
         in_channels: Number of input channels (1 for depth)
@@ -180,7 +196,7 @@ class DepthResNetStudentBuilder(NetworkBuilder):
     """Network builder for student policy with depth encoder.
     
     This builder creates a network that:
-    1. Slices depth from END of obs tensor (last resolution*resolution floats)
+    1. Slices depth from END of obs tensor (last H*W floats)
     2. Normalizes ONLY base_obs with RunningMeanStd (depth is already [0,1])
     3. Applies optional DepthAug during training
     4. Encodes depth through SmallResNet
@@ -189,11 +205,17 @@ class DepthResNetStudentBuilder(NetworkBuilder):
     
     def __init__(self, **kwargs):
         NetworkBuilder.__init__(self)
+        self.params = None
     
     def load(self, params: Dict[str, Any]):
         self.params = params
     
     def build(self, name: str, **kwargs) -> nn.Module:
+        if self.params is None:
+            raise RuntimeError(
+                "DepthResNetStudentBuilder.build() called before load(). "
+                "Ensure RL-Games has loaded network params from agent config."
+            )
         return DepthResNetStudentBuilder.Network(self.params, **kwargs)
     
     class Network(NetworkBuilder.BaseNetwork):
@@ -221,9 +243,30 @@ class DepthResNetStudentBuilder(NetworkBuilder):
             
             # Depth encoder config
             depth_cfg = params.get('depth_encoder', {})
-            self.depth_resolution = depth_cfg.get('resolution', 64)
+            camera_hw = _get_wrist_camera_shape_from_y2r_config()
+            resolution = depth_cfg.get('resolution', None)
+            depth_h = depth_cfg.get('height', None)
+            depth_w = depth_cfg.get('width', None)
+
+            if depth_h is not None or depth_w is not None:
+                if depth_h is None or depth_w is None:
+                    raise ValueError("depth_encoder.height and depth_encoder.width must be set together.")
+                self.depth_height = int(depth_h)
+                self.depth_width = int(depth_w)
+            elif camera_hw is not None:
+                self.depth_height, self.depth_width = camera_hw
+                if resolution is not None:
+                    print(
+                        f"[DepthResNetStudent] Ignoring depth_encoder.resolution={resolution} "
+                        f"and using wrist_camera size {self.depth_height}x{self.depth_width} from Y2R config."
+                    )
+            else:
+                # Fallback for standalone usage outside Y2R config system.
+                self.depth_height = int(resolution) if resolution is not None else 64
+                self.depth_width = int(resolution) if resolution is not None else 64
+
             self.depth_channels = depth_cfg.get('channels', [32, 64, 128])
-            self.depth_dim = self.depth_resolution * self.depth_resolution
+            self.depth_dim = self.depth_height * self.depth_width
             
             # Depth augmentation config
             self.use_depth_aug = params.get('depth_augmentation', False)
@@ -240,6 +283,12 @@ class DepthResNetStudentBuilder(NetworkBuilder):
             # Calculate base_obs dimension (full obs minus depth)
             full_obs_dim = input_shape[0] if isinstance(input_shape, tuple) else input_shape
             self.base_obs_dim = full_obs_dim - self.depth_dim
+            if self.base_obs_dim <= 0:
+                raise ValueError(
+                    f"Invalid student obs layout: full_obs_dim={full_obs_dim}, depth_dim={self.depth_dim} "
+                    f"(depth={self.depth_height}x{self.depth_width}). "
+                    "Expected depth to be packed at tail of obs with base_obs before it."
+                )
             
             # RunningMeanStd for base_obs ONLY (not depth)
             if self.normalize_base_obs:
@@ -274,13 +323,13 @@ class DepthResNetStudentBuilder(NetworkBuilder):
                     self.space_config['mu_activation']
                 )
                 
-                if self.fixed_sigma:
+                if self.fixed_sigma == "fixed":
                     self.sigma = nn.Parameter(
                         torch.zeros(actions_num, requires_grad=True, dtype=torch.float32),
                         requires_grad=True
                     )
                 else:
-                    self.sigma = nn.Linear(out_size, actions_num)
+                    self.sigma_head = nn.Linear(out_size, actions_num)
                 
                 self.sigma_act = self.activations_factory.create(
                     self.space_config['sigma_activation']
@@ -290,10 +339,10 @@ class DepthResNetStudentBuilder(NetworkBuilder):
                 mu_init = self.init_factory.create(**self.space_config['mu_init'])
                 sigma_init = self.init_factory.create(**self.space_config['sigma_init'])
                 mu_init(self.mu.weight)
-                if self.fixed_sigma:
+                if self.fixed_sigma == "fixed":
                     sigma_init(self.sigma)
                 else:
-                    sigma_init(self.sigma.weight)
+                    sigma_init(self.sigma_head.weight)
             
             # Initialize MLP weights
             mlp_init = self.init_factory.create(**self.initializer)
@@ -309,7 +358,7 @@ class DepthResNetStudentBuilder(NetworkBuilder):
             print(f"[DepthResNetStudent] Initialized:")
             print(f"  full_obs_dim: {full_obs_dim}")
             print(f"  base_obs_dim: {self.base_obs_dim}")
-            print(f"  depth_dim: {self.depth_dim} ({self.depth_resolution}x{self.depth_resolution})")
+            print(f"  depth_dim: {self.depth_dim} ({self.depth_height}x{self.depth_width})")
             print(f"  depth_features: {depth_features}")
             print(f"  mlp_input_size: {mlp_input_size}")
             print(f"  normalize_base_obs: {self.normalize_base_obs}")
@@ -346,8 +395,8 @@ class DepthResNetStudentBuilder(NetworkBuilder):
             if self.normalize_base_obs:
                 base_obs = self.running_mean_std(base_obs)
             
-            # Reshape depth to image: (B, res*res) → (B, 1, res, res)
-            depth_img = depth_flat.view(B, 1, self.depth_resolution, self.depth_resolution)
+            # Reshape depth to image: (B, H*W) → (B, 1, H, W)
+            depth_img = depth_flat.view(B, 1, self.depth_height, self.depth_width)
             
             # Apply depth augmentation during training only
             if self.training and self.use_depth_aug:
@@ -362,7 +411,7 @@ class DepthResNetStudentBuilder(NetworkBuilder):
             self.last_depth_img = depth_img.detach()
             
             # Encode depth
-            depth_features = self.depth_encoder(depth_img)  # (B, 128)
+            depth_features = self.depth_encoder(depth_img)  # (B, depth_features)
             
             # Concatenate: normalized base_obs + depth_features
             combined = torch.cat([base_obs, depth_features], dim=-1)
@@ -376,10 +425,10 @@ class DepthResNetStudentBuilder(NetworkBuilder):
             # Policy (continuous)
             if self.is_continuous:
                 mu = self.mu_act(self.mu(out))
-                if self.fixed_sigma:
+                if self.fixed_sigma == "fixed":
                     sigma = self.sigma_act(self.sigma)
                 else:
-                    sigma = self.sigma_act(self.sigma(out))
+                    sigma = self.sigma_act(self.sigma_head(out))
                 
                 return mu, mu * 0 + sigma, value, None
             
@@ -408,12 +457,17 @@ class DepthResNetStudentBuilder(NetworkBuilder):
                 
                 if self.is_continuous:
                     self.space_config = params['space']['continuous']
-                    self.fixed_sigma = self.space_config['fixed_sigma']
+                    fixed_sigma = self.space_config.get('fixed_sigma', True)
+                    if fixed_sigma is True:
+                        fixed_sigma = "fixed"
+                    elif fixed_sigma is False:
+                        fixed_sigma = "obs_cond"
+                    self.fixed_sigma = fixed_sigma
             else:
                 self.is_continuous = True  # Default to continuous
                 self.is_discrete = False
                 self.is_multi_discrete = False
-                self.fixed_sigma = True
+                self.fixed_sigma = "fixed"
                 self.space_config = {
                     'mu_activation': 'None',
                     'sigma_activation': 'None',

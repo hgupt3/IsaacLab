@@ -35,8 +35,9 @@ gym.register(
         "env_cfg_entry_point": f"{__name__}.trajectory_kuka_allegro_env_cfg:TrajectoryKukaAllegroEnvCfg",
         # Teacher agent config (default for train.py, play.py)
         "rl_games_cfg_entry_point": f"{shared_agents.__name__}:rl_games_trajectory_ppo_cfg.yaml",
-        # Student agent config (use with --agent rl_games_student_cfg_entry_point)
+        # Student agent configs (distill.py uses rl_games_student_cfg_entry_point by default)
         "rl_games_student_cfg_entry_point": f"{shared_agents.__name__}:rl_games_student_depth_ppo_cfg.yaml",
+        "rl_games_student_pt_cfg_entry_point": f"{shared_agents.__name__}:rl_games_student_depth_pt_ppo_cfg.yaml",
         # Teacher config for distillation (used by distill.py --teacher-agent)
         "rl_games_teacher_cfg_entry_point": f"{shared_agents.__name__}:rl_games_trajectory_ppo_cfg.yaml",
         # Other frameworks

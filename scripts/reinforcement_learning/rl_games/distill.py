@@ -40,6 +40,11 @@ parser.add_argument(
     "--teacher-agent", type=str, default="rl_games_teacher_cfg_entry_point",
     help="Teacher agent config entry point (default: rl_games_cfg_entry_point)."
 )
+parser.add_argument(
+    "--student-agent", type=str, default="rl_games_student_cfg_entry_point",
+    help="Student agent config entry point (default: rl_games_student_cfg_entry_point). "
+         "Use rl_games_student_pt_cfg_entry_point for Point Transformer student."
+)
 parser.add_argument("--max_iterations", type=int, default=None, help="Distillation training iterations.")
 parser.add_argument("--wandb-project-name", type=str, default=None, help="the wandb's project name")
 parser.add_argument("--wandb-entity", type=str, default=None, help="the entity (team) of wandb's project")
@@ -165,7 +170,7 @@ def register_distill_agent_with_runner(runner: Runner):
     )
 
 
-@hydra_task_config(args_cli.task, "rl_games_student_cfg_entry_point")
+@hydra_task_config(args_cli.task, args_cli.student_agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: dict):
     """Run teacher-student distillation."""
     
@@ -369,12 +374,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 "agent_cfg_full": agent_cfg,
             }, allow_val_change=True)
     
+    # Resolve student resume checkpoint (if provided)
+    resume_path = None
+    if args_cli.checkpoint is not None:
+        resume_path = retrieve_file_path(args_cli.checkpoint)
+        print(f"[INFO] Resuming student checkpoint: {resume_path}")
+
     # ===== Run distillation =====
     print("\n" + "="*60)
     print("Starting Distillation")
     print("="*60 + "\n")
-    
-    runner.run({"train": True, "play": False})
+
+    if resume_path is not None:
+        runner.run({"train": True, "play": False, "checkpoint": resume_path})
+    else:
+        runner.run({"train": True, "play": False})
     
     # Close
     env.close()
