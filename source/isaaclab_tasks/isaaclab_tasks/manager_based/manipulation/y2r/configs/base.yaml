@@ -285,7 +285,7 @@ rewards:
 
   # Penalize being too close to joint soft limits (encourages "comfort zone" postures)
   joint_limits_margin:
-    weight: -0.5
+    weight: -0.0
     params:
       threshold: 0.95             # Fraction of joint range where penalty starts
       power: 1.0                  # Penalty sharpness near limits
@@ -352,7 +352,7 @@ rewards:
 # ==============================================================================
 terminations:
   trajectory_deviation:
-    position_threshold: [0.18, 0.08]      # Spatial error (meters)
+    position_threshold: [0.2, 0.1]      # Spatial error (meters)
     rotation_threshold: [2.0, 1.0]       # Rotation error (radians)
   
   hand_pose_deviation:
@@ -511,8 +511,8 @@ push_t:
 # VISIBILITY CAMERA (true occlusion via instance segmentation + depth)
 # ==============================================================================
 visibility_camera:
-  width: 160
-  height: 90                        # 16:9 aspect ratio (RealSense D435i native 1280x720)
+  width: 128
+  height: 72                        # 16:9 aspect ratio (RealSense D435i native 1280x720)
   focal_length: 3.16                # 87° HFOV (D435i depth): 6.0 / (2×tan(43.5°))
   horizontal_aperture: 6.0
   clipping_range: [0.1, 2.0]
@@ -525,11 +525,11 @@ visibility_camera:
 # WRIST CAMERA  (Gemini 305 depth — pinhole, square pixels, HFOV 88°)
 # ==============================================================================
 wrist_camera:
-  width: 120                     # Gemini 305 native 16:10 aspect ratio (1280:800)
-  height: 75
+  width: 64                     # Gemini 305 native 16:10 aspect ratio (1280:800)
+  height: 40
   focal_length: 3.19            # 88° HFOV: 6.17 / (2×tan(44°))
   horizontal_aperture: 6.17     # Virtual sensor width (mm)
-  clipping_range: [0.04, 1.0]   # Gemini 305 depth range: 4–100 cm
+  clipping_range: [0.04, 0.5]   # Gemini 305 depth range: 4–100 cm
 
   # Offset: ur5e_link_6 → camera (opengl convention, Euler degrees)
   # Computed from URDF chain: link_6→ee_link→palm_link→camera

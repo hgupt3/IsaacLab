@@ -38,7 +38,7 @@ params:
     flash_attention: True        # False = math backend (bypasses CUDA grid limit for batch > 65535)
     torch_compile: True           # torch.compile the network (reduce-overhead + dynamic)
     mlp:
-      units: [512, 512, 256, 256]
+      units: [512, 256, 128]
       activation: elu
       d2rl: False
       initializer:

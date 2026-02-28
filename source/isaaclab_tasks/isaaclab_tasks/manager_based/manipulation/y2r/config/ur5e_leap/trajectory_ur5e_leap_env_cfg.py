@@ -114,20 +114,18 @@ class UR5eLeapTrajectoryMixinCfg:
         self.scene.robot = UR5E_LEAP_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
         self.scene.robot.init_state.pos = (0.0, 0.0, table_surface_z)
 
-        # Override table: real-world dimensions (1.125m depth × 1.62m width × 1cm thick)
-        # Robot at X=0, centered in Y=0. Table NOT centered on robot:
-        #   77cm to right edge (-Y), 85cm to left edge (+Y) → center Y = +0.04
-        # Table center X = 0.113 - 1.125/2 = -0.4495 ≈ -0.45
+        # Override table: previous XY footprint/offset with current Z terms preserved.
+        # okemo table size: size=(1.125, 1.62, 0.01), pos=(-0.45, 0.04, table_surface_z - 0.005)
         self.scene.table = RigidObjectCfg(
             prim_path="/World/envs/env_.*/table",
             spawn=sim_utils.CuboidCfg(
-                size=(1.125, 1.62, 0.01),
+                size=(1.13, 1.27, 0.01),
                 rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
                 collision_props=sim_utils.CollisionPropertiesCfg(),
                 visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.92, 0.91, 0.90), roughness=0.4),
             ),
             init_state=RigidObjectCfg.InitialStateCfg(
-                pos=(-0.45, 0.04, table_surface_z - 0.005),
+                pos=(-0.45, 0.0, table_surface_z - 0.005),
                 rot=(1.0, 0.0, 0.0, 0.0),
             ),
         )
@@ -248,19 +246,6 @@ class UR5eLeapTrajectoryMixinCfg:
                 ),
                 init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0)),
             )
-
-            # Camera mount — mesh has absolute sim coordinates baked in (placed at origin)
-            self.scene.camera_mount = RigidObjectCfg(
-                prim_path="/World/envs/env_.*/camera_mount",
-                spawn=sim_utils.UsdFileCfg(
-                    usd_path=str(realsense_assets / "mount" / "table_mount.usd"),
-                    rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
-                    collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
-                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 0.0), roughness=0.9),
-                ),
-                init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0)),
-            )
-
 
 # ==============================================================================
 # FINAL ENV CONFIG

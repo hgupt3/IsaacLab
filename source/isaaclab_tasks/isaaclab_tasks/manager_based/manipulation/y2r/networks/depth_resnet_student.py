@@ -2,14 +2,14 @@
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Small ResNet-style Depth Encoder for Student Policy Distillation and PPO Fine-tuning.
+"""3-Layer CNN Depth Encoder for Student Policy Distillation and PPO Fine-tuning.
 
 This module implements a student policy network that processes wrist camera
-depth images through a small ResNet encoder and concatenates features with
-proprioceptive and point cloud observations.
+depth images through a simple 3-layer CNN encoder and concatenates features
+with proprioceptive and point cloud observations.
 
 Architecture:
-    - Depth encoder: Conv3x3 s=2 → ResBlock(32) → ResBlock(64,s=2) → ResBlock(128,s=2) → AvgPool
+    - Depth encoder: 3x Conv2d(k=3,s=2) + GroupNorm + ReLU → GAP
     - Feature fusion: depth_features (C) + base_obs (proprio + student_perception + student_targets)
       where C is the last entry of depth_encoder.channels
     - Policy MLP: [512, 256, 128] → actions
@@ -20,7 +20,7 @@ Depth handling:
     1. Slices depth from end of obs
     2. Applies RunningMeanStd normalization ONLY to base_obs (not depth)
     3. Applies optional DepthAug when explicitly enabled via apply_depth_aug
-    4. Encodes depth via SmallResNet
+    4. Encodes depth via DepthCNN
     5. Concatenates normalized base_obs + depth_features
 
 Usage in YAML config:
@@ -53,6 +53,15 @@ from rl_games.algos_torch.network_builder import NetworkBuilder
 from rl_games.algos_torch import torch_ext
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
 
+try:
+    _compile_disable = torch.compiler.disable
+except Exception:
+    try:
+        _compile_disable = torch._dynamo.disable
+    except Exception:
+        def _compile_disable(fn):
+            return fn
+
 
 def _get_wrist_camera_shape_from_y2r_config() -> tuple[int, int] | None:
     """Get wrist camera (height, width) from active Y2R config, if available."""
@@ -68,123 +77,57 @@ def _get_wrist_camera_shape_from_y2r_config() -> tuple[int, int] | None:
 
 
 # =============================================================================
-# Residual Block
+# 3-Layer CNN Depth Encoder
 # =============================================================================
 
-class ResBlock(nn.Module):
-    """Residual block with optional downsampling and channel change.
-    
-    Structure:
-        x → Conv3x3 → LayerNorm → ReLU → Conv3x3 → LayerNorm → (+) → ReLU
-            └─────────────── skip connection (1x1 conv if needed) ─┘
-    
-    Args:
-        in_channels: Number of input channels
-        out_channels: Number of output channels
-        stride: Stride for first conv (1 = same size, 2 = downsample)
-    """
-    
-    def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
-        super().__init__()
-        
-        self.conv1 = nn.Conv2d(
-            in_channels, out_channels, kernel_size=3, 
-            stride=stride, padding=1, bias=False
-        )
-        self.ln1 = nn.GroupNorm(1, out_channels)  # GroupNorm(1) = LayerNorm for conv
-        
-        self.conv2 = nn.Conv2d(
-            out_channels, out_channels, kernel_size=3,
-            stride=1, padding=1, bias=False
-        )
-        self.ln2 = nn.GroupNorm(1, out_channels)
-        
-        # Skip connection with projection if dimensions change
-        self.skip = nn.Identity()
-        if stride != 1 or in_channels != out_channels:
-            self.skip = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.GroupNorm(1, out_channels)
-            )
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        identity = self.skip(x)
-        
-        out = self.conv1(x)
-        out = self.ln1(out)
-        out = F.relu(out)
-        
-        out = self.conv2(out)
-        out = self.ln2(out)
-        
-        out = out + identity
-        out = F.relu(out)
-        
-        return out
+class DepthCNN(nn.Module):
+    """Simple 3-layer CNN encoder for depth images.
 
+    Each layer: Conv2d(k=3, s=2, p=1) → GroupNorm → ReLU, followed by GAP.
 
-# =============================================================================
-# Small ResNet Encoder
-# =============================================================================
+    Example for 64x64 input with channels=[32, 64, 128]:
+        Input:  (B, 1, 64, 64)
+        Conv1:  (B, 32, 32, 32)
+        Conv2:  (B, 64, 16, 16)
+        Conv3:  (B, 128, 8, 8)
+        GAP:    (B, 128, 1, 1)
+        Output: (B, 128)
 
-class SmallResNet(nn.Module):
-    """Small ResNet encoder for depth images.
-    
-    Example architecture for a 64x64 input:
-        Input: (B, 1, 64, 64)
-        Conv 3x3, s=2: 1 → 32 channels, 64x64 → 32x32
-        ResBlock: 32 → 32 channels, 32x32
-        ResBlock s=2: 32 → 64 channels, 32x32 → 16x16
-        ResBlock s=2: 64 → 128 channels, 16x16 → 8x8
-        AdaptiveAvgPool: 8x8 → 1x1
-        Output: (B, out_features), where out_features = channels[-1]
-    
     Args:
         in_channels: Number of input channels (1 for depth)
         channels: List of channel sizes [32, 64, 128]
     """
-    
+
     def __init__(self, in_channels: int = 1, channels: list = None):
         super().__init__()
-        
+
         if channels is None:
             channels = [32, 64, 128]
-        
+
         assert len(channels) == 3, f"Expected 3 channel values, got {len(channels)}"
         c1, c2, c3 = channels
-        
-        # Initial conv: 1 → 32, stride 2 (64x64 → 32x32)
-        self.stem = nn.Sequential(
+
+        self.layers = nn.Sequential(
             nn.Conv2d(in_channels, c1, kernel_size=3, stride=2, padding=1, bias=False),
             nn.GroupNorm(1, c1),
-            nn.ReLU(inplace=True)
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(c1, c2, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(1, c2),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(c2, c3, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(1, c3),
+            nn.ReLU(inplace=True),
         )
-        
-        # Residual blocks
-        self.block1 = ResBlock(c1, c1, stride=1)   # 32x32, 32ch
-        self.block2 = ResBlock(c1, c2, stride=2)   # 32x32 → 16x16, 64ch
-        self.block3 = ResBlock(c2, c3, stride=2)   # 16x16 → 8x8, 128ch
-        
-        # Global average pooling
         self.pool = nn.AdaptiveAvgPool2d(1)
-        
+
         self.out_features = c3
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
-        
-        Args:
-            x: Depth image tensor (B, 1, H, W)
-            
-        Returns:
-            Feature tensor (B, out_features)
-        """
-        x = self.stem(x)      # (B, 32, 32, 32)
-        x = self.block1(x)    # (B, 32, 32, 32)
-        x = self.block2(x)    # (B, 64, 16, 16)
-        x = self.block3(x)    # (B, 128, 8, 8)
-        x = self.pool(x)      # (B, 128, 1, 1)
-        x = x.flatten(1)      # (B, 128)
+        x = self.layers(x)
+        x = self.pool(x)
+        x = x.flatten(1)
         return x
 
 
@@ -216,7 +159,13 @@ class DepthResNetStudentBuilder(NetworkBuilder):
                 "DepthResNetStudentBuilder.build() called before load(). "
                 "Ensure RL-Games has loaded network params from agent config."
             )
-        return DepthResNetStudentBuilder.Network(self.params, **kwargs)
+        # Enable TF32 for matmuls outside AMP autocast.
+        torch.backends.cuda.matmul.allow_tf32 = True
+
+        net = DepthResNetStudentBuilder.Network(self.params, **kwargs)
+        if self.params.get("torch_compile", False):
+            net = torch.compile(net, mode="reduce-overhead", dynamic=True)
+        return net
     
     class Network(NetworkBuilder.BaseNetwork):
         """Student policy network with depth encoder."""
@@ -278,7 +227,7 @@ class DepthResNetStudentBuilder(NetworkBuilder):
             self.depth_aug = None  # Lazy init on first forward (needs device)
             
             # Build depth encoder
-            self.depth_encoder = SmallResNet(
+            self.depth_encoder = DepthCNN(
                 in_channels=1,
                 channels=self.depth_channels
             )
@@ -376,6 +325,18 @@ class DepthResNetStudentBuilder(NetworkBuilder):
                 from isaaclab_tasks.manager_based.manipulation.y2r.distillation.depth_augs import DepthAug
                 self.depth_aug = DepthAug(device, self.depth_aug_config)
                 print(f"[DepthResNetStudent] DepthAug initialized on {device}")
+
+        @_compile_disable
+        def _apply_depth_aug_eager(self, depth_img: torch.Tensor) -> torch.Tensor:
+            """Run Warp depth augmentation outside torch.compile tracing."""
+            depth_3d = depth_img.squeeze(1)
+            depth_3d = self.depth_aug.augment(depth_3d)
+            return depth_3d.unsqueeze(1)
+
+        @_compile_disable
+        def _apply_obs_rms_eager(self, base_obs: torch.Tensor) -> torch.Tensor:
+            """Run obs RMS outside torch.compile tracing to avoid CUDAGraph overwrite issues."""
+            return self.running_mean_std(base_obs)
         
         def forward(self, obs_dict: Dict[str, torch.Tensor]):
             """Forward pass.
@@ -398,11 +359,16 @@ class DepthResNetStudentBuilder(NetworkBuilder):
             # Normalize base_obs only (depth is already normalized to [0,1]).
             # Running stats update is explicitly controlled via apply_obs_rms_update.
             if self.normalize_base_obs:
+                base_obs_dtype = base_obs.dtype
                 if self.apply_obs_rms_update:
                     self.running_mean_std.train()
                 else:
                     self.running_mean_std.eval()
-                base_obs = self.running_mean_std(base_obs)
+                if base_obs.dtype != torch.float32:
+                    base_obs = base_obs.float()
+                base_obs = self._apply_obs_rms_eager(base_obs)
+                if base_obs.dtype != base_obs_dtype:
+                    base_obs = base_obs.to(base_obs_dtype)
             
             # Reshape depth to image: (B, H*W) → (B, 1, H, W)
             depth_img = depth_flat.view(B, 1, self.depth_height, self.depth_width)
@@ -411,10 +377,7 @@ class DepthResNetStudentBuilder(NetworkBuilder):
             if self.apply_depth_aug and self.use_depth_aug:
                 self._init_depth_aug(str(depth_img.device))
                 if self.depth_aug is not None:
-                    # DepthAug expects (B, H, W), returns (B, H, W)
-                    depth_3d = depth_img.squeeze(1)  # (B, H, W)
-                    depth_3d = self.depth_aug.augment(depth_3d)
-                    depth_img = depth_3d.unsqueeze(1)  # (B, 1, H, W)
+                    depth_img = self._apply_depth_aug_eager(depth_img)
             
             # Store post-augmentation depth for video recording
             self.last_depth_img = depth_img.detach()

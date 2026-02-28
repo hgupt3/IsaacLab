@@ -52,7 +52,16 @@ from rl_games.algos_torch.network_builder import NetworkBuilder
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
 
 from .point_transformer import SelfAttentionBlock, CrossAttentionBlock, FeedForwardBlock
-from .depth_resnet_student import SmallResNet
+from .depth_resnet_student import DepthCNN
+
+try:
+    _compile_disable = torch.compiler.disable
+except Exception:
+    try:
+        _compile_disable = torch._dynamo.disable
+    except Exception:
+        def _compile_disable(fn):
+            return fn
 
 
 class DepthPointTransformerStudentBuilder(NetworkBuilder):
@@ -174,11 +183,11 @@ class DepthPointTransformerStudentBuilder(NetworkBuilder):
                 self.running_mean_std = RunningMeanStd(non_depth_dim)
 
             # =====================================================================
-            # Depth encoder (SmallResNet)
+            # Depth encoder (3-layer CNN)
             # =====================================================================
             depth_cfg = params.get('depth_encoder', {})
             self.depth_channels = depth_cfg.get('channels', [32, 64, 128])
-            self.depth_encoder = SmallResNet(in_channels=1, channels=self.depth_channels)
+            self.depth_encoder = DepthCNN(in_channels=1, channels=self.depth_channels)
             self.depth_features_dim = self.depth_encoder.out_features
 
             # Depth augmentation (GPU-accelerated, explicitly controlled)
@@ -331,6 +340,18 @@ class DepthPointTransformerStudentBuilder(NetworkBuilder):
                 self.depth_aug = DepthAug(device, self.depth_aug_config)
                 print(f"[DepthPointTransformerStudent] DepthAug initialized on {device}")
 
+        @_compile_disable
+        def _apply_depth_aug_eager(self, depth_img: torch.Tensor) -> torch.Tensor:
+            """Run Warp depth augmentation outside torch.compile tracing."""
+            depth_3d = depth_img.squeeze(1)
+            depth_3d = self.depth_aug.augment(depth_3d)
+            return depth_3d.unsqueeze(1)
+
+        @_compile_disable
+        def _apply_obs_rms_eager(self, non_depth: torch.Tensor) -> torch.Tensor:
+            """Run obs RMS outside torch.compile tracing to avoid CUDAGraph overwrite issues."""
+            return self.running_mean_std(non_depth)
+
         def forward(self, obs_dict: Dict[str, Any]):
             """Forward pass through hybrid depth + point transformer network.
 
@@ -353,11 +374,16 @@ class DepthPointTransformerStudentBuilder(NetworkBuilder):
             # Normalize non-depth (proprio + point clouds), matching teacher behavior.
             # Running stats update is explicitly controlled via apply_obs_rms_update.
             if self.normalize_non_depth:
+                non_depth_dtype = non_depth.dtype
                 if self.apply_obs_rms_update:
                     self.running_mean_std.train()
                 else:
                     self.running_mean_std.eval()
-                non_depth = self.running_mean_std(non_depth)
+                if non_depth.dtype != torch.float32:
+                    non_depth = non_depth.float()
+                non_depth = self._apply_obs_rms_eager(non_depth)
+                if non_depth.dtype != non_depth_dtype:
+                    non_depth = non_depth.to(non_depth_dtype)
 
             proprio = non_depth[:, :self.proprio_dim]
             pc_flat = non_depth[:, self.proprio_dim:]
@@ -374,9 +400,7 @@ class DepthPointTransformerStudentBuilder(NetworkBuilder):
             if self.apply_depth_aug and self.use_depth_aug:
                 self._init_depth_aug(str(depth_img.device))
                 if self.depth_aug is not None:
-                    depth_3d = depth_img.squeeze(1)
-                    depth_3d = self.depth_aug.augment(depth_3d)
-                    depth_img = depth_3d.unsqueeze(1)
+                    depth_img = self._apply_depth_aug_eager(depth_img)
 
             self.last_depth_img = depth_img.detach()
             depth_features = self.depth_encoder(depth_img)  # (B, depth_features_dim)

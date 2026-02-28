@@ -53,11 +53,12 @@ params:
     # would incorrectly normalize depth. We therefore disable RL-Games normalize_input
     # and do base_obs-only normalization inside the model instead.
     normalize_base_obs: True
+    torch_compile: True              # Compile student network for lower Python overhead
     
-    # Depth encoder: SmallResNet for wrist_camera depth image.
+    # Depth encoder: 3-layer CNN for wrist_camera depth image.
     # Height/width are taken from active Y2R config (robot + mode layers).
     depth_encoder:
-      channels: [64, 128, 256]
+      channels: [32, 64, 128]
     
     # Depth augmentation (GPU-accelerated via NVIDIA Warp)
     # Applied INSIDE the model when explicit apply_depth_aug=True (set by train/distill/play code).
@@ -167,6 +168,8 @@ params:
     
     # DaGGer
     beta: 0.5                     # Fraction of envs using teacher (0.5 = 50%)
+    distill_value: False          # Distill teacher's value function (warm critic for RL fine-tuning)
+    distill_value_coef: 1.0       # Coefficient for value distillation loss
 
     # Hybrid (PHP) schedule
     dagger_loss_coef: 10.0        # Paper knob: coefficient for imitation term in hybrid PPO+BC loss

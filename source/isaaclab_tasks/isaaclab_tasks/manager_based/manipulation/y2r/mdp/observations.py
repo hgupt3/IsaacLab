@@ -688,19 +688,12 @@ class visible_object_point_cloud_b(ManagerTermBase):
         """Flag that sensors need a render + buffer refresh before next resample."""
         self._pending_reset = True
 
-    _discover_printed = False
-
     def _discover_object_instance_ids(self):
         """Discover instance IDs belonging to the object from camera metadata.
 
         Rebuilds every resample — the idToLabels dict is tiny so cost is negligible.
         """
         label_map = self.camera.data.info["instance_id_segmentation_fast"]["idToLabels"]
-        if not visible_object_point_cloud_b._discover_printed:
-            print(f"[visibility] idToLabels ({len(label_map)} entries):")
-            for uid, meta in label_map.items():
-                print(f"  {uid}: {meta}")
-            visible_object_point_cloud_b._discover_printed = True
         object_ids = set()
         for uid, meta in label_map.items():
             prim_path = meta

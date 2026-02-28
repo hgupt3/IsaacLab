@@ -103,7 +103,7 @@ class DistillAgent(A2CAgent):
             raise ValueError(f"Unsupported distillation.mode='{self.distill_mode}'. Expected 'dagger' or 'hybrid'.")
 
         # Training hyperparams
-        self.distill_lr = self.distill_config["learning_rate"]
+        self.distill_lr = float(self.distill_config["learning_rate"])
         self.distill_grad_norm = self.distill_config["grad_norm"]
         self.max_distill_iters = self.distill_config["max_iterations"]
         # Override save_freq from parent with distillation-specific value
@@ -113,6 +113,8 @@ class DistillAgent(A2CAgent):
 
         # DaGGer
         self.beta = self.distill_config["beta"]
+        self.distill_value = self.distill_config["distill_value"]
+        self.distill_value_coef = float(self.distill_config["distill_value_coef"])
 
         # Hybrid (PHP) settings
         self.lambda_d_initial = None
@@ -159,6 +161,15 @@ class DistillAgent(A2CAgent):
         self.teacher_model = self._build_and_load_teacher(teacher_cfg, teacher_ckpt_path)
         self.teacher_model.to(self.ppo_device)
         self.teacher_model.eval()
+
+        # Copy teacher's value_mean_std to student so the student critic trains
+        # in the teacher's normalized value space.  When RL fine-tuning starts,
+        # denorm(student_raw) produces correct real-scale values from step 1.
+        if self.distill_value and self.normalize_value:
+            teacher_vmstd = self.teacher_model.value_mean_std
+            student_vmstd = self.model.value_mean_std
+            student_vmstd.load_state_dict(teacher_vmstd.state_dict())
+            print("[INFO] Copied teacher value_mean_std to student for value distillation.")
         
         # Fixed environment assignment for DaGGer.
         # First beta fraction of envs always use teacher, rest always use student.
@@ -239,6 +250,7 @@ class DistillAgent(A2CAgent):
         print(f"  Save best after: {self.save_best_after}")
         print(f"  Mixed precision: {self.mixed_precision}")
         print(f"  Normalize input (RL-Games): {self.normalize_input}")
+        print(f"  Distill value: {self.distill_value}" + (f" (coef={self.distill_value_coef})" if self.distill_value else ""))
         print("  Depth augmentation: handled inside student model (depth_resnet_student)")
         if self.debug_depth_video:
             print(f"  Depth video recording: ENABLED (fps={self.debug_depth_video_fps}, num_frames={self.debug_depth_video_num_frames})")
@@ -285,7 +297,11 @@ class DistillAgent(A2CAgent):
         # Load weights
         print(f"Loading teacher weights from: {ckpt_path}")
         checkpoint = torch_ext.load_checkpoint(ckpt_path)
-        teacher_model.load_state_dict(checkpoint['model'])
+        checkpoint_model_state = checkpoint["model"]
+        if any("._orig_mod." in key for key in checkpoint_model_state.keys()):
+            print("[INFO] Teacher checkpoint contains torch.compile '_orig_mod' keys; remapping for load.")
+        adjusted_teacher_state = adjust_state_dict_keys(checkpoint_model_state, teacher_model.state_dict())
+        teacher_model.load_state_dict(adjusted_teacher_state)
         
         # Load RunningMeanStd for teacher if present (DEXTRAH / RL-Games behavior).
         # RL-Games restore semantics:
@@ -360,10 +376,12 @@ class DistillAgent(A2CAgent):
             teacher_obs = self._preproc_obs(self.obs['states'])
             
             # ===== Get teacher actions (no grad) =====
-            # Teacher was trained with AMP, so run inside autocast context
+            # Use is_train=True so 'values' returns raw (pre-denorm) values,
+            # matching the student's raw space for value distillation.
+            # Teacher model is in eval() mode so running_mean_std won't update.
             with torch.no_grad(), torch.amp.autocast('cuda', enabled=self.mixed_precision):
                 teacher_batch = {
-                    'is_train': False,
+                    'is_train': True,
                     'obs': teacher_obs,
                     'prev_actions': self.prev_actions_teacher,
                 }
@@ -371,19 +389,16 @@ class DistillAgent(A2CAgent):
                     teacher_batch['rnn_states'] = self.teacher_rnn_states
                     teacher_batch['seq_length'] = 1
                     teacher_batch['rnn_masks'] = None
-                
+
                 teacher_res = self.teacher_model(teacher_batch)
                 teacher_mus = teacher_res['mus']
                 teacher_sigmas = teacher_res['sigmas']
                 if self.is_teacher_rnn:
                     self.teacher_rnn_states = teacher_res['rnn_states']
-                
-                # Match RL-Games training semantics: use the model-sampled actions (no manual clamp).
-                # RL-Games controls any clamping/rescaling via config.clip_actions in preprocess_actions().
-                teacher_actions = teacher_res.get('actions', None)
-                if teacher_actions is None:
-                    teacher_distr = torch.distributions.Normal(teacher_mus, teacher_sigmas)
-                    teacher_actions = teacher_distr.sample()
+
+                # is_train=True doesn't return 'actions', so sample from distribution
+                teacher_distr = torch.distributions.Normal(teacher_mus, teacher_sigmas)
+                teacher_actions = teacher_distr.sample()
             
             # ===== Get student actions (with grad) + Compute loss with AMP =====
             with torch.amp.autocast('cuda', enabled=self.mixed_precision):
@@ -411,8 +426,20 @@ class DistillAgent(A2CAgent):
                 
                 mu_loss = weighted_l2_loss(student_mus, teacher_mus.detach(), weights).mean()
                 sigma_loss = l2_loss(student_sigmas, teacher_sigmas.detach()).mean()
-                
+
                 total_loss = mu_loss + sigma_loss
+
+                # Optionally distill teacher's value function.
+                # Both teacher and student are called with is_train=True, so both
+                # return raw (pre-denorm) values.  Student's value_mean_std was
+                # initialized from teacher's, so they share the same normalized space.
+                # This means RL fine-tuning can start with correct denorm from step 1.
+                value_loss = torch.zeros(1, device=self.ppo_device)
+                if self.distill_value:
+                    teacher_values = teacher_res['values'].detach()
+                    student_values = student_res['values']
+                    value_loss = l2_loss(student_values, teacher_values).mean()
+                    total_loss = total_loss + self.distill_value_coef * value_loss
             
             # Sample student actions (outside autocast for stability)
             with torch.no_grad():
@@ -663,6 +690,8 @@ class DistillAgent(A2CAgent):
                 self.writer.add_scalar('losses/mu_loss', mu_loss.item(), frame)
                 self.writer.add_scalar('losses/sigma_loss', sigma_loss.item(), frame)
                 self.writer.add_scalar('losses/total_loss', total_loss.item(), frame)
+                if self.distill_value:
+                    self.writer.add_scalar('losses/value_loss', value_loss.item(), frame)
                 
                 # Info metrics (matching RL-Games)
                 self.writer.add_scalar('info/last_lr', self.last_lr, frame)
@@ -842,6 +871,9 @@ class DistillAgent(A2CAgent):
         depth_dim = int(a2c_network.depth_dim)
         batch_size = raw_obs.shape[0]
         aug_depth_flat = aug_depth.reshape(batch_size, -1).detach()
+        if aug_depth_flat.dtype != raw_obs.dtype:
+            # Keep rollout buffer dtype stable (fp16 under mixed_precision).
+            aug_depth_flat = aug_depth_flat.to(raw_obs.dtype)
         if aug_depth_flat.shape[1] != depth_dim:
             raise RuntimeError(
                 f"Augmented depth shape mismatch: expected {depth_dim}, got {aug_depth_flat.shape[1]}."
@@ -950,15 +982,17 @@ class DistillAgent(A2CAgent):
                     teacher_batch["rnn_masks"] = None
 
                 teacher_res = self.teacher_model(teacher_batch)
-                teacher_mus = teacher_res["mus"].detach()
+                # CUDAGraph-backed/compiled models may reuse output buffers across invocations.
+                # Clone any tensor we persist beyond this forward pass.
+                teacher_mus = teacher_res["mus"].detach().clone()
                 teacher_mus_steps.append(teacher_mus)
 
                 if self.is_teacher_rnn:
-                    self.teacher_rnn_states = teacher_res["rnn_states"]
+                    self.teacher_rnn_states = [s.detach().clone() for s in teacher_res["rnn_states"]]
                 if "actions" in teacher_res:
-                    self.prev_actions_teacher = teacher_res["actions"].detach()
+                    self.prev_actions_teacher = teacher_res["actions"].detach().clone()
                 else:
-                    self.prev_actions_teacher = teacher_mus
+                    self.prev_actions_teacher = teacher_mus.clone()
 
             step_time_start = time.perf_counter()
             isaac_env = self.vec_env.env.unwrapped

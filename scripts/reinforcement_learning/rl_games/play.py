@@ -193,6 +193,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent: BasePlayer = runner.create_player()
     agent.restore(resume_path)
     agent.reset()
+    # Upcast FP16 observations to FP32 before model preprocessing.
+    # Keeps inference numerics and student network assumptions consistent.
+    _orig_preproc = agent._preproc_obs
+    def _preproc_obs_f32(obs_batch):
+        obs_batch = _orig_preproc(obs_batch)
+        if isinstance(obs_batch, torch.Tensor) and obs_batch.dtype == torch.float16:
+            obs_batch = obs_batch.float()
+        elif isinstance(obs_batch, dict):
+            obs_batch = {k: v.float() if isinstance(v, torch.Tensor) and v.dtype == torch.float16 else v for k, v in obs_batch.items()}
+        return obs_batch
+    agent._preproc_obs = _preproc_obs_f32
+
     # Explicit runtime switches for inference: disable train-time stochasticity/stat updates.
     a2c_network = getattr(getattr(agent, "model", None), "a2c_network", None)
     if a2c_network is not None:

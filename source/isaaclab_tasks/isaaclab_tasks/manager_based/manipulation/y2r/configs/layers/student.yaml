@@ -9,4 +9,18 @@ mode:
   use_student_mode: true
 
 simulation:
-  num_envs: 4096
+  num_envs: 2048
+
+terminations:
+  trajectory_deviation:
+    position_threshold: [0.2, 0.12]      # Spatial error (meters)
+    rotation_threshold: [2.0, 1.2]       # Rotation error (radians)
+  
+  hand_pose_deviation:
+    position_threshold: [0.25, 0.16]         # Position threshold (meters)
+    rotation_threshold: [3.0, 2.0]        # Rotation threshold (radians)
+
+curriculum:
+  difficulty:
+    initial: 10                  # Starting difficulty
+    min: 10

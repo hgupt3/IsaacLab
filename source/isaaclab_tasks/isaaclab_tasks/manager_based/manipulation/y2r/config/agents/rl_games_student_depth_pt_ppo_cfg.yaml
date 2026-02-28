@@ -56,6 +56,7 @@ params:
     num_heads: 2                     # Attention heads
     self_attention: True             # Self-attention on point tokens
     flash_attention: True            # Use CUDA Flash Attention kernels
+    torch_compile: False             # Keep disabled in distillation by default
     ffn_ratio: 1.0                   # FFN expansion ratio (0 = disabled)
     ffn_dropout: 0.0
     attn_dropout: 0.0
@@ -69,10 +70,10 @@ params:
     proprio_encoder_norm: True
 
     # --- Depth Encoder ---
-    # SmallResNet for wrist_camera depth image.
+    # 3-layer CNN for wrist_camera depth image.
     # Height/width are taken from active Y2R config (robot + mode layers).
     depth_encoder:
-      channels: [64, 128, 256]
+      channels: [32, 64, 128]
     
     # Depth augmentation (GPU-accelerated via NVIDIA Warp)
     # Applied INSIDE the model when explicit apply_depth_aug=True (set by train/distill/play code).
@@ -135,7 +136,7 @@ params:
     learning_rate: 3e-4
     lr_schedule: adaptive
     schedule_type: legacy
-    kl_threshold: 0.016
+    kl_threshold: 0.012
     score_to_win: 100000000
     max_epochs: 750000
     save_best_after: 1000
@@ -146,7 +147,7 @@ params:
     truncate_grads: True
     e_clip: 0.2
     horizon_length: 32
-    minibatch_size: 4096
+    minibatch_size: 8192
     mini_epochs: 4
     critic_coef: 4
     freeze_critic: False
@@ -171,18 +172,20 @@ params:
   # Note: Depth augmentation is handled INSIDE the model (see network.depth_augmentation)
   # ==========================================================================
   distillation:
-    mode: hybrid
+    mode: dagger
 
     # DAgger training (mode: dagger only)
-    learning_rate: 3e-4           # Adam lr for DAgger optimizer
+    learning_rate: 1e-4           # Adam lr for DAgger optimizer
     grad_norm: 1.0                # Gradient clipping for DAgger
     max_iterations: 100000000     # Total training iterations
     save_frequency: 5000          # Checkpoint save interval (iterations, not frames)
     save_best_after: 10000        # Don't save "best" until this many epochs/iters (avoid early noise)
     beta: 0.5                     # Fraction of envs using teacher (0.5 = 50%)
+    distill_value: True           # Distill teacher's value function (warm critic for RL fine-tuning)
+    distill_value_coef: 1.0       # Coefficient for value distillation loss
 
     # Hybrid (PHP) schedule
-    dagger_loss_coef: 10.0        # Paper knob: coefficient for imitation term in hybrid PPO+BC loss
+    dagger_loss_coef: 1.0        # Paper knob: coefficient for imitation term in hybrid PPO+BC loss
     lambda_d_initial: 1.0
     lambda_d_min: 0.1
     lambda_d_anneal_epochs: 50000

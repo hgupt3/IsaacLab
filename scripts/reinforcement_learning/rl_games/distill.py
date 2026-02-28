@@ -94,6 +94,7 @@ import math
 import os
 import random
 import subprocess
+import torch
 from datetime import datetime
 from pathlib import Path
 
@@ -224,7 +225,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # ===== Load teacher config =====
     # Use registry to find teacher config (allows overriding via --teacher-agent)
     teacher_cfg = load_cfg_from_registry(args_cli.task, args_cli.teacher_agent)
-    
+
+    # Keep teacher compile in sync with student compile setting when explicitly disabled.
+    student_net_cfg = agent_cfg.get("params", {}).get("network", {})
+    teacher_net_cfg = teacher_cfg.get("params", {}).get("network", {})
+    if student_net_cfg.get("torch_compile", None) is False and teacher_net_cfg.get("torch_compile", False):
+        teacher_net_cfg["torch_compile"] = False
+        print("[INFO] Distill override: disabled teacher torch_compile because student torch_compile=False.")
+
     # ===== Inject distillation config into agent_cfg =====
     teacher_ckpt = retrieve_file_path(args_cli.teacher_checkpoint)
     
@@ -345,6 +353,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     _orig_create = runner.algo_factory.create
     def _create_with_runtime_flags(*args, **kwargs):
         agent = _orig_create(*args, **kwargs)
+        # Global preproc patch: upcast FP16 obs/states to FP32 before model preprocessing.
+        _orig_preproc = agent._preproc_obs
+        def _preproc_obs_f32(obs_batch):
+            obs_batch = _orig_preproc(obs_batch)
+            if isinstance(obs_batch, torch.Tensor) and obs_batch.dtype == torch.float16:
+                obs_batch = obs_batch.float()
+            elif isinstance(obs_batch, dict):
+                obs_batch = {
+                    k: v.float() if isinstance(v, torch.Tensor) and v.dtype == torch.float16 else v
+                    for k, v in obs_batch.items()
+                }
+            return obs_batch
+        agent._preproc_obs = _preproc_obs_f32
+
         a2c_network = getattr(getattr(agent, "model", None), "a2c_network", None)
         if a2c_network is not None:
             if hasattr(a2c_network, "apply_depth_aug"):
