@@ -516,9 +516,9 @@ visibility_camera:
   focal_length: 3.16                # 87° HFOV (D435i depth): 6.0 / (2×tan(43.5°))
   horizontal_aperture: 6.0
   clipping_range: [0.1, 2.0]
-  distance: [0.5, 0.5]            # meters
-  yaw: [180.0, 180.0]            # degrees (full circle)
-  pitch: [0.0, 0.0]            # degrees (elevation)
+  distance: [0.75, 0.75]            # meters
+  yaw: [135.0, 225.0]            # degrees (full circle)
+  pitch: [0.0, 20.0]            # degrees (elevation)
   look_at_offset: [0.0, 0.0, -0.05]  # (x, y, z) fixed offset from workspace center
 
 # ==============================================================================

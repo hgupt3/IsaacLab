@@ -19,7 +19,7 @@ Depth handling:
     The model:
     1. Slices depth from end of obs
     2. Applies RunningMeanStd normalization ONLY to base_obs (not depth)
-    3. Applies optional DepthAug during training
+    3. Applies optional DepthAug when explicitly enabled via apply_depth_aug
     4. Encodes depth via SmallResNet
     5. Concatenates normalized base_obs + depth_features
 
@@ -198,7 +198,7 @@ class DepthResNetStudentBuilder(NetworkBuilder):
     This builder creates a network that:
     1. Slices depth from END of obs tensor (last H*W floats)
     2. Normalizes ONLY base_obs with RunningMeanStd (depth is already [0,1])
-    3. Applies optional DepthAug during training
+    3. Applies optional DepthAug when explicitly enabled via apply_depth_aug
     4. Encodes depth through SmallResNet
     5. Concatenates features and feeds through MLP to produce actions
     """
@@ -268,8 +268,12 @@ class DepthResNetStudentBuilder(NetworkBuilder):
             self.depth_channels = depth_cfg.get('channels', [32, 64, 128])
             self.depth_dim = self.depth_height * self.depth_width
             
+            # Runtime control flags (explicitly toggled by train/distill/play scripts)
+            self.apply_obs_rms_update = bool(params.get("apply_obs_rms_update", False))
+
             # Depth augmentation config
             self.use_depth_aug = params.get('depth_augmentation', False)
+            self.apply_depth_aug = bool(params.get("apply_depth_aug", False))
             self.depth_aug_config = params.get('depth_aug_config', None)
             self.depth_aug = None  # Lazy init on first forward (needs device)
             
@@ -391,15 +395,20 @@ class DepthResNetStudentBuilder(NetworkBuilder):
             base_obs = full_obs[:, :-self.depth_dim]
             depth_flat = full_obs[:, -self.depth_dim:]
             
-            # Normalize base_obs only (depth is already normalized to [0,1])
+            # Normalize base_obs only (depth is already normalized to [0,1]).
+            # Running stats update is explicitly controlled via apply_obs_rms_update.
             if self.normalize_base_obs:
+                if self.apply_obs_rms_update:
+                    self.running_mean_std.train()
+                else:
+                    self.running_mean_std.eval()
                 base_obs = self.running_mean_std(base_obs)
             
             # Reshape depth to image: (B, H*W) → (B, 1, H, W)
             depth_img = depth_flat.view(B, 1, self.depth_height, self.depth_width)
             
-            # Apply depth augmentation during training only
-            if self.training and self.use_depth_aug:
+            # Apply depth augmentation when explicitly enabled.
+            if self.apply_depth_aug and self.use_depth_aug:
                 self._init_depth_aug(str(depth_img.device))
                 if self.depth_aug is not None:
                     # DepthAug expects (B, H, W), returns (B, H, W)

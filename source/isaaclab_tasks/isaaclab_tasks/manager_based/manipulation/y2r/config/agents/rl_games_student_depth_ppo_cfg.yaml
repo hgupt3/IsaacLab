@@ -60,7 +60,7 @@ params:
       channels: [64, 128, 256]
     
     # Depth augmentation (GPU-accelerated via NVIDIA Warp)
-    # Applied INSIDE the model during training only (self.training=True)
+    # Applied INSIDE the model when explicit apply_depth_aug=True (set by train/distill/play code).
     depth_augmentation: True
     depth_aug_config:
       correlated_noise:
@@ -120,7 +120,7 @@ params:
     learning_rate: 1e-3
     lr_schedule: adaptive
     schedule_type: legacy
-    kl_threshold: 0.01
+    kl_threshold: 0.016
     score_to_win: 100000000
     max_epochs: 750000
     save_best_after: 1000
@@ -134,6 +134,7 @@ params:
     minibatch_size: 4608
     mini_epochs: 5
     critic_coef: 4
+    freeze_critic: False
     clip_value: True
     clip_actions: False
     seq_len: 4
@@ -155,23 +156,24 @@ params:
   # Note: Depth augmentation is handled INSIDE the model (see network.depth_augmentation)
   # ==========================================================================
   distillation:
-    # Training
-    learning_rate: 1e-4           # Adam lr for distillation
-    grad_norm: 1.0                # Gradient clipping
+    mode: hybrid
+
+    # DAgger training (mode: dagger only)
+    learning_rate: 1e-4           # Adam lr for DAgger optimizer
+    grad_norm: 1.0                # Gradient clipping for DAgger
     max_iterations: 100000000     # Total training iterations
     save_frequency: 5000          # Checkpoint save interval (iterations, not frames)
     save_best_after: 10000        # Don't save "best" until this many epochs/iters (avoid early noise)
     
-    # Value distillation (train critic from teacher value)
-    value_distillation: True      # Enable value distillation (MSE loss on critic)
-    
     # DaGGer
     beta: 0.5                     # Fraction of envs using teacher (0.5 = 50%)
-    
-    # Infrastructure
-    mixed_precision: True         # Use AMP for faster training
-    normalize_input: True         # Normalize observations with RunningMeanStd
-    multi_gpu: False              # DDP (overridden by --distributed flag)
+
+    # Hybrid (PHP) schedule
+    dagger_loss_coef: 10.0        # Paper knob: coefficient for imitation term in hybrid PPO+BC loss
+    lambda_d_initial: 1.0
+    lambda_d_min: 0.1
+    lambda_d_anneal_epochs: 10000
+    adaptive_lr_gate_lambda_ppo: 0.1
 
     # Debug: save depth video for env 0
     # Output path: logs/.../nn/depth_video.mp4

@@ -309,6 +309,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 obs_batch = {k: v.float() if v.dtype == torch.float16 else v for k, v in obs_batch.items()}
             return obs_batch
         agent._preproc_obs = _preproc_obs_f32
+
+        # Explicit runtime switches for student depth networks:
+        # training scripts opt-in to depth augmentation and obs RMS updates.
+        a2c_network = getattr(getattr(agent, "model", None), "a2c_network", None)
+        if a2c_network is not None:
+            if hasattr(a2c_network, "apply_depth_aug"):
+                a2c_network.apply_depth_aug = True
+                print("[INFO] Enabled student depth augmentation for training.")
+            if hasattr(a2c_network, "apply_obs_rms_update"):
+                a2c_network.apply_obs_rms_update = True
+                print("[INFO] Enabled student obs RMS updates for training.")
         return agent
     runner.algo_factory.create = _create_with_patches
 

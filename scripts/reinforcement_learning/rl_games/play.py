@@ -193,6 +193,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent: BasePlayer = runner.create_player()
     agent.restore(resume_path)
     agent.reset()
+    # Explicit runtime switches for inference: disable train-time stochasticity/stat updates.
+    a2c_network = getattr(getattr(agent, "model", None), "a2c_network", None)
+    if a2c_network is not None:
+        if hasattr(a2c_network, "apply_depth_aug"):
+            a2c_network.apply_depth_aug = False
+            print("[INFO] Disabled student depth augmentation for play.")
+        if hasattr(a2c_network, "apply_obs_rms_update"):
+            a2c_network.apply_obs_rms_update = False
+            print("[INFO] Disabled student obs RMS updates for play.")
+        rms = getattr(a2c_network, "running_mean_std", None)
+        if rms is not None:
+            rms.eval()
 
     dt = env.unwrapped.step_dt
 

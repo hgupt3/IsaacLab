@@ -58,10 +58,18 @@ parser.add_argument(
     help="if toggled, this experiment will be tracked with Weights and Biases",
 )
 # Distillation-specific arguments
-parser.add_argument("--beta", type=float, default=0.5, help="Fraction of envs using teacher actions (0-1).")
-parser.add_argument("--learning-rate", type=float, default=1e-4, help="Learning rate for distillation.")
-parser.add_argument("--grad-norm", type=float, default=1.0, help="Gradient clipping norm.")
-parser.add_argument("--save-frequency", type=int, default=5000, help="Checkpoint save frequency (iterations).")
+parser.add_argument(
+    "--beta", type=float, default=None, help="Fraction of envs using teacher actions (0-1). Overrides YAML when set."
+)
+parser.add_argument(
+    "--learning-rate", type=float, default=None, help="Learning rate for distillation. Overrides YAML when set."
+)
+parser.add_argument(
+    "--grad-norm", type=float, default=None, help="Gradient clipping norm. Overrides YAML when set."
+)
+parser.add_argument(
+    "--save-frequency", type=int, default=None, help="Checkpoint save frequency (iterations). Overrides YAML when set."
+)
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -154,12 +162,20 @@ def log_y2r_config_files():
     # Get list of files that will actually be loaded (single source of truth)
     config_files = get_config_file_paths()
 
-    # Base path for relative paths in wandb
-    isaaclab_tasks_root = Path(__file__).parent.parent.parent / "isaaclab_tasks"
+    # Base path for relative paths in wandb.
+    # distill.py lives in IsaacLab/scripts/reinforcement_learning/rl_games/, so
+    # IsaacLab root is parents[3], and task sources live under source/isaaclab_tasks.
+    isaaclab_root = Path(__file__).resolve().parents[3]
+    isaaclab_tasks_root = (isaaclab_root / "source" / "isaaclab_tasks").resolve()
 
     # Upload all config files that are part of this run
     for yaml_path in config_files:
-        wandb.save(str(yaml_path), base_path=str(isaaclab_tasks_root), policy="now")
+        yaml_path = Path(yaml_path).resolve()
+        if str(yaml_path).startswith(str(isaaclab_tasks_root)):
+            wandb.save(str(yaml_path), base_path=str(isaaclab_tasks_root), policy="now")
+        else:
+            # Fallback: save without base_path instead of hard-failing tracked runs.
+            wandb.save(str(yaml_path), policy="now")
 
 
 def register_distill_agent_with_runner(runner: Runner):
@@ -212,20 +228,39 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # ===== Inject distillation config into agent_cfg =====
     teacher_ckpt = retrieve_file_path(args_cli.teacher_checkpoint)
     
-    # Start with YAML distillation config (if exists), then override with CLI args
-    yaml_distill_cfg = agent_cfg["params"].get("distillation", {})
+    # Start with YAML distillation config, then override with CLI args
+    yaml_distill_cfg = agent_cfg["params"]["distillation"]
+    distill_mode = yaml_distill_cfg["mode"]
+    effective_beta = args_cli.beta if args_cli.beta is not None else yaml_distill_cfg["beta"]
+    if distill_mode == "hybrid" and args_cli.beta is not None:
+        print("[WARNING] --beta is ignored in hybrid mode (only used in dagger).")
+        effective_beta = yaml_distill_cfg["beta"]
     
-    # Merge: YAML values as base, CLI args override
+    # Merge: YAML values as base, only explicitly provided CLI args override
     agent_cfg["params"]["distillation"] = {
         **yaml_distill_cfg,  # YAML values first (save_best_after, depth_aug, etc.)
         "teacher_cfg": teacher_cfg,  # Full teacher config dict
         "teacher_ckpt": teacher_ckpt,
-        "beta": args_cli.beta,
-        "learning_rate": args_cli.learning_rate,
-        "grad_norm": args_cli.grad_norm,
-        "max_iterations": args_cli.max_iterations if args_cli.max_iterations else yaml_distill_cfg.get("max_iterations", 1_000_000),
-        "save_frequency": args_cli.save_frequency if args_cli.save_frequency != 5000 else yaml_distill_cfg.get("save_frequency", 5000),
+        "beta": effective_beta,
+        "learning_rate": args_cli.learning_rate if args_cli.learning_rate is not None else yaml_distill_cfg["learning_rate"],
+        "grad_norm": args_cli.grad_norm if args_cli.grad_norm is not None else yaml_distill_cfg["grad_norm"],
+        "max_iterations": args_cli.max_iterations if args_cli.max_iterations is not None else yaml_distill_cfg["max_iterations"],
+        "save_frequency": args_cli.save_frequency if args_cli.save_frequency is not None else yaml_distill_cfg["save_frequency"],
     }
+    distill_mode = agent_cfg["params"]["distillation"]["mode"]
+    if distill_mode == "hybrid":
+        # In hybrid mode, optimizer/scheduler come from params.config (PPO path).
+        if args_cli.learning_rate is not None:
+            agent_cfg["params"]["config"]["learning_rate"] = args_cli.learning_rate
+            print(f"[INFO] Hybrid mode: overriding PPO learning_rate with --learning-rate={args_cli.learning_rate}.")
+        if args_cli.grad_norm is not None:
+            agent_cfg["params"]["config"]["grad_norm"] = args_cli.grad_norm
+            print(f"[INFO] Hybrid mode: overriding PPO grad_norm with --grad-norm={args_cli.grad_norm}.")
+    if distill_mode == "hybrid" and args_cli.max_iterations is not None:
+        print(
+            f"[WARNING] --max_iterations ignored in hybrid mode. "
+            f"Stopping is controlled by config.max_epochs ({agent_cfg['params']['config']['max_epochs']})."
+        )
     
     # Override the algo name to use our distillation agent
     agent_cfg["params"]["algo"]["name"] = "distill_a2c_continuous"
@@ -256,7 +291,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     
     print(f"[INFO] Experiment directory: {os.path.join(log_root_path, log_dir)}")
     print(f"[INFO] Teacher checkpoint: {teacher_ckpt}")
-    print(f"[INFO] Beta (teacher env ratio): {args_cli.beta}")
+    print(f"[INFO] Beta (teacher env ratio): {agent_cfg['params']['distillation']['beta']}")
     
     # ===== Read agent configurations =====
     rl_device = agent_cfg["params"]["config"]["device"]
@@ -305,6 +340,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     register_distill_agent_with_runner(runner)
     
     runner.load(agent_cfg)
+
+    # Explicit runtime defaults: distillation code toggles these per phase.
+    _orig_create = runner.algo_factory.create
+    def _create_with_runtime_flags(*args, **kwargs):
+        agent = _orig_create(*args, **kwargs)
+        a2c_network = getattr(getattr(agent, "model", None), "a2c_network", None)
+        if a2c_network is not None:
+            if hasattr(a2c_network, "apply_depth_aug"):
+                a2c_network.apply_depth_aug = False
+            if hasattr(a2c_network, "apply_obs_rms_update"):
+                a2c_network.apply_obs_rms_update = False
+            rms = getattr(a2c_network, "running_mean_std", None)
+            if rms is not None:
+                rms.eval()
+        return agent
+    runner.algo_factory.create = _create_with_runtime_flags
+
     runner.reset()
     
     # ===== WandB tracking =====
@@ -320,9 +372,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             name=experiment_name,
             sync_tensorboard=True,
             config={
-                "beta": args_cli.beta,
-                "learning_rate": args_cli.learning_rate,
-                "grad_norm": args_cli.grad_norm,
+                "beta": agent_cfg["params"]["distillation"]["beta"],
+                "learning_rate": agent_cfg["params"]["distillation"]["learning_rate"],
+                "grad_norm": agent_cfg["params"]["distillation"]["grad_norm"],
                 "teacher_checkpoint": args_cli.teacher_checkpoint,
             }
         )
@@ -352,9 +404,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 "distillation": {
                     "teacher_checkpoint": args_cli.teacher_checkpoint,
                     "student_checkpoint": args_cli.checkpoint if args_cli.checkpoint else "fresh",
-                    "beta": args_cli.beta,
-                    "learning_rate": args_cli.learning_rate,
-                    "grad_norm": args_cli.grad_norm,
+                    "beta": agent_cfg["params"]["distillation"]["beta"],
+                    "learning_rate": agent_cfg["params"]["distillation"]["learning_rate"],
+                    "grad_norm": agent_cfg["params"]["distillation"]["grad_norm"],
                 },
                 "simulation": {
                     "physics_dt": env_cfg.sim.dt,

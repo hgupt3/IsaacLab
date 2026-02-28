@@ -164,9 +164,11 @@ class DepthPointTransformerStudentBuilder(NetworkBuilder):
             # Normalization: RunningMeanStd on non-depth obs (proprio + point clouds)
             # This matches teacher behavior (rl_games normalize_input: True normalizes
             # entire obs including PCs). Student can't use global normalize_input because
-            # depth is packed in obs.
+            # depth is packed in obs. Running-stats updates are explicitly gated by
+            # apply_obs_rms_update (toggled by train/distill/play scripts).
             # =====================================================================
             self.normalize_non_depth = params.get("normalize_base_obs", True)
+            self.apply_obs_rms_update = bool(params.get("apply_obs_rms_update", False))
             non_depth_dim = self.proprio_dim + self.point_cloud_dim
             if self.normalize_non_depth:
                 self.running_mean_std = RunningMeanStd(non_depth_dim)
@@ -179,8 +181,9 @@ class DepthPointTransformerStudentBuilder(NetworkBuilder):
             self.depth_encoder = SmallResNet(in_channels=1, channels=self.depth_channels)
             self.depth_features_dim = self.depth_encoder.out_features
 
-            # Depth augmentation (GPU-accelerated, training only)
+            # Depth augmentation (GPU-accelerated, explicitly controlled)
             self.use_depth_aug = params.get('depth_augmentation', False)
+            self.apply_depth_aug = bool(params.get("apply_depth_aug", False))
             self.depth_aug_config = params.get('depth_aug_config', None)
             self.depth_aug = None  # Lazy init on first forward
 
@@ -347,8 +350,13 @@ class DepthPointTransformerStudentBuilder(NetworkBuilder):
             depth_flat = full_obs[:, -self.depth_dim:]
             non_depth = full_obs[:, :-self.depth_dim]
 
-            # Normalize non-depth (proprio + point clouds), matching teacher behavior
+            # Normalize non-depth (proprio + point clouds), matching teacher behavior.
+            # Running stats update is explicitly controlled via apply_obs_rms_update.
             if self.normalize_non_depth:
+                if self.apply_obs_rms_update:
+                    self.running_mean_std.train()
+                else:
+                    self.running_mean_std.eval()
                 non_depth = self.running_mean_std(non_depth)
 
             proprio = non_depth[:, :self.proprio_dim]
@@ -362,8 +370,8 @@ class DepthPointTransformerStudentBuilder(NetworkBuilder):
             # =================================================================
             depth_img = depth_flat.view(B, 1, self.depth_height, self.depth_width)
 
-            # Apply depth augmentation during training only
-            if self.training and self.use_depth_aug:
+            # Apply depth augmentation when explicitly enabled.
+            if self.apply_depth_aug and self.use_depth_aug:
                 self._init_depth_aug(str(depth_img.device))
                 if self.depth_aug is not None:
                     depth_3d = depth_img.squeeze(1)
