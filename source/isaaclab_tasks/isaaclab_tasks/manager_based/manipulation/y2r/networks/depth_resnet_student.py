@@ -2,14 +2,14 @@
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""3-Layer CNN Depth Encoder for Student Policy Distillation and PPO Fine-tuning.
+"""Depth ResNet Encoder for Student Policy Distillation and PPO Fine-tuning.
 
 This module implements a student policy network that processes wrist camera
-depth images through a simple 3-layer CNN encoder and concatenates features
+depth images through a small ResNet encoder and concatenates features
 with proprioceptive and point cloud observations.
 
 Architecture:
-    - Depth encoder: 3x Conv2d(k=3,s=2) + GroupNorm + ReLU → GAP
+    - Depth encoder: Conv stem (s=2) → N ResBlocks (each s=2) → GAP
     - Feature fusion: depth_features (C) + base_obs (proprio + student_perception + student_targets)
       where C is the last entry of depth_encoder.channels
     - Policy MLP: [512, 256, 128] → actions
@@ -20,7 +20,7 @@ Depth handling:
     1. Slices depth from end of obs
     2. Applies RunningMeanStd normalization ONLY to base_obs (not depth)
     3. Applies optional DepthAug when explicitly enabled via apply_depth_aug
-    4. Encodes depth via DepthCNN
+    4. Encodes depth via DepthResNet
     5. Concatenates normalized base_obs + depth_features
 
 Usage in YAML config:
@@ -77,58 +77,87 @@ def _get_wrist_camera_shape_from_y2r_config() -> tuple[int, int] | None:
 
 
 # =============================================================================
-# 3-Layer CNN Depth Encoder
+# ResBlock + DepthResNet
 # =============================================================================
 
-class DepthCNN(nn.Module):
-    """Simple 3-layer CNN encoder for depth images.
+class ResBlock(nn.Module):
+    """Residual block with stride-2 downsampling and channel projection.
 
-    Each layer: Conv2d(k=3, s=2, p=1) → GroupNorm → ReLU, followed by GAP.
+    Structure:
+        x → Conv3x3(s=2) → GN → ReLU → Conv3x3(s=1) → GN → (+) → ReLU
+            └──────────── Conv1x1(s=2) + GN (skip) ──────────┘
+    """
 
-    Example for 64x64 input with channels=[32, 64, 128]:
-        Input:  (B, 1, 64, 64)
-        Conv1:  (B, 32, 32, 32)
-        Conv2:  (B, 64, 16, 16)
-        Conv3:  (B, 128, 8, 8)
-        GAP:    (B, 128, 1, 1)
-        Output: (B, 128)
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, stride=2, padding=1, bias=False)
+        self.gn1 = nn.GroupNorm(1, out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, stride=1, padding=1, bias=False)
+        self.gn2 = nn.GroupNorm(1, out_channels)
+        self.skip = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 1, stride=2, bias=False),
+            nn.GroupNorm(1, out_channels),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = self.skip(x)
+        out = F.relu(self.gn1(self.conv1(x)))
+        out = self.gn2(self.conv2(out))
+        return F.relu(out + identity)
+
+
+class DepthResNet(nn.Module):
+    """Small ResNet encoder for depth images.
+
+    Conv stem (1→c0, s=2) → len(channels) ResBlocks (each s=2) → GAP.
+    First block keeps stem channels, subsequent blocks follow channels list.
+
+    Example for 64x40 input with channels=[32, 64, 128]:
+        Input:  (B, 1, 64, 40)
+        Stem:   (B, 32, 32, 20)   — conv 1→32, s=2
+        Res1:   (B, 32, 16, 10)   — 32→32, s=2
+        Res2:   (B, 64, 8, 5)     — 32→64, s=2
+        Res3:   (B, 128, 4, 3)    — 64→128, s=2
+        GAP:    (B, 128)
 
     Args:
         in_channels: Number of input channels (1 for depth)
-        channels: List of channel sizes [32, 64, 128]
+        channels: List of channel sizes — one ResBlock per entry
     """
 
     def __init__(self, in_channels: int = 1, channels: list = None):
         super().__init__()
-
         if channels is None:
             channels = [32, 64, 128]
+        assert len(channels) >= 1, f"Need at least 1 channel value, got {len(channels)}"
 
-        assert len(channels) == 3, f"Expected 3 channel values, got {len(channels)}"
-        c1, c2, c3 = channels
-
-        self.layers = nn.Sequential(
-            nn.Conv2d(in_channels, c1, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.GroupNorm(1, c1),
-            nn.ReLU(inplace=True),
-
-            nn.Conv2d(c1, c2, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.GroupNorm(1, c2),
-            nn.ReLU(inplace=True),
-
-            nn.Conv2d(c2, c3, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.GroupNorm(1, c3),
+        # Stem: Conv s=2 → GN → ReLU  (1 → channels[0])
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, channels[0], 3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(1, channels[0]),
             nn.ReLU(inplace=True),
         )
-        self.pool = nn.AdaptiveAvgPool2d(1)
 
-        self.out_features = c3
+        # One ResBlock per channel entry: c0→c0, c0→c1, c1→c2, ...
+        blocks = []
+        in_ch = channels[0]
+        for out_ch in channels:
+            blocks.append(ResBlock(in_ch, out_ch))
+            in_ch = out_ch
+        self.blocks = nn.Sequential(*blocks)
+
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.out_features = channels[-1]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.layers(x)
+        x = self.stem(x)
+        x = self.blocks(x)
         x = self.pool(x)
-        x = x.flatten(1)
-        return x
+        return x.flatten(1)
+
+
+# Keep old name as alias for backwards compatibility with checkpoints
+DepthCNN = DepthResNet
 
 
 # =============================================================================
@@ -227,7 +256,7 @@ class DepthResNetStudentBuilder(NetworkBuilder):
             self.depth_aug = None  # Lazy init on first forward (needs device)
             
             # Build depth encoder
-            self.depth_encoder = DepthCNN(
+            self.depth_encoder = DepthResNet(
                 in_channels=1,
                 channels=self.depth_channels
             )

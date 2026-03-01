@@ -52,25 +52,25 @@ params:
     normalize_base_obs: True
 
     # --- Point Transformer ---
-    hidden_dim: 64                   # Token embedding dimension
-    num_heads: 2                     # Attention heads
+    hidden_dim: 128                   # Token embedding dimension
+    num_heads: 4                     # Attention heads
     self_attention: True             # Self-attention on point tokens
     flash_attention: True            # Use CUDA Flash Attention kernels
     torch_compile: False             # Keep disabled in distillation by default
-    ffn_ratio: 1.0                   # FFN expansion ratio (0 = disabled)
+    ffn_ratio: 2.0                   # FFN expansion ratio (0 = disabled)
     ffn_dropout: 0.0
     attn_dropout: 0.0
 
     # Point encoder: per-point MLP (num_timesteps*3 → hidden_dim)
-    point_encoder_layers: [64, 64]
+    point_encoder_layers: [128, 128]
     point_encoder_norm: True         # LayerNorm after encoder
 
     # Proprio encoder: MLP (proprio_dim → hidden_dim)
-    proprio_encoder_layers: [64, 64]
+    proprio_encoder_layers: [128, 128]
     proprio_encoder_norm: True
 
     # --- Depth Encoder ---
-    # 3-layer CNN for wrist_camera depth image.
+    # ResNet: stem (1→c0, s=2) + N ResBlocks (each s=2) → GAP.
     # Height/width are taken from active Y2R config (robot + mode layers).
     depth_encoder:
       channels: [32, 64, 128]
@@ -102,7 +102,7 @@ params:
         fixed_sigma: 'fixed'
     
     mlp:
-      units: [512, 256, 128]
+      units: [1024, 512, 256, 128]
       activation: elu
       d2rl: False
       initializer:

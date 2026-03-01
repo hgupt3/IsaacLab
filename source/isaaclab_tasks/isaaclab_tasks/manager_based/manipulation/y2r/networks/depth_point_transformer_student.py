@@ -52,7 +52,7 @@ from rl_games.algos_torch.network_builder import NetworkBuilder
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
 
 from .point_transformer import SelfAttentionBlock, CrossAttentionBlock, FeedForwardBlock
-from .depth_resnet_student import DepthCNN
+from .depth_resnet_student import DepthResNet
 
 try:
     _compile_disable = torch.compiler.disable
@@ -183,11 +183,11 @@ class DepthPointTransformerStudentBuilder(NetworkBuilder):
                 self.running_mean_std = RunningMeanStd(non_depth_dim)
 
             # =====================================================================
-            # Depth encoder (3-layer CNN)
+            # Depth encoder (ResNet)
             # =====================================================================
             depth_cfg = params.get('depth_encoder', {})
             self.depth_channels = depth_cfg.get('channels', [32, 64, 128])
-            self.depth_encoder = DepthCNN(in_channels=1, channels=self.depth_channels)
+            self.depth_encoder = DepthResNet(in_channels=1, channels=self.depth_channels)
             self.depth_features_dim = self.depth_encoder.out_features
 
             # Depth augmentation (GPU-accelerated, explicitly controlled)

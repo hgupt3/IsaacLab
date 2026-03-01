@@ -55,7 +55,7 @@ params:
     normalize_base_obs: True
     torch_compile: True              # Compile student network for lower Python overhead
     
-    # Depth encoder: 3-layer CNN for wrist_camera depth image.
+    # Depth encoder: ResNet — stem (1→c0, s=2) + N ResBlocks (each s=2) → GAP.
     # Height/width are taken from active Y2R config (robot + mode layers).
     depth_encoder:
       channels: [32, 64, 128]

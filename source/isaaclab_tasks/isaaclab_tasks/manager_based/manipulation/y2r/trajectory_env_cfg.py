@@ -148,22 +148,23 @@ def _build_object_cfg(cfg: Y2RConfig) -> RigidObjectCfg:
         # All primitives
         all_assets = primitive_assets
     else:
-        # Mix: repeat assets to approximate the desired ratio
-        # Target: procedural_count / total_count ≈ pct
+        # Mix: repeat the SMALLER side to approximate the desired ratio.
+        # Target: (n_proc * r_proc) / (n_prim * r_prim + n_proc * r_proc) = pct
         n_prim = len(primitive_assets)
         n_proc = len(procedural_assets)
-        
-        # Find repeat counts to achieve ratio
-        # We want: (n_proc * r_proc) / (n_prim * r_prim + n_proc * r_proc) = pct
-        # Simplify by setting r_prim = 1 and solving for r_proc:
-        # r_proc = pct * n_prim / ((1 - pct) * n_proc)
-        if pct < 1.0:
-            r_proc = pct * n_prim / ((1 - pct) * n_proc)
-            r_proc = max(1, round(r_proc))  # At least 1 repeat
+
+        # Compute ideal repeat for each side (holding the other at 1)
+        # r_proc needed (with r_prim=1): pct * n_prim / ((1-pct) * n_proc)
+        # r_prim needed (with r_proc=1): (1-pct) * n_proc / (pct * n_prim)
+        r_proc_ideal = pct * n_prim / ((1 - pct) * n_proc)
+        r_prim_ideal = (1 - pct) * n_proc / (pct * n_prim)
+
+        if r_proc_ideal >= 1.0:
+            # Procedural is minority — repeat procedural
+            all_assets = primitive_assets + procedural_assets * max(1, round(r_proc_ideal))
         else:
-            r_proc = 1
-        
-        all_assets = primitive_assets + procedural_assets * r_proc
+            # Primitives are minority — repeat primitives
+            all_assets = primitive_assets * max(1, round(r_prim_ideal)) + procedural_assets
     
     return RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Object",

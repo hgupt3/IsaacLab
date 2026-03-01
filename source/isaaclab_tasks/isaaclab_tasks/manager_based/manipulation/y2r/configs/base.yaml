@@ -12,7 +12,7 @@
 simulation:
   physics_dt: 0.01              # Physics timestep (seconds)
   decimation: 2                 # Control decimation (steps per action)
-  num_envs: 32768
+  num_envs: 20480
   env_spacing: 3.0
   replicate_physics: false
   solver_position_iteration_count: 16
@@ -173,12 +173,12 @@ goal:
 rewards:
   contact_factor:
     nail_gate: 0.0                        # Cosine cutoff for pad-direction gating (0.0 = 90° cutoff, <0 = stricter, ≥1.0 = disabled)
-    nail_gate_min: 0.1                    # Floor on nail gate (0.0 = full cutoff, 0.1 = 10% of nail-direction force leaks through)
-    finger_weights: [0.65, 0.45, 0.35]   # Diminishing weights for [1st, 2nd, 3rd] best non-thumb finger
+    nail_gate_min: 0.0                    # Floor on nail gate (0.0 = full cutoff, 0.1 = 10% of nail-direction force leaks through)
+    finger_weights: [1.0, 0.5, 0.5]   # Diminishing weights for [1st, 2nd, 3rd] best non-thumb finger
     threshold: 0.5                         # Force threshold below which finger factor is 0 (N)
-    ramp: 1.0                              # Range over which factor ramps 0→1 (N)
+    ramp: 1.5                              # Range over which factor ramps 0→1 (N)
     min_factor: 0.0                       # Floor so factor never fully zeroes
-    thumb_gate_floor: 0.2                 # Floor on thumb gate (0.0 = hard prerequisite, 0.3 = 30% credit without thumb)
+    thumb_gate_floor: 0.0                 # Floor on thumb gate (0.0 = hard prerequisite, 0.3 = 30% credit without thumb)
 
   action_l2:
     weight: -0.005
@@ -516,7 +516,7 @@ visibility_camera:
   focal_length: 3.16                # 87° HFOV (D435i depth): 6.0 / (2×tan(43.5°))
   horizontal_aperture: 6.0
   clipping_range: [0.1, 2.0]
-  distance: [0.75, 0.75]            # meters
+  distance: [0.55, 0.55]            # meters
   yaw: [135.0, 225.0]            # degrees (full circle)
   pitch: [0.0, 20.0]            # degrees (elevation)
   look_at_offset: [0.0, 0.0, -0.05]  # (x, y, z) fixed offset from workspace center
@@ -525,8 +525,8 @@ visibility_camera:
 # WRIST CAMERA  (Gemini 305 depth — pinhole, square pixels, HFOV 88°)
 # ==============================================================================
 wrist_camera:
-  width: 64                     # Gemini 305 native 16:10 aspect ratio (1280:800)
-  height: 40
+  width: 96                     # Gemini 305 native 16:10 aspect ratio (1280:800)
+  height: 60
   focal_length: 3.19            # 88° HFOV: 6.17 / (2×tan(44°))
   horizontal_aperture: 6.17     # Virtual sensor width (mm)
   clipping_range: [0.04, 0.5]   # Gemini 305 depth range: 4–100 cm

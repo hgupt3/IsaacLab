@@ -8,7 +8,7 @@
 # Start at max difficulty
 curriculum:
   difficulty:
-    initial: 3
+    initial: 10
 
 mode:                                                                                                                                                                                                    
   use_student_mode: false
@@ -22,8 +22,8 @@ visualization:
   debug_print_rewards: false
   hand_pose_targets: false
   grasp_surface_point: false 
-  contact_forces: false
-  camera_pose: true
+  contact_forces: true
+  camera_pose: false
   student_visible: false
   student_target: false
   camera_viewer:
@@ -34,7 +34,7 @@ visualization:
 
 # Fewer envs for visualization
 simulation:
-  num_envs: 2
+  num_envs: 16
 
 procedural_objects:
   generation:

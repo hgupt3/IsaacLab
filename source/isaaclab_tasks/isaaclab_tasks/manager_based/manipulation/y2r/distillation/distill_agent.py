@@ -210,6 +210,9 @@ class DistillAgent(A2CAgent):
         self.teacher_episode_sums = None  # Dict[str, Tensor] per env
         self.student_episode_sums = None
         self.hybrid_episode_sums = None
+        self.teacher_termination_term_names = None
+        self.student_termination_term_names = None
+        self._episode_metric_provider = None
         
         # Accumulators for aggregated logging (like IsaacAlgoObserver pattern)
         # These collect values during steps and are flushed to TensorBoard periodically
@@ -217,10 +220,17 @@ class DistillAgent(A2CAgent):
         if self.log_interval <= 0:
             raise ValueError("distillation.log_interval must be > 0.")
         self.teacher_term_accum = {}  # Dict[term_name, List[float]]
+        self.teacher_term_sum_accum = {}  # Dict[term_name, List[float]]
         self.student_term_accum = {}  # Dict[term_name, List[float]]
+        self.student_term_sum_accum = {}  # Dict[term_name, List[float]]
+        self.teacher_termination_accum = {}  # Dict[term_name, List[float]]
+        self.student_termination_accum = {}  # Dict[term_name, List[float]]
+        self.teacher_metric_accum = {}  # Dict[metric_name, List[float]]
+        self.student_metric_accum = {}  # Dict[metric_name, List[float]]
         self.teacher_adr_accum = []   # List[float]
         self.student_adr_accum = []   # List[float]
         self.hybrid_term_accum = {}   # Dict[term_name, List[float]]
+        self.hybrid_term_sum_accum = {}  # Dict[term_name, List[float]]
         self.hybrid_adr_accum = []    # List[float]
         self.last_hybrid_adr = None
         
@@ -258,6 +268,23 @@ class DistillAgent(A2CAgent):
             print(f"  RNN enabled:")
             print(f"    seq_length: {self.seq_length}")
         print(f"{'='*60}\n")
+
+    def _get_episode_metric_provider(self):
+        """Locate observation term that stores per-env episode metric snapshots."""
+        if self._episode_metric_provider is not None:
+            return self._episode_metric_provider
+
+        obs_manager = getattr(self.vec_env.env.unwrapped, "observation_manager", None)
+        if obs_manager is None:
+            return None
+        group_term_cfgs = getattr(obs_manager, "_group_obs_term_cfgs", {})
+        for cfg_list in group_term_cfgs.values():
+            for term_cfg in cfg_list:
+                func = getattr(term_cfg, "func", None)
+                if hasattr(func, "_last_success") and hasattr(func, "_last_mean_pos_error"):
+                    self._episode_metric_provider = func
+                    return self._episode_metric_provider
+        return None
     
     def _build_and_load_teacher(self, teacher_cfg, ckpt_path):
         """Build teacher model using teacher config and load weights.
@@ -391,10 +418,13 @@ class DistillAgent(A2CAgent):
                     teacher_batch['rnn_masks'] = None
 
                 teacher_res = self.teacher_model(teacher_batch)
-                teacher_mus = teacher_res['mus']
-                teacher_sigmas = teacher_res['sigmas']
+                # Clone outputs — compiled models with CUDAGraphs reuse buffers
+                # that get overwritten by the subsequent student forward pass.
+                teacher_mus = teacher_res['mus'].clone()
+                teacher_sigmas = teacher_res['sigmas'].clone()
+                teacher_values_raw = teacher_res['values'].clone() if self.distill_value else None
                 if self.is_teacher_rnn:
-                    self.teacher_rnn_states = teacher_res['rnn_states']
+                    self.teacher_rnn_states = [s.clone() for s in teacher_res['rnn_states']]
 
                 # is_train=True doesn't return 'actions', so sample from distribution
                 teacher_distr = torch.distributions.Normal(teacher_mus, teacher_sigmas)
@@ -436,9 +466,8 @@ class DistillAgent(A2CAgent):
                 # This means RL fine-tuning can start with correct denorm from step 1.
                 value_loss = torch.zeros(1, device=self.ppo_device)
                 if self.distill_value:
-                    teacher_values = teacher_res['values'].detach()
                     student_values = student_res['values']
-                    value_loss = l2_loss(student_values, teacher_values).mean()
+                    value_loss = l2_loss(student_values, teacher_values_raw.detach()).mean()
                     total_loss = total_loss + self.distill_value_coef * value_loss
             
             # Sample student actions (outside autocast for stability)
@@ -560,25 +589,34 @@ class DistillAgent(A2CAgent):
                 # This populates ep_infos which after_print_stats will aggregate and log
                 self.algo_observer.process_infos(infos, env_done_indices)
                 
-                # Accumulate per-term episode rewards (will be logged periodically)
-                # Use actual per-env episode lengths from trajectory_manager instead of max
-                tm = isaac_env.trajectory_manager
-                teacher_ep_lens = tm.t_episode_end[teacher_done_indices] if len(teacher_done_indices) > 0 else None
-                student_ep_lens = tm.t_episode_end[student_done_indices] if len(student_done_indices) > 0 else None
+                # Accumulate per-term episode rewards (will be logged periodically).
+                # Normalize by ACTUAL elapsed episode time (steps * dt), matching RewardManager semantics.
+                teacher_ep_lens = (
+                    self.current_lengths[teacher_done_indices] * dt if len(teacher_done_indices) > 0 else None
+                )
+                student_ep_lens = (
+                    self.current_lengths[student_done_indices] * dt if len(student_done_indices) > 0 else None
+                )
                 
                 for term_name in self.reward_term_names:
                     # Initialize accumulator lists if needed
                     if term_name not in self.teacher_term_accum:
                         self.teacher_term_accum[term_name] = []
+                    if term_name not in self.teacher_term_sum_accum:
+                        self.teacher_term_sum_accum[term_name] = []
                     if term_name not in self.student_term_accum:
                         self.student_term_accum[term_name] = []
+                    if term_name not in self.student_term_sum_accum:
+                        self.student_term_sum_accum[term_name] = []
                     
                     # Teacher - accumulate instead of immediate log
                     if len(teacher_done_indices) > 0:
                         teacher_sums = self.teacher_episode_sums[term_name][teacher_done_indices]
                         # Normalize each env by its actual episode length, then average
-                        val = (teacher_sums / teacher_ep_lens.clamp(min=1e-6)).mean().item()
-                        self.teacher_term_accum[term_name].append(val)
+                        val_per_sec = (teacher_sums / teacher_ep_lens.clamp(min=1e-6)).mean().item()
+                        val_sum = teacher_sums.mean().item()
+                        self.teacher_term_accum[term_name].append(val_per_sec)
+                        self.teacher_term_sum_accum[term_name].append(val_sum)
                         # Reset for done envs
                         self.teacher_episode_sums[term_name][teacher_done_indices] = 0
                     
@@ -586,24 +624,72 @@ class DistillAgent(A2CAgent):
                     if len(student_done_indices) > 0:
                         student_sums = self.student_episode_sums[term_name][student_done_indices]
                         # Normalize each env by its actual episode length, then average
-                        val = (student_sums / student_ep_lens.clamp(min=1e-6)).mean().item()
-                        self.student_term_accum[term_name].append(val)
+                        val_per_sec = (student_sums / student_ep_lens.clamp(min=1e-6)).mean().item()
+                        val_sum = student_sums.mean().item()
+                        self.student_term_accum[term_name].append(val_per_sec)
+                        self.student_term_sum_accum[term_name].append(val_sum)
                         # Reset for done envs
                         self.student_episode_sums[term_name][student_done_indices] = 0
                 
-                # Accumulate per-env ADR difficulty split by teacher/student
+                # Accumulate per-env ADR difficulty split by teacher/student using normalized scale [0, 1]
                 adr_term = isaac_env.curriculum_manager.cfg.adr.func
                 per_env_difficulties = adr_term.current_adr_difficulties  # shape: (num_envs,)
+                max_difficulty = float(isaac_env.curriculum_manager.cfg.adr.params.get("max_difficulty", 1))
+                max_difficulty = max(max_difficulty, 1.0)
                 
                 if len(teacher_done_indices) > 0:
-                    teacher_adr = per_env_difficulties[teacher_done_indices].mean().item()
+                    teacher_adr = (per_env_difficulties[teacher_done_indices] / max_difficulty).mean().item()
                     self.teacher_adr_accum.append(teacher_adr)
                     self.last_teacher_adr = teacher_adr
                 
                 if len(student_done_indices) > 0:
-                    student_adr = per_env_difficulties[student_done_indices].mean().item()
+                    student_adr = (per_env_difficulties[student_done_indices] / max_difficulty).mean().item()
                     self.student_adr_accum.append(student_adr)
                     self.last_student_adr = student_adr
+
+                # Split termination stats by teacher/student done envs.
+                term_manager = isaac_env.termination_manager
+                term_names = term_manager._term_names
+                last_episode_dones = term_manager._last_episode_dones
+                if self.teacher_termination_term_names is None:
+                    self.teacher_termination_term_names = term_names
+                    self.student_termination_term_names = term_names
+                if len(teacher_done_indices) > 0:
+                    teacher_term_vals = last_episode_dones[teacher_done_indices].float()
+                    for term_idx, term_name in enumerate(term_names):
+                        if term_name not in self.teacher_termination_accum:
+                            self.teacher_termination_accum[term_name] = []
+                        self.teacher_termination_accum[term_name].append(teacher_term_vals[:, term_idx].mean().item())
+                if len(student_done_indices) > 0:
+                    student_term_vals = last_episode_dones[student_done_indices].float()
+                    for term_idx, term_name in enumerate(term_names):
+                        if term_name not in self.student_termination_accum:
+                            self.student_termination_accum[term_name] = []
+                        self.student_termination_accum[term_name].append(student_term_vals[:, term_idx].mean().item())
+
+                # Split episode metrics by teacher/student done envs.
+                metric_provider = self._get_episode_metric_provider()
+                if metric_provider is not None:
+                    metric_buffers = {
+                        "success_rate": metric_provider._last_success.float(),
+                        "reached_release": metric_provider._last_reached_release.float(),
+                        "phase_at_termination": metric_provider._last_phase.float(),
+                        "mean_pos_error": metric_provider._last_mean_pos_error.float(),
+                        "mean_rot_error": metric_provider._last_mean_rot_error.float(),
+                        "final_pos_error": metric_provider._last_final_pos_error.float(),
+                        "final_rot_error": metric_provider._last_final_rot_error.float(),
+                        "grasp_contact_rate": metric_provider._last_grasp_contact_rate.float(),
+                    }
+                    if len(teacher_done_indices) > 0:
+                        for metric_name, metric_vals in metric_buffers.items():
+                            if metric_name not in self.teacher_metric_accum:
+                                self.teacher_metric_accum[metric_name] = []
+                            self.teacher_metric_accum[metric_name].append(metric_vals[teacher_done_indices].mean().item())
+                    if len(student_done_indices) > 0:
+                        for metric_name, metric_vals in metric_buffers.items():
+                            if metric_name not in self.student_metric_accum:
+                                self.student_metric_accum[metric_name] = []
+                            self.student_metric_accum[metric_name].append(metric_vals[student_done_indices].mean().item())
                 
                 # Reset tracking for done envs (use vectorized multiply like parent)
                 not_dones = 1.0 - self.dones.float()
@@ -778,24 +864,58 @@ class DistillAgent(A2CAgent):
                     for term_name in self.teacher_term_accum:
                         if len(self.teacher_term_accum[term_name]) > 0:
                             mean_val = sum(self.teacher_term_accum[term_name]) / len(self.teacher_term_accum[term_name])
-                            self.writer.add_scalar(f'Episode/teacher/Episode_Reward/{term_name}', mean_val, frame)
+                            self.writer.add_scalar(f'Episode/teacher/Episode_Reward/{term_name}', mean_val, log_counter)
                             self.teacher_term_accum[term_name].clear()
+                    for term_name in self.teacher_term_sum_accum:
+                        if len(self.teacher_term_sum_accum[term_name]) > 0:
+                            mean_val = sum(self.teacher_term_sum_accum[term_name]) / len(self.teacher_term_sum_accum[term_name])
+                            self.writer.add_scalar(f'Episode/teacher/Episode_Reward_Sum/{term_name}', mean_val, log_counter)
+                            self.teacher_term_sum_accum[term_name].clear()
                     
                     for term_name in self.student_term_accum:
                         if len(self.student_term_accum[term_name]) > 0:
                             mean_val = sum(self.student_term_accum[term_name]) / len(self.student_term_accum[term_name])
-                            self.writer.add_scalar(f'Episode/student/Episode_Reward/{term_name}', mean_val, frame)
+                            self.writer.add_scalar(f'Episode/student/Episode_Reward/{term_name}', mean_val, log_counter)
                             self.student_term_accum[term_name].clear()
+                    for term_name in self.student_term_sum_accum:
+                        if len(self.student_term_sum_accum[term_name]) > 0:
+                            mean_val = sum(self.student_term_sum_accum[term_name]) / len(self.student_term_sum_accum[term_name])
+                            self.writer.add_scalar(f'Episode/student/Episode_Reward_Sum/{term_name}', mean_val, log_counter)
+                            self.student_term_sum_accum[term_name].clear()
+
+                    # Flush split termination stats
+                    for term_name in self.teacher_termination_accum:
+                        if len(self.teacher_termination_accum[term_name]) > 0:
+                            mean_val = sum(self.teacher_termination_accum[term_name]) / len(self.teacher_termination_accum[term_name])
+                            self.writer.add_scalar(f'Episode/teacher/Episode_Termination/{term_name}', mean_val, log_counter)
+                            self.teacher_termination_accum[term_name].clear()
+                    for term_name in self.student_termination_accum:
+                        if len(self.student_termination_accum[term_name]) > 0:
+                            mean_val = sum(self.student_termination_accum[term_name]) / len(self.student_termination_accum[term_name])
+                            self.writer.add_scalar(f'Episode/student/Episode_Termination/{term_name}', mean_val, log_counter)
+                            self.student_termination_accum[term_name].clear()
+
+                    # Flush split episode metrics
+                    for metric_name in self.teacher_metric_accum:
+                        if len(self.teacher_metric_accum[metric_name]) > 0:
+                            mean_val = sum(self.teacher_metric_accum[metric_name]) / len(self.teacher_metric_accum[metric_name])
+                            self.writer.add_scalar(f'Episode/teacher/Episode_Metric/{metric_name}', mean_val, log_counter)
+                            self.teacher_metric_accum[metric_name].clear()
+                    for metric_name in self.student_metric_accum:
+                        if len(self.student_metric_accum[metric_name]) > 0:
+                            mean_val = sum(self.student_metric_accum[metric_name]) / len(self.student_metric_accum[metric_name])
+                            self.writer.add_scalar(f'Episode/student/Episode_Metric/{metric_name}', mean_val, log_counter)
+                            self.student_metric_accum[metric_name].clear()
                     
                     # Flush ADR values
                     if len(self.teacher_adr_accum) > 0:
                         mean_adr = sum(self.teacher_adr_accum) / len(self.teacher_adr_accum)
-                        self.writer.add_scalar('Episode/teacher/Curriculum/adr', mean_adr, frame)
+                        self.writer.add_scalar('Episode/teacher/Curriculum/adr', mean_adr, log_counter)
                         self.teacher_adr_accum.clear()
                     
                     if len(self.student_adr_accum) > 0:
                         mean_adr = sum(self.student_adr_accum) / len(self.student_adr_accum)
-                        self.writer.add_scalar('Episode/student/Curriculum/adr', mean_adr, frame)
+                        self.writer.add_scalar('Episode/student/Curriculum/adr', mean_adr, log_counter)
                         self.student_adr_accum.clear()
                 
                 # Check max_epochs exit (matching RL-Games)
@@ -1038,20 +1158,26 @@ class DistillAgent(A2CAgent):
 
             if len(env_done_indices) > 0:
                 env_done_flat = env_done_indices.squeeze(-1) if env_done_indices.dim() > 1 else env_done_indices
-                tm = isaac_env.trajectory_manager
-                ep_lens = tm.t_episode_end[env_done_flat]
+                # Normalize by ACTUAL elapsed episode time (steps * dt), not planned trajectory duration.
+                ep_lens = self.current_lengths[env_done_flat] * dt
 
                 for term_name in self.reward_term_names:
                     if term_name not in self.hybrid_term_accum:
                         self.hybrid_term_accum[term_name] = []
+                    if term_name not in self.hybrid_term_sum_accum:
+                        self.hybrid_term_sum_accum[term_name] = []
                     ep_sums = self.hybrid_episode_sums[term_name][env_done_flat]
-                    val = (ep_sums / ep_lens.clamp(min=1e-6)).mean().item()
-                    self.hybrid_term_accum[term_name].append(val)
+                    val_per_sec = (ep_sums / ep_lens.clamp(min=1e-6)).mean().item()
+                    val_sum = ep_sums.mean().item()
+                    self.hybrid_term_accum[term_name].append(val_per_sec)
+                    self.hybrid_term_sum_accum[term_name].append(val_sum)
                     self.hybrid_episode_sums[term_name][env_done_flat] = 0.0
 
                 adr_term = isaac_env.curriculum_manager.cfg.adr.func
                 per_env_difficulties = adr_term.current_adr_difficulties
-                hybrid_adr = per_env_difficulties[env_done_flat].mean().item()
+                max_difficulty = float(isaac_env.curriculum_manager.cfg.adr.params.get("max_difficulty", 1))
+                max_difficulty = max(max_difficulty, 1.0)
+                hybrid_adr = (per_env_difficulties[env_done_flat] / max_difficulty).mean().item()
                 self.hybrid_adr_accum.append(hybrid_adr)
                 self.last_hybrid_adr = hybrid_adr
 
@@ -1486,12 +1612,17 @@ class DistillAgent(A2CAgent):
                     for term_name, values in self.hybrid_term_accum.items():
                         if len(values) > 0:
                             mean_val = sum(values) / len(values)
-                            self.writer.add_scalar(f"Episode/student/Episode_Reward/{term_name}", mean_val, frame)
+                            self.writer.add_scalar(f"Episode/student/Episode_Reward/{term_name}", mean_val, epoch_num)
+                            values.clear()
+                    for term_name, values in self.hybrid_term_sum_accum.items():
+                        if len(values) > 0:
+                            mean_val = sum(values) / len(values)
+                            self.writer.add_scalar(f"Episode/student/Episode_Reward_Sum/{term_name}", mean_val, epoch_num)
                             values.clear()
 
                     if len(self.hybrid_adr_accum) > 0:
                         mean_adr = sum(self.hybrid_adr_accum) / len(self.hybrid_adr_accum)
-                        self.writer.add_scalar("Episode/student/Curriculum/adr", mean_adr, frame)
+                        self.writer.add_scalar("Episode/student/Curriculum/adr", mean_adr, epoch_num)
                         self.hybrid_adr_accum.clear()
 
                 if self.game_rewards.current_size > 0:

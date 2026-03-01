@@ -135,7 +135,15 @@ def get_palm_frame_pose_w(
     global _PALM_OFFSET_POS, _PALM_OFFSET_QUAT
     _ensure_palm_offset_cache(y2r_cfg, robot.device)
 
-    palm_idx = robot.find_bodies(y2r_cfg.robot.palm_body_name)[0][0]
+    # Cache string-based body lookup on the articulation to avoid per-step find_bodies.
+    palm_name = y2r_cfg.robot.palm_body_name
+    palm_idx = getattr(robot, "_y2r_cached_palm_body_idx", None)
+    cached_name = getattr(robot, "_y2r_cached_palm_body_name", None)
+    if palm_idx is None or cached_name != palm_name:
+        palm_ids = robot.find_bodies(palm_name)[0]
+        palm_idx = palm_ids[0]
+        robot._y2r_cached_palm_body_idx = palm_idx
+        robot._y2r_cached_palm_body_name = palm_name
     pos_w = robot.data.body_pos_w[:, palm_idx]
     quat_w = robot.data.body_quat_w[:, palm_idx]
 
@@ -671,9 +679,8 @@ class visible_object_point_cloud_b(ManagerTermBase):
         # State
         self.cached_points_local = None  # (N, num_points, 3) in object-local frame
         self._step_counter = 0
-        self._object_instance_ids = None  # Lazy-init on first render
+        self._object_id_tensor = None  # Lazy-init on first render
         self.selected_points_w = None
-        self._pending_reset = False
 
         # Init visibility camera pose buffers (populated by reset_visibility_camera_pose event)
         env._visibility_cam_pos_w = torch.zeros(env.num_envs, 3, device=env.device)
@@ -685,8 +692,22 @@ class visible_object_point_cloud_b(ManagerTermBase):
             self._init_visualizer()
 
     def reset(self, env_ids=None):
-        """Flag that sensors need a render + buffer refresh before next resample."""
-        self._pending_reset = True
+        """Reset selected envs to pool points without forcing camera render/resample."""
+        # Before first observation call there is no cache yet.
+        if self.cached_points_local is None:
+            return
+
+        if env_ids is None:
+            env_ids_t = torch.arange(self.env.num_envs, device=self.env.device, dtype=torch.long)
+        elif isinstance(env_ids, torch.Tensor):
+            env_ids_t = env_ids.to(device=self.env.device, dtype=torch.long)
+        else:
+            env_ids_t = torch.tensor(list(env_ids), device=self.env.device, dtype=torch.long)
+
+        if env_ids_t.numel() == 0:
+            return
+
+        self._fill_pool_points(env_ids_t, self.env.device)
 
     def _discover_object_instance_ids(self):
         """Discover instance IDs belonging to the object from camera metadata.
@@ -694,12 +715,12 @@ class visible_object_point_cloud_b(ManagerTermBase):
         Rebuilds every resample — the idToLabels dict is tiny so cost is negligible.
         """
         label_map = self.camera.data.info["instance_id_segmentation_fast"]["idToLabels"]
-        object_ids = set()
-        for uid, meta in label_map.items():
-            prim_path = meta
-            if "/Object" in prim_path:
-                object_ids.add(int(uid))
-        self._object_instance_ids = object_ids
+        object_ids = [int(uid) for uid, meta in label_map.items() if "/Object" in meta]
+        # Store as GPU tensor for vectorized isin() lookup
+        if object_ids:
+            self._object_id_tensor = torch.tensor(object_ids, dtype=torch.int32, device=self.env.device)
+        else:
+            self._object_id_tensor = None
 
     def _build_object_mask(self, inst_id: torch.Tensor) -> torch.Tensor:
         """Build boolean mask of pixels belonging to the object.
@@ -710,14 +731,11 @@ class visible_object_point_cloud_b(ManagerTermBase):
         Returns:
             (N, H, W) boolean mask.
         """
-        if not self._object_instance_ids:
+        if self._object_id_tensor is None:
             return torch.zeros_like(inst_id, dtype=torch.bool)
 
-        # Build mask by OR-ing matches for each known object ID
-        mask = torch.zeros_like(inst_id, dtype=torch.bool)
-        for oid in self._object_instance_ids:
-            mask |= (inst_id == oid)
-        return mask
+        # Single fused GPU op instead of per-ID loop
+        return torch.isin(inst_id, self._object_id_tensor)
 
     def __call__(
         self,
@@ -731,105 +749,128 @@ class visible_object_point_cloud_b(ManagerTermBase):
         num_pts = self.num_points
         device = env.device
 
-        # After reset: render post-reset scene and refresh all sensor buffers
-        force_resample = False
-        if self._pending_reset:
-            self._pending_reset = False
-            env.sim.render()
-            env.scene.update(dt=0.0)
-            force_resample = True
+        # Determine what needs resampling this step
+        first_call = self.cached_points_local is None
+        if first_call:
+            # Avoid forcing manual renders at startup/reset: initialize with pool points
+            # and wait for the next scheduled interval resample for camera-based points.
+            self.cached_points_local = torch.empty(N, num_pts, 3, device=device)
+            self._fill_pool_points(torch.arange(N, device=device, dtype=torch.long), device)
 
-        # Check resample via CPU counter (no GPU sync)
-        needs_resample = self.cached_points_local is None or force_resample
-        if force_resample:
-            self._step_counter = 0
-        elif not needs_resample:
+        # Interval-based resample (all envs)
+        interval_resample = False
+        if not first_call:
             self._step_counter += 1
-            needs_resample = self._step_counter >= self.resample_interval
-            if needs_resample:
+            if self._step_counter >= self.resample_interval:
                 self._step_counter = 0
+                interval_resample = True
 
-        if needs_resample:
-            # Rebuild object instance IDs every resample (idToLabels is tiny)
+        # Determine which env IDs to resample
+        if interval_resample:
+            resample_ids = None  # None = all envs
+        else:
+            resample_ids = False  # no resample needed
+
+        if resample_ids is not False:
             self._discover_object_instance_ids()
 
             camera = self.camera
 
-            # 1. Fetch rendered data
-            depth = camera.data.output["distance_to_image_plane"]          # (N, H, W, 1)
-            inst_id = camera.data.output["instance_id_segmentation_fast"]  # (N, H, W, 1)
-            depth = depth.squeeze(-1)     # (N, H, W)
-            inst_id = inst_id.squeeze(-1).int()  # (N, H, W)
+            # 1. Fetch rendered data (always full batch from tiled camera)
+            depth_all = camera.data.output["distance_to_image_plane"].squeeze(-1)      # (N, H, W)
+            inst_id_all = camera.data.output["instance_id_segmentation_fast"].squeeze(-1).int()
 
             # Camera debug viewer
             if self.env.cfg.y2r_cfg.visualization.camera_viewer.enabled:
-                _update_camera_viewer_visibility(self.env, depth, inst_id)
+                _update_camera_viewer_visibility(self.env, depth_all, inst_id_all)
+
+            # Subset to resample IDs (or use all)
+            if resample_ids is not None:
+                depth = depth_all[resample_ids]
+                inst_id = inst_id_all[resample_ids]
+                R = len(resample_ids)
+            else:
+                depth = depth_all
+                inst_id = inst_id_all
+                R = N
 
             H, W = depth.shape[1], depth.shape[2]
 
             # 2. Build object mask, eroded by 1px to avoid depth bleeding at edges
-            object_mask = self._build_object_mask(inst_id)  # (N, H, W) bool
+            object_mask = self._build_object_mask(inst_id)  # (R, H, W) bool
             eroded_mask = (-F.max_pool2d(-object_mask.float().unsqueeze(1), 3, stride=1, padding=1)).squeeze(1) > 0.5
-            mask_flat = eroded_mask.view(N, -1).float()     # (N, H*W)
-            has_object = mask_flat.sum(dim=-1) > 0           # (N,)
+            mask_flat = eroded_mask.view(R, -1).float()     # (R, H*W)
+            has_object = mask_flat.sum(dim=-1) > 0           # (R,)
 
             # 3. Sample pixel cells from masked region (multinomial with replacement)
             weights = mask_flat.clone()
             weights[~has_object] = 1.0  # placeholder so multinomial doesn't fail
-            sampled_cells = torch.multinomial(weights, num_pts, replacement=True)  # (N, K)
+            sampled_cells = torch.multinomial(weights, num_pts, replacement=True)  # (R, K)
 
-            rows_center = (sampled_cells // W).float()  # (N, K)
-            cols_center = (sampled_cells % W).float()   # (N, K)
+            rows_center = (sampled_cells // W).float()  # (R, K)
+            cols_center = (sampled_cells % W).float()   # (R, K)
 
             # Sub-pixel jitter for continuous area sampling
             rows_cont = (rows_center + torch.rand_like(rows_center) - 0.5).clamp(0, H - 1)
             cols_cont = (cols_center + torch.rand_like(cols_center) - 0.5).clamp(0, W - 1)
 
             # 4. Bilinear depth interpolation
-            depth_interp = _bilinear_sample_depth(depth, rows_cont, cols_cont)  # (N, K)
+            depth_interp = _bilinear_sample_depth(depth, rows_cont, cols_cont)  # (R, K)
 
             # 5. Back-project to 3D in camera frame
-            # Isaac Sim TiledCamera uses OpenGL convention: x-right, y-up, z-backward
-            # Pixel (col, row) maps to: x = (col - cx) * z / fx, y = -(row - cy) * z / fy (y flipped for image coords)
             intrinsics = camera.data.intrinsic_matrices  # (N, 3, 3)
-            fx = intrinsics[:, 0, 0]  # (N,)
+            if resample_ids is not None:
+                intrinsics = intrinsics[resample_ids]
+            fx = intrinsics[:, 0, 0]  # (R,)
             fy = intrinsics[:, 1, 1]
             cx = intrinsics[:, 0, 2]
             cy = intrinsics[:, 1, 2]
 
-            # OpenGL camera: image row increases downward but camera Y points up
             x_cam = (cols_cont - cx.unsqueeze(1)) * depth_interp / fx.unsqueeze(1)
             y_cam = -(rows_cont - cy.unsqueeze(1)) * depth_interp / fy.unsqueeze(1)
             z_cam = -depth_interp  # OpenGL: depth is along -Z
-            points_cam = torch.stack([x_cam, y_cam, z_cam], dim=-1)  # (N, K, 3)
+            points_cam = torch.stack([x_cam, y_cam, z_cam], dim=-1)  # (R, K, 3)
 
             # 6. Camera frame -> world frame
-            # Use cached pose from reset event — camera.data is stale in Fabric mode
             cam_pos_w = env._visibility_cam_pos_w       # (N, 3)
-            cam_quat_w = env._visibility_cam_quat_w_opengl  # (N, 4) wxyz, OpenGL convention
+            cam_quat_w = env._visibility_cam_quat_w_opengl  # (N, 4)
+            if resample_ids is not None:
+                cam_pos_w = cam_pos_w[resample_ids]
+                cam_quat_w = cam_quat_w[resample_ids]
             points_w = _quat_rotate_vec(cam_quat_w, points_cam) + cam_pos_w.unsqueeze(1)
 
             # 7. World frame -> object-local frame (for caching)
             obj_pos_w = self.object.data.root_pos_w
             obj_quat_w = self.object.data.root_quat_w
+            if resample_ids is not None:
+                obj_pos_w = obj_pos_w[resample_ids]
+                obj_quat_w = obj_quat_w[resample_ids]
             inv_quat = _quat_conjugate(obj_quat_w)
             new_cached = _quat_rotate_vec(inv_quat, points_w - obj_pos_w.unsqueeze(1))
 
-            # 8. Handle zero-visibility: keep last cached points for those envs
+            # 8. Update cached points — only for resampled envs
             if self.cached_points_local is not None:
-                self.cached_points_local[has_object] = new_cached[has_object]
+                if resample_ids is not None:
+                    # Per-env update: only overwrite envs that have visible object
+                    vis_mask = has_object
+                    vis_ids = resample_ids[vis_mask]
+                    self.cached_points_local[vis_ids] = new_cached[vis_mask]
+                    # Reset envs with no visibility get pool points
+                    novis_mask = ~has_object
+                    if novis_mask.any():
+                        novis_ids = resample_ids[novis_mask]
+                        self._fill_pool_points(novis_ids, device)
+                else:
+                    self.cached_points_local[has_object] = new_cached[has_object]
             else:
-                # First call — use pool points as fallback for no-visibility envs
+                # First call — initialize for all envs
                 self.cached_points_local = new_cached
                 no_vis = ~has_object
                 if no_vis.any():
-                    geo_idx = self.geo_indices[:N]
-                    scales = self.scales[:N]
-                    pool_local = self.all_base_points[geo_idx] * scales.unsqueeze(1)  # (N, P, 3)
-                    n_no = int(no_vis.sum())
-                    fallback_idx = torch.randint(0, self.pool_size, (n_no, num_pts), device=device)
-                    batch = torch.arange(n_no, device=device).unsqueeze(1)
-                    self.cached_points_local[no_vis] = pool_local[no_vis][batch, fallback_idx]
+                    if resample_ids is not None:
+                        self._fill_pool_points(resample_ids[no_vis], device)
+                    else:
+                        self._fill_pool_points(torch.where(no_vis)[0], device)
 
         # Transform cached local points to current world frame
         object_pos_w = self.object.data.root_pos_w
@@ -848,6 +889,15 @@ class visible_object_point_cloud_b(ManagerTermBase):
             self._visualize(selected_points_w, N)
 
         return points_b.view(N, -1) if flatten else points_b
+
+    def _fill_pool_points(self, env_ids: torch.Tensor, device: torch.device):
+        """Fill cached points for given envs with random pool surface points."""
+        n = len(env_ids)
+        pool_local = self.all_base_points[self.geo_indices[env_ids]] * self.scales[env_ids].unsqueeze(1)
+        idx = torch.randint(0, self.pool_size, (n, self.num_points), device=device)
+        self.cached_points_local[env_ids] = torch.gather(
+            pool_local, 1, idx.unsqueeze(-1).expand(-1, -1, 3)
+        )
 
     def _init_visualizer(self):
         """Initialize blue sphere markers for visible point cloud."""
@@ -2046,28 +2096,6 @@ class target_sequence_obs_b(ManagerTermBase):
 
         # Current object points (world space, broadcast)
         current_points_w = _quat_rotate_vec(object_quat_w, self.points_local) + object_pos_w.unsqueeze(1)
-        
-        # === Cache point cloud errors ===
-        current_exp = current_points_w.unsqueeze(1).expand(N, W, P, 3)
-        point_errors = (current_exp - all_points_w).norm(dim=-1)  # (N, W, P)
-        env._cached_mean_errors = point_errors.mean(dim=-1)  # (N, W)
-        
-        # === Cache pose errors ===
-        # Position error: (N, W)
-        object_pos_exp_w = object_pos_w.unsqueeze(1).expand(N, W, 3)
-        pos_errors = (object_pos_exp_w - target_pos_w).norm(dim=-1)  # (N, W)
-        
-        # Rotation error using quat_error_magnitude: (N, W)
-        object_quat_exp_w = object_quat_w.unsqueeze(1).expand(N, W, 4)
-        rot_errors = quat_error_magnitude(
-            object_quat_exp_w.reshape(-1, 4),
-            target_quat_w.reshape(-1, 4)
-        ).reshape(N, W)  # (N, W)
-        
-        env._cached_pose_errors = {
-            'pos': pos_errors,  # (N, W) position error in meters
-            'rot': rot_errors,  # (N, W) rotation error in radians
-        }
 
         # === Cache aligned current errors (shared across rewards/terminations) ===
         cfg: Y2RConfig = env.cfg.y2r_cfg
@@ -2111,7 +2139,33 @@ class target_sequence_obs_b(ManagerTermBase):
             ) + interp_pos.unsqueeze(1)
             aligned_point_errors = (current_points_w - target_points_w).norm(dim=-1)
             env._cached_aligned_mean_error = aligned_point_errors.mean(dim=-1)
+
+            # Path mode rewards/terminations only use aligned caches. Keep raw caches
+            # lightweight for compatibility with occasional debug access.
+            env._cached_mean_errors = env._cached_aligned_mean_error.unsqueeze(1)
+            env._cached_pose_errors = {
+                "pos": aligned_pos_error.unsqueeze(1),
+                "rot": aligned_rot_error.unsqueeze(1),
+            }
         else:
+            # Waypoint mode needs full window error tensors.
+            current_exp = current_points_w.unsqueeze(1).expand(N, W, P, 3)
+            point_errors = (current_exp - all_points_w).norm(dim=-1)  # (N, W, P)
+            env._cached_mean_errors = point_errors.mean(dim=-1)  # (N, W)
+
+            object_pos_exp_w = object_pos_w.unsqueeze(1).expand(N, W, 3)
+            pos_errors = (object_pos_exp_w - target_pos_w).norm(dim=-1)  # (N, W)
+
+            object_quat_exp_w = object_quat_w.unsqueeze(1).expand(N, W, 4)
+            rot_errors = quat_error_magnitude(
+                object_quat_exp_w.reshape(-1, 4),
+                target_quat_w.reshape(-1, 4),
+            ).reshape(N, W)
+
+            env._cached_pose_errors = {
+                "pos": pos_errors,
+                "rot": rot_errors,
+            }
             env._cached_aligned_pose_errors = {
                 "pos": pos_errors[:, 0],
                 "rot": rot_errors[:, 0],

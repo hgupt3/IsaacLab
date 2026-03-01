@@ -221,8 +221,15 @@ class UR5eLeapTrajectoryMixinCfg:
         # Add visibility camera for true occlusion-based point cloud filtering
         # Camera under env root Xform (not attached to robot), pose set at reset
         if cfg.mode.use_student_mode:
+            # Keep visibility camera updates aligned with visible point cloud resampling.
+            policy_dt = float(cfg.simulation.physics_dt * cfg.simulation.decimation)
+            steps_per_target = 1.0 / (cfg.trajectory.target_hz * policy_dt)
+            visibility_resample_interval = max(1, int(cfg.trajectory.window_size * steps_per_target))
+            visibility_update_period = policy_dt * visibility_resample_interval
+
             self.scene.visibility_camera = TiledCameraCfg(
                 prim_path="{ENV_REGEX_NS}/visibility_camera",
+                update_period=visibility_update_period,
                 data_types=["distance_to_image_plane", "instance_id_segmentation_fast"],
                 spawn=PinholeCameraCfg(
                     focal_length=cfg.visibility_camera.focal_length,

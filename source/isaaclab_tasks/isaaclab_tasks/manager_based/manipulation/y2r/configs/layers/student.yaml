@@ -9,7 +9,7 @@ mode:
   use_student_mode: true
 
 simulation:
-  num_envs: 2048
+  num_envs: 3072
 
 terminations:
   trajectory_deviation:
