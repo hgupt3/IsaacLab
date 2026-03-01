@@ -172,9 +172,9 @@ goal:
 # ==============================================================================
 rewards:
   contact_factor:
-    nail_gate: 0.0                        # Cosine cutoff for pad-direction gating (0.0 = 90° cutoff, <0 = stricter, ≥1.0 = disabled)
+    nail_gate: -0.4                        # Cosine cutoff for pad-direction gating (0.0 = 90° cutoff, <0 = stricter, ≥1.0 = disabled)
     nail_gate_min: 0.0                    # Floor on nail gate (0.0 = full cutoff, 0.1 = 10% of nail-direction force leaks through)
-    finger_weights: [1.0, 0.5, 0.5]   # Diminishing weights for [1st, 2nd, 3rd] best non-thumb finger
+    finger_weights: [2.2, 1.6, 1.0]   # Diminishing weights for [1st, 2nd, 3rd] best non-thumb finger
     threshold: 0.5                         # Force threshold below which finger factor is 0 (N)
     ramp: 1.5                              # Range over which factor ramps 0→1 (N)
     min_factor: 0.0                       # Floor so factor never fully zeroes
@@ -191,14 +191,14 @@ rewards:
       finger_scale: 0.12
     
   fingers_to_object:
-    weight: 1.5
+    weight: 2.0
     params:
       phases: [grasp, manipulation]    # Active in grasp and manipulation phases
       use_hand_pose_gate: true        # Optional hand pose gating
       std: 0.4
-      error_gate_pos_threshold: 0.10   # Position/point-cloud threshold (meters)
+      error_gate_pos_threshold: 0.15   # Position/point-cloud threshold (meters)
       error_gate_pos_slope: 0.05       # Position gate slope (meters)
-      error_gate_rot_threshold: 1.0    # Rotation threshold (radians)
+      error_gate_rot_threshold: 1.5    # Rotation threshold (radians)
       error_gate_rot_slope: 0.5        # Rotation gate slope (radians)
     
   lookahead_tracking:
@@ -248,14 +248,14 @@ rewards:
     
   # Robot-specific (Kuka Allegro)
   good_finger_contact:
-    weight: 1.0
+    weight: 1.5
     params:
       phases: [manipulation, release]
       use_hand_pose_gate: true
       invert_in_release: true          # Invert reward in release (reward NO contact)
     
   finger_manipulation:
-    weight: 5.0
+    weight: 6.0
     params:
       phases: [manipulation, release]    # Active in grasp and manipulation phases
       use_hand_pose_gate: true         # Apply hand pose gate from hand_pose_following
