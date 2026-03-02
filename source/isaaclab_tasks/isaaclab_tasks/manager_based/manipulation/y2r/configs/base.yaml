@@ -12,7 +12,7 @@
 simulation:
   physics_dt: 0.01              # Physics timestep (seconds)
   decimation: 2                 # Control decimation (steps per action)
-  num_envs: 20480
+  num_envs: 32768
   env_spacing: 3.0
   replicate_physics: false
   solver_position_iteration_count: 16
@@ -183,12 +183,12 @@ rewards:
   action_l2:
     weight: -0.005
     params:
-      finger_scale: 0.12
+      finger_scale: 0.1
     
   action_rate_l2:
     weight: -0.005
     params:
-      finger_scale: 0.12
+      finger_scale: 0.1
     
   fingers_to_object:
     weight: 2.0
@@ -399,6 +399,7 @@ curriculum:
     
   gate_floor: [0.4, 0.1] # Hand pose gate floor: [initial, final]
   grasp_scale: [0.8, 0.3] # Grasp phase scaling for lookahead tracking: [initial, final]
+  best_release_error: true # ADR uses latched "hit-goal during release" instead of end pose
     
   # Gravity scheduling (m/s²)
   gravity:

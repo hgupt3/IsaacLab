@@ -853,30 +853,32 @@ def trajectory_success(
     
     cfg = env.cfg.y2r_cfg
     use_point_cloud = cfg.mode.use_point_cloud
-    
+
     if not use_point_cloud:
         # Pose mode: position + rotation
         pos_error = env._cached_aligned_pose_errors['pos']  # (N,)
         rot_error = env._cached_aligned_pose_errors['rot']  # (N,)
-        
+
         # Dense component: exp kernel shaping (always provides gradient)
         pos_dense = torch.exp(-pos_error / pos_std)
         rot_dense = torch.exp(-rot_error / rot_std)
         dense = (pos_dense + rot_dense) / 2.0
-        
+
         # Sparse component: binary bonus when in bounds
         pos_ok = pos_error < pos_threshold
         rot_ok = rot_error < rot_threshold
-        sparse = (pos_ok & rot_ok).float()
+        sparse_success = pos_ok & rot_ok
+        sparse = sparse_success.float()
     else:
         # Point cloud mode: position only
         current_error = env._cached_aligned_mean_error  # (N,)
-        
+
         # Dense component
         dense = torch.exp(-current_error / pos_std)
-        
+
         # Sparse component
-        sparse = (current_error < pos_threshold).float()
+        sparse_success = current_error < pos_threshold
+        sparse = sparse_success.float()
     
     # Optionally gate sparse component by finger release (must actually release, not hold)
     if use_finger_release_gate:
@@ -896,8 +898,33 @@ def trajectory_success(
     # Apply phase filter and optional hand pose gate
     reward = _apply_phase_filter(env, reward, phases)
     reward = _apply_hand_pose_gate(env, reward, use_hand_pose_gate)
-    
+
+    # --- Release success latch for ADR advancement ---
+    # For unstable objects that roll after release, ADR only needs whether goal
+    # was achieved at any point during release (not the final rolled-away pose).
+    if cfg.curriculum.best_release_error:
+        _update_release_success_latch(env, sparse_success)
+
     return reward
+
+
+def _update_release_success_latch(env, success_now: torch.Tensor):
+    """Latch whether each env achieved goal at least once during release."""
+    phase = _get_cached_phase(env)
+    in_release = (phase == PHASE_MAP["release"])
+
+    # Lazy init
+    if not hasattr(env, '_release_success_latch'):
+        env._release_success_latch = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+    # Episode resets: clear latched state for fresh episodes.
+    if hasattr(env, 'episode_length_buf'):
+        reset_mask = env.episode_length_buf == 0
+        if torch.any(reset_mask):
+            env._release_success_latch[reset_mask] = False
+
+    # Latch success while in release.
+    env._release_success_latch = env._release_success_latch | (in_release & success_now)
 
 
 def arm_table_binary_penalty(

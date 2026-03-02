@@ -427,6 +427,7 @@ class CurriculumConfig:
     noise: NoiseConfig
     gate_floor: tuple[float, float]
     grasp_scale: tuple[float, float]
+    best_release_error: bool
     gravity: GravityConfig
 
 

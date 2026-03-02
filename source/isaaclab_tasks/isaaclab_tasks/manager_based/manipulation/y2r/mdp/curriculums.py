@@ -126,35 +126,50 @@ class DifficultyScheduler(ManagerTermBase):
             effective_rot_tol = rot_tol if rot_tol is not None else current_rot_threshold
             effective_pc_tol = pc_tol if pc_tol is not None else current_pos_threshold
             
-            # Compare object pose against FINAL GOAL (not current lookahead target)
-            goal_poses = trajectory_manager.goal_poses[env_ids]  # (n, 7) world frame
-            goal_pos = goal_poses[:, :3]  # (n, 3)
-            goal_quat = goal_poses[:, 3:7]  # (n, 4)
-            
-            # Object current pose (world frame)
-            object_pos_w = env.scene["object"].data.root_pos_w[env_ids]  # (n, 3)
-            object_quat_w = env.scene["object"].data.root_quat_w[env_ids]  # (n, 4)
-            
-            if use_point_cloud:
-                # Point cloud mode: compute mean point error against goal point cloud
-                points_local = trajectory_manager.points_local  # (num_envs, P, 3)
-                if points_local is not None:
-                    pts = points_local[env_ids]  # (n, P, 3)
-                    goal_pts_w = quat_apply(
-                        goal_quat.unsqueeze(1).expand_as(pts), pts
-                    ) + goal_pos.unsqueeze(1)  # (n, P, 3)
-                    curr_pts_w = quat_apply(
-                        object_quat_w.unsqueeze(1).expand_as(pts), pts
-                    ) + object_pos_w.unsqueeze(1)  # (n, P, 3)
-                    mean_errors = (curr_pts_w - goal_pts_w).norm(dim=-1).mean(dim=-1)  # (n,)
-                    at_goal = mean_errors < effective_pc_tol
-                else:
-                    at_goal = torch.zeros(len(env_ids), dtype=torch.bool, device=env.device)
+            best_release = trajectory_manager.cfg.curriculum.best_release_error
+            # Release latch uses trajectory_success thresholds. If caller overrides
+            # tolerances, fall back to direct pose comparison for consistency.
+            use_release_latch = (
+                best_release
+                and pos_tol is None
+                and rot_tol is None
+                and pc_tol is None
+                and hasattr(env, "_release_success_latch")
+            )
+
+            if use_release_latch:
+                at_goal = env._release_success_latch[env_ids]
+                # Consume latch for completed episodes.
+                env._release_success_latch[env_ids] = False
             else:
-                # Pose mode: position + rotation error against final goal
-                pos_errors = (object_pos_w - goal_pos).norm(dim=-1)  # (n,)
-                rot_errors = quat_error_magnitude(object_quat_w, goal_quat)  # (n,)
-                at_goal = (pos_errors < effective_pos_tol) & (rot_errors < effective_rot_tol)
+                # Compare object pose against FINAL GOAL (not current lookahead target)
+                goal_poses = trajectory_manager.goal_poses[env_ids]  # (n, 7) world frame
+                goal_pos = goal_poses[:, :3]  # (n, 3)
+                goal_quat = goal_poses[:, 3:7]  # (n, 4)
+
+                object_pos_w = env.scene["object"].data.root_pos_w[env_ids]  # (n, 3)
+                object_quat_w = env.scene["object"].data.root_quat_w[env_ids]  # (n, 4)
+
+                if use_point_cloud:
+                    # Point cloud mode: compute mean point error against goal point cloud
+                    points_local = trajectory_manager.points_local  # (num_envs, P, 3)
+                    if points_local is not None:
+                        pts = points_local[env_ids]  # (n, P, 3)
+                        goal_pts_w = quat_apply(
+                            goal_quat.unsqueeze(1).expand_as(pts), pts
+                        ) + goal_pos.unsqueeze(1)  # (n, P, 3)
+                        curr_pts_w = quat_apply(
+                            object_quat_w.unsqueeze(1).expand_as(pts), pts
+                        ) + object_pos_w.unsqueeze(1)  # (n, P, 3)
+                        mean_errors = (curr_pts_w - goal_pts_w).norm(dim=-1).mean(dim=-1)  # (n,)
+                        at_goal = mean_errors < effective_pc_tol
+                    else:
+                        at_goal = torch.zeros(len(env_ids), dtype=torch.bool, device=env.device)
+                else:
+                    # Pose mode: position + rotation error against final goal
+                    pos_errors = (object_pos_w - goal_pos).norm(dim=-1)  # (n,)
+                    rot_errors = quat_error_magnitude(object_quat_w, goal_quat)  # (n,)
+                    at_goal = (pos_errors < effective_pos_tol) & (rot_errors < effective_rot_tol)
             
             # Promote only if episode timed out (completed full trajectory) AND object is at goal
             if hasattr(env, 'reset_time_outs') and env.reset_time_outs is not None:
