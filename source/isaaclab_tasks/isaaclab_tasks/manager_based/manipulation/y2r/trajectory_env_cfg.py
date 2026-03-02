@@ -920,6 +920,11 @@ def _build_rewards_cfg(cfg: Y2RConfig, terminations_cfg=None):
             },
         )
 
+        timeout_bonus = RewTerm(
+            func=mdp.timeout_bonus,
+            weight=cfg.rewards.timeout_bonus.weight,
+        )
+
     return RewardsCfg()
 
 

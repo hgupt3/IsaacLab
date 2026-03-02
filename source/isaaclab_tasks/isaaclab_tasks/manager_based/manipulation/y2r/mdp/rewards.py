@@ -908,6 +908,17 @@ def trajectory_success(
     return reward
 
 
+def timeout_bonus(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """One-time bonus on the step where the episode naturally times out.
+
+    Returns 1.0 for envs whose episode just reached the end of the trajectory,
+    0.0 otherwise. No goal or success check — purely rewards survival.
+    """
+    tm = env.trajectory_manager
+    is_timeout = (env.episode_length_buf * env.step_dt) >= tm.t_episode_end
+    return is_timeout.float()
+
+
 def _update_release_success_latch(env, success_now: torch.Tensor):
     """Latch whether each env achieved goal at least once during release."""
     phase = _get_cached_phase(env)

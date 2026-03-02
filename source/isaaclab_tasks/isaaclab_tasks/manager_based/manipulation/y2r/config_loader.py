@@ -352,6 +352,7 @@ class RewardsConfig:
     finger_release: RewardConfig
     finger_regularizer: RewardConfig
     object_stillness: RewardConfig
+    timeout_bonus: RewardConfig
 
 
 @dataclass

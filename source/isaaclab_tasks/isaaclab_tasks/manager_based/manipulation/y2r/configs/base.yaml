@@ -347,6 +347,10 @@ rewards:
       lin_std: 0.02               # Linear velocity std (m/s)
       ang_std: 0.2                # Angular velocity std (rad/s)
 
+  # Large one-time bonus for surviving to episode timeout (completing the full trajectory)
+  timeout_bonus:
+    weight: 100.0
+
 # ==============================================================================
 # TERMINATIONS
 # ==============================================================================
@@ -374,7 +378,7 @@ curriculum:
     
   # Step-based scheduler (set step_interval to null to disable)
   scheduler: 
-    step_interval: 50000        # Floor increases at this interval
+    step_interval: 75000        # Floor increases at this interval
     use_performance: true       # Performance can still advance faster than floor
     
   # Tolerances to advance difficulty level
