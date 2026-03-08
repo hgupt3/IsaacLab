@@ -106,10 +106,11 @@ class DistillAgent(A2CAgent):
         self.distill_lr = float(self.distill_config["learning_rate"])
         self.distill_grad_norm = self.distill_config["grad_norm"]
         self.max_distill_iters = self.distill_config["max_iterations"]
-        # Override save_freq from parent with distillation-specific value
-        self.save_freq = self.distill_config["save_frequency"]
-        # save_best_after: don't save best until this many epochs (avoid early noise)
-        self.save_best_after = self.distill_config["save_best_after"]
+        # DAgger overrides save settings from distillation: section.
+        # Hybrid uses the parent PPO values from config: section (already set by A2CAgent).
+        if self.distill_mode == "dagger":
+            self.save_freq = self.distill_config["save_frequency"]
+            self.save_best_after = self.distill_config["save_best_after"]
 
         # DaGGer
         self.beta = self.distill_config["beta"]
@@ -121,7 +122,6 @@ class DistillAgent(A2CAgent):
         self.lambda_d_min = None
         self.lambda_d_anneal_epochs = None
         self.hybrid_lr_gate_lambda = None
-        self.dagger_loss_coef = float(self.distill_config["dagger_loss_coef"])
         if self.distill_mode == "hybrid":
             self.lambda_d_initial = float(self.distill_config["lambda_d_initial"])
             self.lambda_d_min = float(self.distill_config["lambda_d_min"])
@@ -129,26 +129,23 @@ class DistillAgent(A2CAgent):
             self.hybrid_lr_gate_lambda = float(self.distill_config["adaptive_lr_gate_lambda_ppo"])
             if self.lambda_d_anneal_epochs <= 0:
                 raise ValueError("distillation.lambda_d_anneal_epochs must be > 0 in hybrid mode.")
-            if not (0.0 <= self.lambda_d_min <= self.lambda_d_initial <= 1.0):
+            if not (0.0 <= self.lambda_d_min <= self.lambda_d_initial):
                 raise ValueError(
                     "distillation.lambda_d_min and lambda_d_initial must satisfy "
-                    "0.0 <= lambda_d_min <= lambda_d_initial <= 1.0."
+                    "0.0 <= lambda_d_min <= lambda_d_initial."
                 )
             if not (0.0 <= self.hybrid_lr_gate_lambda <= 1.0):
                 raise ValueError("distillation.adaptive_lr_gate_lambda_ppo must be in [0, 1].")
             self.lambda_d = self.lambda_d_initial
-            self.lambda_ppo = 1.0 - self.lambda_d
+            self.lambda_ppo = 1.0  # Fixed — lambda_d is an independent BC multiplier
+            # EMA for auto-balancing BC loss to PPO loss scale
+            self._ema_ppo = None  # initialized from first minibatch
+            self._ema_bc = None
+            self._ema_momentum = 0.999
         else:
             self.lambda_d = None
             self.lambda_ppo = None
 
-        # Debug depth video recording
-        self.debug_depth_video = self.distill_config["debug_depth_video"]
-        self.debug_depth_video_fps = self.distill_config["debug_depth_video_fps"]
-        self.debug_depth_video_num_frames = self.distill_config["debug_depth_video_num_frames"]
-        self.depth_video_frames = []  # Accumulate frames for env 0
-        self.depth_video_saved = False  # Only save once
-        
         # DAgger uses distillation.* optimizer/scaler settings.
         # Hybrid uses the parent PPO optimizer/scheduler settings from params.config.
         if self.distill_mode == "dagger":
@@ -252,8 +249,9 @@ class DistillAgent(A2CAgent):
             print(f"  Grad norm: {self.distill_grad_norm}")
             print(f"  Max iterations: {self.max_distill_iters}")
         else:
-            print(f"  Lambda schedule: initial={self.lambda_d_initial}, min={self.lambda_d_min}, anneal_epochs={self.lambda_d_anneal_epochs}")
-            print(f"  Adaptive LR gate: lambda_ppo >= {self.hybrid_lr_gate_lambda}")
+            print(f"  Lambda_d schedule: initial={self.lambda_d_initial}, min={self.lambda_d_min}, anneal_epochs={self.lambda_d_anneal_epochs}")
+            print(f"  BC auto-balanced to PPO scale (EMA momentum={self._ema_momentum})")
+            print(f"  Adaptive LR gate: effective_ppo_frac >= {self.hybrid_lr_gate_lambda}")
             print(f"  PPO learning rate: {self.last_lr}")
             print(f"  Max epochs: {self.max_epochs}")
         print(f"  Save frequency: {self.save_freq}")
@@ -262,8 +260,6 @@ class DistillAgent(A2CAgent):
         print(f"  Normalize input (RL-Games): {self.normalize_input}")
         print(f"  Distill value: {self.distill_value}" + (f" (coef={self.distill_value_coef})" if self.distill_value else ""))
         print("  Depth augmentation: handled inside student model (depth_resnet_student)")
-        if self.debug_depth_video:
-            print(f"  Depth video recording: ENABLED (fps={self.debug_depth_video_fps}, num_frames={self.debug_depth_video_num_frames})")
         if self.is_rnn:
             print(f"  RNN enabled:")
             print(f"    seq_length: {self.seq_length}")
@@ -389,6 +385,11 @@ class DistillAgent(A2CAgent):
         self._set_apply_depth_aug(True)
         self._set_student_obs_rms_update(True)
 
+        # Use RL-Games grad sync infrastructure (trancate_gradients_and_step)
+        # which handles multi-GPU all_reduce, grad clipping, and scaler step/update.
+        self.truncate_grads = True
+        self.grad_norm = self.distill_grad_norm
+
         log_counter = 0
         
         print(f"Starting distillation for {self.max_distill_iters} iterations...")
@@ -488,12 +489,13 @@ class DistillAgent(A2CAgent):
                 
                 # Only backward every seq_length steps
                 if (log_counter + 1) % self.seq_length == 0:
-                    self.optimizer.zero_grad()
+                    if self.multi_gpu:
+                        self.optimizer.zero_grad()
+                    else:
+                        for param in self.model.parameters():
+                            param.grad = None
                     self.scaler.scale(self.accumulated_loss).backward()
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.distill_grad_norm)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
+                    self.trancate_gradients_and_step()
                     
                     # Detach hidden states to truncate BPTT
                     if self.rnn_states is not None:
@@ -503,12 +505,13 @@ class DistillAgent(A2CAgent):
                     self.accumulated_loss = None
             else:
                 # Non-RNN: backward every step
-                self.optimizer.zero_grad()
+                if self.multi_gpu:
+                    self.optimizer.zero_grad()
+                else:
+                    for param in self.model.parameters():
+                        param.grad = None
                 self.scaler.scale(total_loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.distill_grad_norm)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                self.trancate_gradients_and_step()
             
             # ===== Choose actions based on fixed env assignment =====
             # teacher_env_mask: True = use teacher, False = use student
@@ -535,14 +538,7 @@ class DistillAgent(A2CAgent):
                                             for name in self.reward_term_names}
                 print(f"[DEBUG] Tracking {num_terms} reward terms: {self.reward_term_names}")
             
-            self.obs, rewards, self.dones, infos = self.env_step(stepping_actions)
-            
-            # Accumulate post-augmentation depth frame for video recording (env 0 only)
-            if self.debug_depth_video and not self.depth_video_saved:
-                self._accumulate_depth_frame_from_model()
-                # Save when we have enough frames
-                if len(self.depth_video_frames) >= self.debug_depth_video_num_frames:
-                    self._save_depth_video()
+            self.obs, rewards, _intr_rewards, self.dones, infos = self.env_step(stepping_actions)
             
             # AFTER step: accumulate per-term rewards (step_reward has raw values from this step)
             # step_reward shape: (num_envs, num_terms), _step_reward[:, idx] = value / dt
@@ -700,12 +696,13 @@ class DistillAgent(A2CAgent):
                 # For RNN: flush accumulated loss before resetting states (like DEXTRAH)
                 # This ensures we don't lose gradients from partial sequences
                 if self.is_rnn and self.accumulated_loss is not None:
-                    self.optimizer.zero_grad()
+                    if self.multi_gpu:
+                        self.optimizer.zero_grad()
+                    else:
+                        for param in self.model.parameters():
+                            param.grad = None
                     self.scaler.scale(self.accumulated_loss).backward()
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.distill_grad_norm)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
+                    self.trancate_gradients_and_step()
                     
                     # Detach hidden states
                     if self.rnn_states is not None:
@@ -1125,14 +1122,9 @@ class DistillAgent(A2CAgent):
                     for name in self.reward_term_names
                 }
 
-            self.obs, rewards, self.dones, infos = self.env_step(res_dict["actions"])
+            self.obs, rewards, _intr_rewards, self.dones, infos = self.env_step(res_dict["actions"])
             step_time_end = time.perf_counter()
             step_time += (step_time_end - step_time_start)
-
-            if self.debug_depth_video and not self.depth_video_saved:
-                self._accumulate_depth_frame_from_model()
-                if len(self.depth_video_frames) >= self.debug_depth_video_num_frames:
-                    self._save_depth_video()
 
             shaped_rewards = self.rewards_shaper(rewards)
             if self.value_bootstrap and "time_outs" in infos:
@@ -1310,7 +1302,7 @@ class DistillAgent(A2CAgent):
             if self.zero_rnn_on_done:
                 batch_dict["dones"] = input_dict["dones"]
 
-        with torch.cuda.amp.autocast(enabled=self.mixed_precision):
+        with torch.amp.autocast('cuda', enabled=self.mixed_precision):
             res_dict = self.model(batch_dict)
             action_log_probs = res_dict["prev_neglogp"]
             values = res_dict["values"]
@@ -1340,9 +1332,21 @@ class DistillAgent(A2CAgent):
 
             ppo_loss = a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
 
-            # Paper-faithful hybrid imitation term: plain MSE on expert action means.
+            # Auto-balanced hybrid imitation term: EMA-normalize BC to PPO scale
+            # so lambda_d directly controls the relative contribution.
             bc_mse_loss = torch.nn.functional.mse_loss(mu, teacher_mus_batch.detach())
-            bc_loss = self.dagger_loss_coef * bc_mse_loss
+            with torch.no_grad():
+                ppo_val = ppo_loss.detach().abs().item()
+                bc_val = bc_mse_loss.detach().abs().clamp(min=1e-8).item()
+                if self._ema_ppo is None:
+                    self._ema_ppo = ppo_val
+                    self._ema_bc = bc_val
+                else:
+                    m = self._ema_momentum
+                    self._ema_ppo = m * self._ema_ppo + (1 - m) * ppo_val
+                    self._ema_bc = m * self._ema_bc + (1 - m) * bc_val
+                auto_coef = self._ema_ppo / max(self._ema_bc, 1e-8)
+            bc_loss = auto_coef * bc_mse_loss
 
             loss = self.lambda_ppo * ppo_loss + self.lambda_d * bc_loss
 
@@ -1458,7 +1462,10 @@ class DistillAgent(A2CAgent):
                     if self.multi_gpu:
                         dist.all_reduce(kl, op=dist.ReduceOp.SUM)
                         av_kls /= self.world_size
-                    if self.lambda_ppo >= self.hybrid_lr_gate_lambda:
+                    # Gate LR adaptation: only update when PPO has enough relative influence.
+                    # effective_ppo_frac = 1/(1+lambda_d), e.g. lambda_d=2 → 0.33, lambda_d=0.1 → 0.91
+                    effective_ppo_frac = 1.0 / (1.0 + self.lambda_d)
+                    if effective_ppo_frac >= self.hybrid_lr_gate_lambda:
                         self.last_lr, self.entropy_coef = self.scheduler.update(
                             self.last_lr, self.entropy_coef, self.epoch_num, 0, av_kls.item()
                         )
@@ -1468,7 +1475,8 @@ class DistillAgent(A2CAgent):
             if self.multi_gpu:
                 dist.all_reduce(av_kls, op=dist.ReduceOp.SUM)
                 av_kls /= self.world_size
-            if self.schedule_type == "standard" and self.lambda_ppo >= self.hybrid_lr_gate_lambda:
+            effective_ppo_frac = 1.0 / (1.0 + self.lambda_d)
+            if self.schedule_type == "standard" and effective_ppo_frac >= self.hybrid_lr_gate_lambda:
                 self.last_lr, self.entropy_coef = self.scheduler.update(
                     self.last_lr, self.entropy_coef, self.epoch_num, 0, av_kls.item()
                 )
@@ -1527,7 +1535,6 @@ class DistillAgent(A2CAgent):
             anneal_progress = min(1.0, float(epoch_num) / float(self.lambda_d_anneal_epochs))
             lambda_span = self.lambda_d_initial - self.lambda_d_min
             self.lambda_d = self.lambda_d_initial - lambda_span * anneal_progress
-            self.lambda_ppo = 1.0 - self.lambda_d
 
             (
                 step_time,
@@ -1591,19 +1598,18 @@ class DistillAgent(A2CAgent):
                 if len(b_losses) > 0:
                     self.writer.add_scalar("losses/bounds_loss", torch_ext.mean_list(b_losses).item(), frame)
                 self.writer.add_scalar("info/lambda_d", self.lambda_d, frame)
-                self.writer.add_scalar("info/lambda_ppo", self.lambda_ppo, frame)
+                auto_coef = self._ema_ppo / max(self._ema_bc, 1e-8) if self._ema_ppo is not None else 0.0
+                self.writer.add_scalar("info/bc_auto_coef", auto_coef, frame)
                 ppo_loss_mean = torch_ext.mean_list(ppo_losses).item()
                 bc_mse_loss_mean = torch_ext.mean_list(bc_mse_losses).item()
-                bc_loss_pre_coef = bc_mse_loss_mean
-                bc_loss_post_coef = self.dagger_loss_coef * bc_loss_pre_coef
+                bc_loss_scaled = auto_coef * bc_mse_loss_mean
                 ppo_loss_weighted = self.lambda_ppo * ppo_loss_mean
-                bc_loss_weighted = self.lambda_d * bc_loss_post_coef
+                bc_loss_weighted = self.lambda_d * bc_loss_scaled
                 hybrid_total_loss = ppo_loss_weighted + bc_loss_weighted
 
                 self.writer.add_scalar("losses/ppo_loss", ppo_loss_mean, frame)
                 self.writer.add_scalar("losses/bc_mse_loss", bc_mse_loss_mean, frame)
-                self.writer.add_scalar("losses/bc_loss_pre_coef", bc_loss_pre_coef, frame)
-                self.writer.add_scalar("losses/bc_loss_post_coef", bc_loss_post_coef, frame)
+                self.writer.add_scalar("losses/bc_loss_scaled", bc_loss_scaled, frame)
                 self.writer.add_scalar("losses/ppo_loss_weighted", ppo_loss_weighted, frame)
                 self.writer.add_scalar("losses/bc_loss_weighted", bc_loss_weighted, frame)
                 self.writer.add_scalar("losses/loss_total", hybrid_total_loss, frame)
@@ -1713,65 +1719,6 @@ class DistillAgent(A2CAgent):
             if should_exit:
                 return self.last_mean_rewards, epoch_num
     
-    def _accumulate_depth_frame_from_model(self):
-        """Accumulate POST-AUGMENTATION depth frame for env 0 from student model.
-        
-        The student model stores `last_depth_img` after applying depth augmentation
-        during forward pass. This captures the augmented depth that the model sees.
-        """
-        # Access post-augmentation depth from student model
-        # Model structure: self.model.a2c_network is the Network instance
-        try:
-            last_depth = self.model.a2c_network.last_depth_img
-            if last_depth is None:
-                return
-        except AttributeError:
-            # Model doesn't have last_depth_img (shouldn't happen with updated model)
-            return
-        
-        # last_depth shape: (B, 1, H, W) - get env 0
-        depth_img = last_depth[0, 0].cpu().numpy()  # (H, W)
-        
-        # Convert to RGB using viridis colormap for visualization
-        import matplotlib.cm as cm
-        depth_colored = cm.viridis(depth_img)[:, :, :3]  # Drop alpha
-        depth_rgb = (depth_colored * 255).astype(np.uint8)
-        
-        self.depth_video_frames.append(depth_rgb)
-    
-    def _save_depth_video(self):
-        """Save accumulated depth frames as video."""
-        if len(self.depth_video_frames) == 0:
-            return
-        
-        try:
-            import imageio
-        except ImportError:
-            print("[WARNING] imageio not installed, cannot save depth video. Install with: pip install imageio[ffmpeg]")
-            self.depth_video_saved = True
-            return
-        
-        # Create output directory
-        video_dir = os.path.join(self.nn_dir, 'depth_videos')
-        os.makedirs(video_dir, exist_ok=True)
-        
-        # Save video
-        video_path = os.path.join(video_dir, 'depth_video.mp4')
-        
-        print(f"\n[DepthVideo] Saving {len(self.depth_video_frames)} frames to {video_path}")
-        
-        # Use imageio to write video
-        writer = imageio.get_writer(video_path, fps=self.debug_depth_video_fps, codec='libx264', quality=8)
-        for frame in self.depth_video_frames:
-            writer.append_data(frame)
-        writer.close()
-        
-        print(f"[DepthVideo] Saved depth video: {video_path}")
-        
-        # Mark as saved
-        self.depth_video_frames = []
-        self.depth_video_saved = True
-
 
 # Register the agent with RL-Games
 def register_distill_agent():

@@ -171,15 +171,9 @@ params:
     distill_value: False          # Distill teacher's value function (warm critic for RL fine-tuning)
     distill_value_coef: 1.0       # Coefficient for value distillation loss
 
-    # Hybrid (PHP) schedule
-    dagger_loss_coef: 10.0        # Paper knob: coefficient for imitation term in hybrid PPO+BC loss
+    # Hybrid (PHP) schedule — BC loss is auto-balanced to PPO scale via EMA,
+    # so lambda_d directly controls relative BC influence (1.0 = equal, 2.0 = 2x BC).
     lambda_d_initial: 1.0
     lambda_d_min: 0.1
     lambda_d_anneal_epochs: 10000
     adaptive_lr_gate_lambda_ppo: 0.1
-
-    # Debug: save depth video for env 0
-    # Output path: logs/.../nn/depth_video.mp4
-    debug_depth_video: False
-    debug_depth_video_fps: 30
-    debug_depth_video_num_frames: 100  # Record this many frames then save

@@ -218,7 +218,7 @@ rewards:
       rot_neg_std: 1.0             # Rotation penalty growth rate
     
   trajectory_success:
-    weight: 15.0
+    weight: 25.0
     params:
       phases: [release]               # Active only in release phase
       use_hand_pose_gate: true        # Apply hand pose gate from hand_pose_following
@@ -349,7 +349,7 @@ rewards:
 
   # Large one-time bonus for surviving to episode timeout (completing the full trajectory)
   timeout_bonus:
-    weight: 100.0
+    weight: 200.0
 
 # ==============================================================================
 # TERMINATIONS
@@ -378,7 +378,7 @@ curriculum:
     
   # Step-based scheduler (set step_interval to null to disable)
   scheduler: 
-    step_interval: 75000        # Floor increases at this interval
+    step_interval: 50000        # Floor increases at this interval
     use_performance: true       # Performance can still advance faster than floor
     
   # Tolerances to advance difficulty level

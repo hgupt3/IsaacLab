@@ -136,18 +136,18 @@ params:
     learning_rate: 3e-4
     lr_schedule: adaptive
     schedule_type: legacy
-    kl_threshold: 0.012
+    kl_threshold: 0.016
     score_to_win: 100000000
     max_epochs: 750000
-    save_best_after: 1000
-    save_frequency: 500
+    save_best_after: 100
+    save_frequency: 50
     print_stats: True
     grad_norm: 1.0
-    entropy_coef: 0.0015
+    entropy_coef: 0.0025
     truncate_grads: True
     e_clip: 0.2
-    horizon_length: 32
-    minibatch_size: 8192
+    horizon_length: 16
+    minibatch_size: 16384
     mini_epochs: 4
     critic_coef: 4
     freeze_critic: False
@@ -172,7 +172,7 @@ params:
   # Note: Depth augmentation is handled INSIDE the model (see network.depth_augmentation)
   # ==========================================================================
   distillation:
-    mode: dagger
+    mode: hybrid # 'dagger' or 'hybrid'
 
     # DAgger training (mode: dagger only)
     learning_rate: 1e-4           # Adam lr for DAgger optimizer
@@ -184,15 +184,9 @@ params:
     distill_value: True           # Distill teacher's value function (warm critic for RL fine-tuning)
     distill_value_coef: 1.0       # Coefficient for value distillation loss
 
-    # Hybrid (PHP) schedule
-    dagger_loss_coef: 1.0        # Paper knob: coefficient for imitation term in hybrid PPO+BC loss
-    lambda_d_initial: 1.0
-    lambda_d_min: 0.1
-    lambda_d_anneal_epochs: 50000
+    # Hybrid (PHP) schedule — BC loss is auto-balanced to PPO scale via EMA,
+    # so lambda_d directly controls relative BC influence (1.0 = equal, 2.0 = 2x BC).
+    lambda_d_initial: 10.0
+    lambda_d_min: 0.01
+    lambda_d_anneal_epochs: 1000
     adaptive_lr_gate_lambda_ppo: 0.1
-    
-    # Debug: save depth video for env 0
-    # Output path: logs/.../nn/depth_video.mp4
-    debug_depth_video: False
-    debug_depth_video_fps: 30
-    debug_depth_video_num_frames: 100  # Record this many frames then save
