@@ -5,6 +5,10 @@
 # Enables student-specific visualization markers.
 # ==============================================================================
 
+# Re-enable student mode (play.yaml disables it for teacher play)
+mode:
+  use_student_mode: true
+
 # Student-specific visualization
 visualization:
   targets: false
