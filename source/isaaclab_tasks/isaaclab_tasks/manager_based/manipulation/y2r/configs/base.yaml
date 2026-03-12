@@ -532,7 +532,7 @@ visibility_camera:
 wrist_camera:
   width: 96                     # Gemini 305 native 16:10 aspect ratio (1280:800)
   height: 60
-  focal_length: 3.19            # 88° HFOV: 6.17 / (2×tan(44°))
+  focal_length: 3.69            # 88° HFOV: 6.17 / (2×tan(44°))
   horizontal_aperture: 6.17     # Virtual sensor width (mm)
   clipping_range: [0.04, 0.5]   # Gemini 305 depth range: 4–100 cm
 

@@ -37,6 +37,7 @@ parser.add_argument(
     help="When no checkpoint provided, use the last saved model. Otherwise use the best saved model.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument("--record", type=str, default=None, help="Record obs/actions/joint_pos to npz file for 1 episode.")
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -62,6 +63,7 @@ import time
 import torch
 
 import carb
+import numpy as np
 import omni
 
 from rl_games.common import env_configurations, vecenv
@@ -220,6 +222,47 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     dt = env.unwrapped.step_dt
 
+    # ── Recording setup ──────────────────────────────────────────────────
+    recording = args_cli.record is not None
+    if recording:
+        recorded_obs = []
+        recorded_actions = []
+        recorded_joint_pos = []
+
+        # Extract metadata from env for the npz
+        unwrapped = env.unwrapped
+        robot = unwrapped.scene["robot"]
+        y2r_cfg = env_cfg.y2r_cfg
+
+        # Action term metadata
+        action_term = unwrapped.action_manager._terms["action"]
+        rec_pca_matrix = action_term._pca_matrix.cpu().numpy()
+        rec_action_scale = float(action_term._scale) if isinstance(action_term._scale, float) else action_term._scale.cpu().numpy()
+        rec_arm_dim = action_term._arm_dim
+        rec_eigen_dim = action_term._eigen_dim
+        rec_hand_dim = action_term._hand_dim
+
+        # Default joint positions
+        rec_default_joint_pos = robot.data.default_joint_pos[0].cpu().numpy()
+        rec_joint_names = list(robot.data.joint_names)
+
+        # Obs group info from the wrapper
+        obs_group_list = obs_groups["obs"] if obs_groups else ["policy"]
+        obs_space = unwrapped.single_observation_space
+        obs_group_names = []
+        obs_group_sizes = []
+        for grp in obs_group_list:
+            obs_group_names.append(grp)
+            obs_group_sizes.append(obs_space[grp].shape[0])
+
+        # Control Hz
+        rec_control_hz = 1.0 / dt
+
+        print(f"[INFO] Recording enabled → {args_cli.record}")
+        print(f"[INFO]   obs groups: {list(zip(obs_group_names, obs_group_sizes))}")
+        print(f"[INFO]   action_dim: {rec_arm_dim + rec_eigen_dim + rec_hand_dim}, action_scale: {rec_action_scale}")
+        print(f"[INFO]   control_hz: {rec_control_hz:.1f}")
+
     # reset environment (use enable_grad to allow tensor modifications)
     with torch.enable_grad():
         obs = env.reset()
@@ -271,8 +314,32 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             obs = agent.obs_to_torch(obs)
             # agent stepping
             actions = agent.get_action(obs, is_deterministic=agent.is_deterministic)
+
+            # Record BEFORE env.step — captures pre-reset state
+            if recording:
+                # obs["obs"] is the concatenated observation vector after obs_to_torch
+                obs_tensor = obs["obs"] if isinstance(obs, dict) else obs
+                recorded_obs.append(obs_tensor[0].cpu().numpy().copy())
+                recorded_actions.append(actions[0].cpu().numpy().copy())
+                recorded_joint_pos.append(
+                    env.unwrapped.scene["robot"].data.joint_pos[0].cpu().numpy().copy()
+                )
+
             # env stepping
             obs, _, dones, _ = env.step(actions)
+
+            # Check for episode termination during recording
+            if recording and dones.numel() > 0 and dones[0]:
+                print(f"[INFO] Episode done after {len(recorded_actions)} steps. Saving recording...")
+                _save_recording(
+                    args_cli.record,
+                    recorded_obs, recorded_actions, recorded_joint_pos,
+                    rec_pca_matrix, rec_action_scale, rec_arm_dim, rec_eigen_dim, rec_hand_dim,
+                    rec_default_joint_pos, rec_joint_names,
+                    obs_group_names, obs_group_sizes, rec_control_hz,
+                    clip_actions,
+                )
+                break
 
             # perform operations for terminated episodes
             if len(dones) > 0:
@@ -292,10 +359,46 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             time.sleep(sleep_time)
 
     # cleanup keyboard subscription
-    kb_sub.unsubscribe()
+    kb_input.unsubscribe_to_keyboard_events(keyboard, kb_sub)
 
     # close the simulator
     env.close()
+
+
+def _save_recording(
+    out_path, obs_list, actions_list, joint_pos_list,
+    pca_matrix, action_scale, arm_dim, eigen_dim, hand_dim,
+    default_joint_pos, joint_names,
+    obs_group_names, obs_group_sizes, control_hz,
+    clip_actions,
+):
+    """Save recorded episode data to npz."""
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+
+    save_dict = {
+        "obs": np.array(obs_list),
+        "actions": np.array(actions_list),
+        "joint_pos": np.array(joint_pos_list),
+        "pca_matrix": pca_matrix,
+        "action_scale": np.array([action_scale]) if isinstance(action_scale, float) else action_scale,
+        "arm_dim": np.array([arm_dim]),
+        "eigen_dim": np.array([eigen_dim]),
+        "hand_dim": np.array([hand_dim]),
+        "default_joint_pos": default_joint_pos,
+        "joint_names": np.array(joint_names),
+        "obs_group_names": np.array(obs_group_names),
+        "obs_group_sizes": np.array(obs_group_sizes),
+        "control_hz": np.array([control_hz]),
+        "clip_actions": np.array([clip_actions]),
+    }
+
+    np.savez(out_path, **save_dict)
+    print(f"[SAVED] {out_path}")
+    print(f"  Steps: {len(actions_list)}")
+    print(f"  obs shape: {save_dict['obs'].shape}")
+    print(f"  actions shape: {save_dict['actions'].shape}")
+    print(f"  joint_pos shape: {save_dict['joint_pos'].shape}")
+    print(f"  obs groups: {list(zip(obs_group_names, obs_group_sizes))}")
 
 
 if __name__ == "__main__":

@@ -768,6 +768,13 @@ def get_config_file_paths(mode: str | None = None, task: str | None = None, robo
         ])
     elif mode == "keyboard":
         files.append(config_dir / "layers" / "keyboard.yaml")
+    elif mode == "dump":
+        files.extend([
+            config_dir / "layers" / "student.yaml",
+            config_dir / "layers" / "play.yaml",
+            config_dir / "layers" / "student_play.yaml",
+            config_dir / "layers" / "dump.yaml",
+        ])
     # mode == "train" uses base only
 
     # Task layer (optional, applied last)
@@ -811,6 +818,11 @@ def get_config(mode: str | None = None, task: str | None = None, robot: str | No
         cfg = _deep_merge(cfg, _load_yaml("layers/student_play"))
     elif mode == "keyboard":
         cfg = _deep_merge(cfg, _load_yaml("layers/keyboard"))
+    elif mode == "dump":
+        cfg = _deep_merge(cfg, _load_yaml("layers/student"))
+        cfg = _deep_merge(cfg, _load_yaml("layers/play"))
+        cfg = _deep_merge(cfg, _load_yaml("layers/student_play"))
+        cfg = _deep_merge(cfg, _load_yaml("layers/dump"))
     # mode == "train" uses base only
 
     # Task layer (optional, applied last)

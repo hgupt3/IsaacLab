@@ -10,8 +10,11 @@ simulation:
 
 terminations:
   trajectory_deviation:
-    position_threshold: [2.00, 2.00]
-    rotation_threshold: [3.14, 3.14]
+    position_threshold: [999.0, 999.0]
+    rotation_threshold: [999.0, 999.0]
+  hand_pose_deviation:
+    position_threshold: [999.0, 999.0]
+    rotation_threshold: [999.0, 999.0]
 
 visualization:
   pose_axes: true
@@ -20,7 +23,19 @@ visualization:
   waypoint_region: true
   goal_region: true
   env_ids: null
-  debug_print_rewards: true
+  debug_print_rewards: false
+
+mode:
+  use_student_mode: true
+
+trajectory:
+  segments:
+    - name: "hold"
+      type: "waypoint"
+      pose: null
+      duration: 10000.0
+      hand_coupling_weights:
+        full: 1.0
 
 procedural_objects:
   generation:

@@ -35,6 +35,7 @@ from isaaclab.app import AppLauncher
 parser = argparse.ArgumentParser(description="Keyboard debug for palm frame exploration.")
 parser.add_argument("--task", type=str, default="Isaac-Trajectory-UR5e-Leap-v0", help="Task name.")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments.")
+parser.add_argument("--depth", action="store_true", help="Enable wrist depth camera. Press P to save images.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 
@@ -118,7 +119,45 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Force single environment for keyboard control
     env_cfg.scene.num_envs = 1
     env_cfg.sim.device = args_cli.device if args_cli.device else "cuda:0"
-    
+
+    # Inject wrist depth camera if --depth requested
+    wrist_camera_enabled = args_cli.depth
+    if wrist_camera_enabled:
+        from scipy.spatial.transform import Rotation as RotScipy
+        from isaaclab.sensors import TiledCameraCfg
+        from isaaclab.sim import PinholeCameraCfg
+
+        wrist_cfg = env_cfg.y2r_cfg.wrist_camera
+        rot_euler = wrist_cfg.offset.rot
+        # Isaac Lab opengl convention: swap Y/Z and negate
+        rot_swapped = (rot_euler[0], rot_euler[2], -rot_euler[1])
+        r_cam = RotScipy.from_euler('xyz', rot_swapped, degrees=True)
+        quat_xyzw = r_cam.as_quat()
+        quat_wxyz = (float(quat_xyzw[3]), float(quat_xyzw[0]), float(quat_xyzw[1]), float(quat_xyzw[2]))
+        pos = tuple(float(x) for x in wrist_cfg.offset.pos)
+
+        # Detect prim path based on robot type
+        palm_body = env_cfg.y2r_cfg.robot.palm_body_name
+        if "ur5e" in palm_body:
+            cam_prim = "{ENV_REGEX_NS}/Robot/ur5e_link_6/wrist_camera"
+        else:
+            cam_prim = "{ENV_REGEX_NS}/Robot/ee_link/palm_link/wrist_camera"
+
+        env_cfg.scene.wrist_camera = TiledCameraCfg(
+            prim_path=cam_prim,
+            offset=TiledCameraCfg.OffsetCfg(pos=pos, rot=quat_wxyz, convention="opengl"),
+            data_types=["distance_to_image_plane"],
+            spawn=PinholeCameraCfg(
+                focal_length=wrist_cfg.focal_length,
+                horizontal_aperture=wrist_cfg.horizontal_aperture,
+                clipping_range=wrist_cfg.clipping_range,
+            ),
+            width=wrist_cfg.width,
+            height=wrist_cfg.height,
+        )
+        print(f"[INFO] Wrist depth camera enabled: {wrist_cfg.width}x{wrist_cfg.height}, "
+              f"clip=[{wrist_cfg.clipping_range[0]}, {wrist_cfg.clipping_range[1]}]m")
+
     # Create environment
     print("[INFO] Creating environment...")
     env = gym.make(args_cli.task, cfg=env_cfg)
@@ -220,9 +259,74 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     )
     se3_keyboard = Se3Keyboard(se3_keyboard_cfg)
     
+    # ==================== OBSERVATION ORDER DIAGNOSTIC ====================
+    print("\n" + "=" * 80)
+    print("OBSERVATION ORDER DIAGNOSTIC")
+    print("=" * 80)
+
+    obs_mgr = unwrapped_env.observation_manager
+    print(f"\nObservation groups: {list(obs_mgr.group_obs_term_dim.keys())}")
+    for group_name, term_dims in obs_mgr.group_obs_term_dim.items():
+        print(f"\n  [{group_name}] term_dims={term_dims}")
+
+    # Print raw joint_pos from the default SceneEntityCfg (what mdp.joint_pos returns)
+    raw_jp = robot.data.joint_pos[0].cpu().tolist()
+    print(f"\n[mdp.joint_pos raw output] robot.data.joint_pos[0] (PhysX native order):")
+    for i, val in enumerate(raw_jp):
+        name = physx_joint_names[i]
+        print(f"  [{i:2d}] {name:16s}: {val:+.4f}")
+
+    # Print hand eigen (canonical order via get_allegro_hand_joint_ids)
+    from isaaclab_tasks.manager_based.manipulation.y2r.mdp.actions import get_allegro_hand_joint_ids
+    eigen_ids = get_allegro_hand_joint_ids(unwrapped_env, robot)
+    hand_canonical = robot.data.joint_pos[0, eigen_ids].cpu().tolist()
+    default_canonical = robot.data.default_joint_pos[0, eigen_ids].cpu().tolist()
+    print(f"\n[allegro_hand_eigen_b] hand joints in CANONICAL order (via get_allegro_hand_joint_ids):")
+    for i, (name, val, dflt) in enumerate(zip(hand_joint_names, hand_canonical, default_canonical)):
+        print(f"  [{i:2d}] {name:16s}: pos={val:+.4f}  default={dflt:+.4f}  delta={val-dflt:+.4f}")
+
     # Reset environment
     print("[INFO] Resetting environment...")
     obs, info = env.reset()
+
+    # Set unique joint positions so we can identify ordering
+    # Assign value = (joint_index + 1) * 0.01 for each PhysX joint
+    unique_pos = torch.zeros(1, 22, device=device)
+    for i in range(22):
+        unique_pos[0, i] = (i + 1) * 0.01  # 0.01, 0.02, ..., 0.22
+    robot.write_joint_state_to_sim(unique_pos, torch.zeros_like(unique_pos))
+    # Step physics so it takes effect
+    unwrapped_env.sim.step(render=False)
+    unwrapped_env.scene.update(dt=unwrapped_env.physics_dt)
+
+    print(f"\n[Set unique positions] PhysX joint i = (i+1)*0.01:")
+    for i, name in enumerate(physx_joint_names):
+        val = robot.data.joint_pos[0, i].item()
+        print(f"  PhysX[{i:2d}] {name:16s} = {val:.4f}")
+
+    all_obs = obs_mgr.compute()
+    for gname, gdata in all_obs.items():
+        if isinstance(gdata, dict):
+            continue
+        flat = gdata[0].cpu()
+        if "proprio" not in gname:
+            continue
+        print(f"\n[{gname} obs] shape={gdata.shape}")
+        jp = flat[:22].tolist()
+        print(f"  joint_pos (first 22 values) — match by value to PhysX index:")
+        for i, val in enumerate(jp):
+            # val ≈ (physx_idx+1)*0.01, so physx_idx ≈ round(val/0.01) - 1
+            physx_idx = round(val / 0.01) - 1
+            if 0 <= physx_idx < 22:
+                name = physx_joint_names[physx_idx]
+                print(f"    obs[{i:2d}] = {val:.6f} → PhysX[{physx_idx:2d}] = {name}")
+            else:
+                print(f"    obs[{i:2d}] = {val:.6f} → ???")
+        if flat.numel() >= 27:
+            eigen = flat[22:27].tolist()
+            print(f"  hand_eigen (22-26): {[f'{v:+.4f}' for v in eigen]}")
+
+    print("=" * 80 + "\n")
     
     # Initialize target pose (will be set after first sim step)
     target_pos_b = None  # (1, 3) - target position in base frame
@@ -252,6 +356,60 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Gripper key states (J = close, K = open) - track press/release for continuous control
     gripper_delta = [0.0]  # Mutable container for closure access
 
+    # Depth save state
+    save_depth_state = {"requested": False, "count": 0}
+
+    if wrist_camera_enabled:
+        import os
+        import numpy as np
+        from pathlib import Path as _Path
+        # keyboard.sh cds into IsaacLab/, so repo root is one level up from cwd
+        _repo_root = str(_Path.cwd().parent)
+        data_root = os.environ.get("Y2R_DATA_ROOT", _repo_root)
+        depth_save_dir = os.path.join(data_root, "debug", "sim_depth")
+        os.makedirs(depth_save_dir, exist_ok=True)
+        print(f"[INFO] Depth images will be saved to: {depth_save_dir}")
+
+    def _save_wrist_depth():
+        """Read wrist camera and save normalized depth as 16-bit PNG + colorized PNG."""
+        import numpy as np
+        import cv2
+
+        camera = unwrapped_env.scene.sensors["wrist_camera"]
+        depth_raw = camera.data.output["distance_to_image_plane"]  # (1, H, W, 1)
+        depth = depth_raw[0].squeeze(-1).cpu().numpy()  # (H, W) in meters
+
+        wrist_cfg = unwrapped_env.cfg.y2r_cfg.wrist_camera
+        near, far = wrist_cfg.clipping_range
+        depth_clamped = np.clip(depth, near, far)
+        depth_norm = (depth_clamped - near) / (far - near)  # [0, 1]
+
+        idx = save_depth_state["count"]
+
+        # Save raw normalized as 16-bit PNG (lossless, full precision)
+        depth_u16 = (depth_norm * 65535).astype(np.uint16)
+        raw_path = os.path.join(depth_save_dir, f"sim_depth_{idx:04d}_raw.png")
+        cv2.imwrite(raw_path, depth_u16)
+
+        # Save colorized version for easy viewing
+        import matplotlib.cm as cm
+        colored = (cm.viridis(depth_norm)[:, :, :3] * 255).astype(np.uint8)
+        colored_bgr = cv2.cvtColor(colored, cv2.COLOR_RGB2BGR)
+        vis_path = os.path.join(depth_save_dir, f"sim_depth_{idx:04d}_vis.png")
+        cv2.imwrite(vis_path, colored_bgr)
+
+        # Also save the raw float32 for exact numerical comparison
+        npy_path = os.path.join(depth_save_dir, f"sim_depth_{idx:04d}.npy")
+        np.save(npy_path, depth_norm)
+
+        save_depth_state["count"] += 1
+        print(f"  [DEPTH SAVED] #{idx}")
+        print(f"    Raw 16-bit : {raw_path}")
+        print(f"    Colorized  : {vis_path}")
+        print(f"    Float32 npy: {npy_path}")
+        print(f"    Shape: {depth_norm.shape}, range: [{depth_norm.min():.4f}, {depth_norm.max():.4f}]")
+        print(f"    Meters range: [{depth_clamped.min():.4f}, {depth_clamped.max():.4f}]")
+
     def on_keyboard_event(event, *args):
         """Handle J/K for joint control and Up/Down for mode cycling."""
         if event.type == carb.input.KeyboardEventType.KEY_PRESS:
@@ -267,6 +425,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 joint_mode[0] = (joint_mode[0] - 1) % num_modes
                 mode_name = joint_mode_names[joint_mode[0]]
                 print(f"  >> Joint mode: [{joint_mode[0]}] {mode_name}")
+            elif event.input.name == "P" and wrist_camera_enabled:
+                save_depth_state["requested"] = True
         elif event.type == carb.input.KeyboardEventType.KEY_RELEASE:
             if event.input.name == "J":
                 gripper_delta[0] -= 1.0
@@ -300,6 +460,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print("  J/K     - Close/Open (hold)")
     print("  Up/Down - Cycle joint mode")
     print("  R       - Reset to default pose")
+    if wrist_camera_enabled:
+        print("  P       - Save wrist depth image")
     print("  ESC     - Quit")
     print("")
     print("Joint modes (Up/Down to cycle):")
@@ -410,7 +572,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if hasattr(unwrapped_env, 'render_debug'):
             unwrapped_env.render_debug()
         step_count += 1
-        
+
+        # Save wrist depth on P keypress (after sim step so camera has fresh data)
+        if wrist_camera_enabled and save_depth_state["requested"]:
+            _save_wrist_depth()
+            save_depth_state["requested"] = False
+
         # Periodic status print
         current_time = time.time()
         if current_time - last_print_time >= print_interval:
