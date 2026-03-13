@@ -116,6 +116,10 @@ class DistillAgent(A2CAgent):
         self.beta = self.distill_config["beta"]
         self.distill_value = self.distill_config["distill_value"]
         self.distill_value_coef = float(self.distill_config["distill_value_coef"])
+        if self.distill_mode == "dagger":
+            self.loss_type = self.distill_config["loss_type"]
+            if self.loss_type not in ("weighted_l2", "mse"):
+                raise ValueError(f"Unsupported distillation.loss_type='{self.loss_type}'. Expected 'weighted_l2' or 'mse'.")
 
         # Hybrid (PHP) settings
         self.lambda_d_initial = None
@@ -138,6 +142,12 @@ class DistillAgent(A2CAgent):
                 raise ValueError("distillation.adaptive_lr_gate_lambda_ppo must be in [0, 1].")
             self.lambda_d = self.lambda_d_initial
             self.lambda_ppo = 1.0  # Fixed — lambda_d is an independent BC multiplier
+            # BC coefficient mode: "auto" (EMA-balanced) or "manual" (fixed multiplier)
+            self._bc_coef_mode = self.distill_config.get("bc_coef_mode", "auto")
+            if self._bc_coef_mode not in ("auto", "manual"):
+                raise ValueError(f"distillation.bc_coef_mode must be 'auto' or 'manual', got '{self._bc_coef_mode}'")
+            if self._bc_coef_mode == "manual":
+                self._manual_bc_coef = float(self.distill_config["bc_manual_coef"])
             # EMA for auto-balancing BC loss to PPO loss scale
             self._ema_ppo = None  # initialized from first minibatch
             self._ema_bc = None
@@ -245,6 +255,7 @@ class DistillAgent(A2CAgent):
         if self.distill_mode == "dagger":
             print(f"  Beta (teacher env ratio): {self.beta}")
             print(f"  Teacher envs: {num_teacher_envs}/{self.num_actors}")
+            print(f"  Loss type: {self.loss_type}")
             print(f"  Learning rate: {self.distill_lr}")
             print(f"  Grad norm: {self.distill_grad_norm}")
             print(f"  Max iterations: {self.max_distill_iters}")
@@ -319,7 +330,8 @@ class DistillAgent(A2CAgent):
         
         # Load weights
         print(f"Loading teacher weights from: {ckpt_path}")
-        checkpoint = torch_ext.load_checkpoint(ckpt_path)
+        checkpoint = torch.load(ckpt_path, weights_only=False, map_location=self.ppo_device)
+        print(f"=> loading checkpoint '{ckpt_path}'")
         checkpoint_model_state = checkpoint["model"]
         if any("._orig_mod." in key for key in checkpoint_model_state.keys()):
             print("[INFO] Teacher checkpoint contains torch.compile '_orig_mod' keys; remapping for load.")
@@ -348,7 +360,23 @@ class DistillAgent(A2CAgent):
         
         print("Teacher model built and loaded successfully!")
         return teacher_model
-    
+
+    def restore(self, fn, set_epoch=True):
+        """Override restore to map checkpoint tensors to the correct device.
+
+        RL-Games' default restore uses torch.load without map_location, so all
+        tensors land on their original device (cuda:0).  In multi-GPU, rank 1
+        uses cuda:1 but gets cuda:0 optimizer state, causing illegal memory
+        access on the first optimizer.step().
+        """
+        checkpoint = torch.load(fn, weights_only=False, map_location=self.ppo_device)
+        if isinstance(checkpoint, dict) and 'model' not in checkpoint:
+            if self.global_rank in checkpoint:
+                checkpoint = checkpoint[self.global_rank]
+            elif 0 in checkpoint:
+                checkpoint = checkpoint[0]
+        self.set_full_state_weights(checkpoint, set_epoch=set_epoch)
+
     def train(self):
         """Dispatch to DAgger or Hybrid training loop."""
         if self.distill_mode == "hybrid":
@@ -363,19 +391,34 @@ class DistillAgent(A2CAgent):
         Keeps the same structure for compatibility with RL-Games infrastructure.
         """
         self.init_tensors()
+        torch.cuda.synchronize()
+        print("[DEBUG] init_tensors OK")
         self.last_mean_rewards = -100500
         start_time = time.perf_counter()
         total_time = 0
-        
+
         # Reset environment
         self.obs = self.env_reset()
+        torch.cuda.synchronize()
+        print("[DEBUG] env_reset OK")
         self.curr_frames = self.batch_size_envs
-        
+
         # Multi-GPU: broadcast student model parameters
         if self.multi_gpu:
             torch.cuda.set_device(self.local_rank)
-            print("Broadcasting student model parameters...")
-            model_params = [self.model.state_dict()]
+            torch.cuda.synchronize()
+            print(f"[DEBUG] set_device({self.local_rank}) OK")
+
+            # Test basic NCCL communication
+            test_tensor = torch.ones(1, device=f'cuda:{self.local_rank}')
+            dist.broadcast(test_tensor, 0)
+            torch.cuda.synchronize()
+            print(f"[DEBUG] NCCL small broadcast OK on rank {self.local_rank}")
+
+            # Test with CPU state dict to avoid CUDA tensor serialization issues
+            model_params = [{k: v.cpu() for k, v in self.model.state_dict().items()}]
+            torch.cuda.synchronize()
+            print(f"[DEBUG] state_dict to CPU OK on rank {self.local_rank}, broadcasting...")
             dist.broadcast_object_list(model_params, 0)
             self.model.load_state_dict(model_params[0])
         
@@ -451,12 +494,15 @@ class DistillAgent(A2CAgent):
                     self.rnn_states = student_res['rnn_states']
                 
                 # ===== Compute BC loss =====
-                # Weight by inverse sigma^2 for stable training
-                weights = 1.0 / (teacher_sigmas.detach() + 1e-6)
-                weights = weights ** 2
-                
-                mu_loss = weighted_l2_loss(student_mus, teacher_mus.detach(), weights).mean()
-                sigma_loss = l2_loss(student_sigmas, teacher_sigmas.detach()).mean()
+                if self.loss_type == "mse":
+                    mu_loss = torch.nn.functional.mse_loss(student_mus, teacher_mus.detach())
+                    sigma_loss = torch.nn.functional.mse_loss(student_sigmas, teacher_sigmas.detach())
+                else:
+                    # Weight by inverse sigma^2 for stable training
+                    weights = 1.0 / (teacher_sigmas.detach() + 1e-6)
+                    weights = weights ** 2
+                    mu_loss = weighted_l2_loss(student_mus, teacher_mus.detach(), weights).mean()
+                    sigma_loss = l2_loss(student_sigmas, teacher_sigmas.detach()).mean()
 
                 total_loss = mu_loss + sigma_loss
 
@@ -1332,8 +1378,7 @@ class DistillAgent(A2CAgent):
 
             ppo_loss = a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
 
-            # Auto-balanced hybrid imitation term: EMA-normalize BC to PPO scale
-            # so lambda_d directly controls the relative contribution.
+            # Hybrid imitation term
             bc_mse_loss = torch.nn.functional.mse_loss(mu, teacher_mus_batch.detach())
             with torch.no_grad():
                 ppo_val = ppo_loss.detach().abs().item()
@@ -1345,7 +1390,10 @@ class DistillAgent(A2CAgent):
                     m = self._ema_momentum
                     self._ema_ppo = m * self._ema_ppo + (1 - m) * ppo_val
                     self._ema_bc = m * self._ema_bc + (1 - m) * bc_val
-                auto_coef = self._ema_ppo / max(self._ema_bc, 1e-8)
+                if self._bc_coef_mode == "auto":
+                    auto_coef = self._ema_ppo / max(self._ema_bc, 1e-8)
+                else:
+                    auto_coef = self._manual_bc_coef
             bc_loss = auto_coef * bc_mse_loss
 
             loss = self.lambda_ppo * ppo_loss + self.lambda_d * bc_loss

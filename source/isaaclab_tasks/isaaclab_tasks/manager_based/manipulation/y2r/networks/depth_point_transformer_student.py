@@ -388,8 +388,13 @@ class DepthPointTransformerStudentBuilder(NetworkBuilder):
             proprio = non_depth[:, :self.proprio_dim]
             pc_flat = non_depth[:, self.proprio_dim:]
 
-            # Reshape point cloud to (B, num_points, num_timesteps * 3)
-            point_obs = pc_flat.reshape(B, self.num_points, self.num_timesteps * 3)
+            # The flat layout is time-major: [t0_p0..pN, t1_p0..pN, ...].
+            # Reshape to 4D time-major, then permute to point-centric so each
+            # row is one physical point tracked across all timesteps.
+            point_obs = (pc_flat
+                         .reshape(B, self.num_timesteps, self.num_points, 3)
+                         .permute(0, 2, 1, 3)
+                         .reshape(B, self.num_points, self.num_timesteps * 3))
 
             # =================================================================
             # Depth encoder

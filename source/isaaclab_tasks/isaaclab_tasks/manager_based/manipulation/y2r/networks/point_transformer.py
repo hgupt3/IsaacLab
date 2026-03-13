@@ -489,9 +489,13 @@ class PointTransformerBuilder(A2CBuilder):
             extended_proprio = obs[:, :self.proprio_dim]  # (B, proprio_dim)
             point_flat = obs[:, self.proprio_dim:]        # (B, point_cloud_dim)
 
-            # Reshape to (B, num_points, num_timesteps * 3) — no 4D reshape needed,
-            # nn.Linear works on arbitrary leading dims so encoder handles (B, P, F) directly.
-            point_obs = point_flat.reshape(B, self.num_points, self.num_timesteps * 3)
+            # The flat layout is time-major: [t0_p0..pN, t1_p0..pN, ...].
+            # Reshape to 4D time-major, then permute to point-centric so each
+            # row is one physical point tracked across all timesteps.
+            point_obs = (point_flat
+                         .reshape(B, self.num_timesteps, self.num_points, 3)
+                         .permute(0, 2, 1, 3)
+                         .reshape(B, self.num_points, self.num_timesteps * 3))
 
             return point_obs, extended_proprio
 

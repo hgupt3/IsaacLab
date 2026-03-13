@@ -143,11 +143,11 @@ params:
     save_frequency: 50
     print_stats: True
     grad_norm: 1.0
-    entropy_coef: 0.0025
+    entropy_coef: 0.002
     truncate_grads: True
     e_clip: 0.2
     horizon_length: 16
-    minibatch_size: 16384
+    minibatch_size: 8192
     mini_epochs: 4
     critic_coef: 4
     freeze_critic: False
@@ -175,7 +175,8 @@ params:
     mode: hybrid # 'dagger' or 'hybrid'
 
     # DAgger training (mode: dagger only)
-    learning_rate: 1e-4           # Adam lr for DAgger optimizer
+    loss_type: mse # 'weighted_l2' (sigma-weighted L2 + sigma loss) or 'mse' (plain MSE on means)
+    learning_rate: 0.0           # Adam lr for DAgger optimizer
     grad_norm: 1.0                # Gradient clipping for DAgger
     max_iterations: 100000000     # Total training iterations
     save_frequency: 5000          # Checkpoint save interval (iterations, not frames)
@@ -186,7 +187,10 @@ params:
 
     # Hybrid (PHP) schedule — BC loss is auto-balanced to PPO scale via EMA,
     # so lambda_d directly controls relative BC influence (1.0 = equal, 2.0 = 2x BC).
-    lambda_d_initial: 10.0
-    lambda_d_min: 0.01
+    lambda_d_initial: 1.0
+    lambda_d_min: 0.1
     lambda_d_anneal_epochs: 1000
     adaptive_lr_gate_lambda_ppo: 0.1
+    # BC coefficient mode: "auto" (EMA-balanced to PPO scale) or "manual" (fixed multiplier)
+    bc_coef_mode: manual
+    bc_manual_coef: 10.0               # Used only when bc_coef_mode: manual

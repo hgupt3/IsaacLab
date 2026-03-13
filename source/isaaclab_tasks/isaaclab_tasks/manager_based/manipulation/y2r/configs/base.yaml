@@ -360,8 +360,8 @@ terminations:
     rotation_threshold: [2.0, 1.0]       # Rotation error (radians)
   
   hand_pose_deviation:
-    position_threshold: [0.25, 0.15]         # Position threshold (meters)
-    rotation_threshold: [3.0, 2.0]        # Rotation threshold (radians)
+    position_threshold: [0.15, 0.075]         # Position threshold (meters)
+    rotation_threshold: [2.0, 0.9]        # Rotation threshold (radians)
 
   abnormal_robot:
     enabled: false                          # Enable abnormal robot termination
@@ -378,7 +378,7 @@ curriculum:
     
   # Step-based scheduler (set step_interval to null to disable)
   scheduler: 
-    step_interval: 50000        # Floor increases at this interval
+    step_interval: 80000        # Floor increases at this interval
     use_performance: true       # Performance can still advance faster than floor
     
   # Tolerances to advance difficulty level
@@ -530,9 +530,9 @@ visibility_camera:
 # WRIST CAMERA  (Gemini 305 depth — pinhole, square pixels, HFOV 88°)
 # ==============================================================================
 wrist_camera:
-  width: 96                     # Gemini 305 native 16:10 aspect ratio (1280:800)
+  width: 80                     # Gemini 305 native 4:3
   height: 60
-  focal_length: 3.69            # 88° HFOV: 6.17 / (2×tan(44°))
+  focal_length: 3.69            # 80° HFOV: 6.17 / (2×tan(40°))
   horizontal_aperture: 6.17     # Virtual sensor width (mm)
   clipping_range: [0.04, 0.5]   # Gemini 305 depth range: 4–100 cm
 

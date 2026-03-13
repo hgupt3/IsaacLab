@@ -183,8 +183,14 @@ def split_point_and_proprio(
     proprio_obs = obs[:, :proprio_dim]
     point_flat = obs[:, proprio_dim:]
     
-    # Reshape to point-centric format
-    point_obs = point_flat.view(B, num_points, point_dim)
+    # The flat layout is time-major: [t0_p0..pN, t1_p0..pN, ...].
+    # Reshape to 4D time-major, then permute to point-centric so each
+    # row is one physical point tracked across all timesteps.
+    num_timesteps = point_dim // 3
+    point_obs = (point_flat
+                 .view(B, num_timesteps, num_points, 3)
+                 .permute(0, 2, 1, 3)
+                 .reshape(B, num_points, point_dim))
     
     return point_obs, proprio_obs
 
