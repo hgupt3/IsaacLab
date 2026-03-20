@@ -391,6 +391,7 @@ class DifficultyConfig:
 class SchedulerConfig:
     step_interval: int | None  # Steps between difficulty floor increases (null to disable)
     use_performance: bool      # Whether performance can advance faster than floor
+    resume_step: bool          # Whether to restore step counter from checkpoint on --continue
 
 
 @dataclass

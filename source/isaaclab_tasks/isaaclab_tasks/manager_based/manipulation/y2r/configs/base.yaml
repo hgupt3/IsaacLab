@@ -12,7 +12,7 @@
 simulation:
   physics_dt: 0.01              # Physics timestep (seconds)
   decimation: 2                 # Control decimation (steps per action)
-  num_envs: 32768
+  num_envs: 16384
   env_spacing: 3.0
   replicate_physics: false
   solver_position_iteration_count: 16
@@ -68,14 +68,14 @@ trajectory:
     - name: "grasp"
       type: "waypoint"
       pose: null              # Computed from start_poses
-      duration: 2.0
+      duration: 2.5
       hand_coupling_weights:
         full: 1.0
 
     - name: "explore"
       type: "random_waypoint"
       count_weights: [0.5, 0.5]  # P(0 waypoints)=50%, P(1 waypoint)=50%
-      movement_duration: 3.0     # Per-waypoint duration (seconds)
+      movement_duration: 3.5     # Per-waypoint duration (seconds)
       pause_duration: 0.25       # Per-waypoint pause (seconds)
       position_range:
         x: null                  # null = use workspace bounds
@@ -98,7 +98,7 @@ trajectory:
     - name: "release"
       type: "waypoint"
       pose: null              # Computed: object stays, hand retreats
-      duration: 2.0
+      duration: 2.5
       hand_coupling_weights:
         none: 1.0             # Hand fully decoupled
 
@@ -304,7 +304,7 @@ rewards:
   # Hand pose following reward (when hand_trajectory.enabled)
   # Guides hand to follow palm pose trajectory through grasp/manipulation/release
   hand_pose_following:
-    weight: 2.5                   # Guiding signal, not strict
+    weight: 3.5                   # Guiding signal, not strict
     params:
       # Phase-varying tolerances: average of position/rotation kernels
       grasp_pos_tol: 0.03         # Position tolerance during grasp
@@ -372,14 +372,15 @@ terminations:
 # ==============================================================================
 curriculum:
   difficulty:
-    initial: 0                  # Starting difficulty
-    min: 0
+    initial: 6                  # Starting difficulty
+    min: 6
     max: 10
     
   # Step-based scheduler (set step_interval to null to disable)
-  scheduler: 
-    step_interval: 80000        # Floor increases at this interval
+  scheduler:
+    step_interval: 60000        # Floor increases at this interval
     use_performance: true       # Performance can still advance faster than floor
+    resume_step: true           # Restore step counter from checkpoint on --continue (false = fresh curriculum)
     
   # Tolerances to advance difficulty level
   # null = use current success threshold (adaptive with curriculum)

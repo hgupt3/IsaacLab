@@ -34,6 +34,9 @@ class Y2RCheckpointObserver(AlgoObserver):
 
         algo.get_full_state_weights = _get_with_counter
 
+        # Check config: should we restore step counter on load?
+        resume_step = getattr(env, "y2r_cfg", None) is not None and env.y2r_cfg.curriculum.scheduler.resume_step
+
         # Patch restore: pull counter back out of checkpoint dict
         _orig_set = algo.set_full_state_weights
 
@@ -41,7 +44,9 @@ class Y2RCheckpointObserver(AlgoObserver):
             if "common_step_counter" in weights:
                 # Strip custom key before handing off to rl_games internals.
                 weights = dict(weights)
-                env.common_step_counter = int(weights.pop("common_step_counter"))
+                counter = int(weights.pop("common_step_counter"))
+                if resume_step:
+                    env.common_step_counter = counter
             _orig_set(weights, set_epoch=set_epoch)
 
         algo.set_full_state_weights = _set_with_counter
