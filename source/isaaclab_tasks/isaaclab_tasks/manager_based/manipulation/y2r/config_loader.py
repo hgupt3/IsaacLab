@@ -769,6 +769,8 @@ def get_config_file_paths(mode: str | None = None, task: str | None = None, robo
         ])
     elif mode == "keyboard":
         files.append(config_dir / "layers" / "keyboard.yaml")
+    elif mode == "sysid":
+        files.append(config_dir / "layers" / "sysid.yaml")
     elif mode == "dump":
         files.extend([
             config_dir / "layers" / "student.yaml",
@@ -819,6 +821,8 @@ def get_config(mode: str | None = None, task: str | None = None, robot: str | No
         cfg = _deep_merge(cfg, _load_yaml("layers/student_play"))
     elif mode == "keyboard":
         cfg = _deep_merge(cfg, _load_yaml("layers/keyboard"))
+    elif mode == "sysid":
+        cfg = _deep_merge(cfg, _load_yaml("layers/sysid"))
     elif mode == "dump":
         cfg = _deep_merge(cfg, _load_yaml("layers/student"))
         cfg = _deep_merge(cfg, _load_yaml("layers/play"))

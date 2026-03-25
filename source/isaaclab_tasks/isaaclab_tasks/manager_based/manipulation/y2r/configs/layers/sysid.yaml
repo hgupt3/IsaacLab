@@ -1,0 +1,70 @@
+# ==============================================================================
+# SysID Mode Layer
+# ==============================================================================
+# Deterministic environment for system identification parameter fitting.
+# Disables all randomization so per-env actuator params can be set at runtime.
+# Usage: Y2R_MODE=sysid
+# ==============================================================================
+
+simulation:
+  num_envs: 128
+
+# Disable all domain randomization — we set actuator params per-env at runtime
+randomization:
+  robot:
+    stiffness_scale: [1.0, 1.0]
+    damping_scale: [1.0, 1.0]
+    joint_friction_scale: [1.0, 1.0]
+  reset:
+    robot_joints: [0.0, 0.0]
+    robot_wrist: [0.0, 0.0]
+    robot_base_x: [0.0, 0.0]
+    robot_base_y: [0.0, 0.0]
+    robot_base_z: [0.0, 0.0]
+    table_xy: [0.0, 0.0]
+    camera_forward: [0.0, 0.0]
+    camera_lateral: [0.0, 0.0]
+    camera_vertical: [0.0, 0.0]
+
+# Disable terminations so envs don't reset during trials
+terminations:
+  trajectory_deviation:
+    position_threshold: [999.0, 999.0]
+    rotation_threshold: [999.0, 999.0]
+  hand_pose_deviation:
+    position_threshold: [999.0, 999.0]
+    rotation_threshold: [999.0, 999.0]
+
+mode:
+  use_student_mode: false
+
+# Long hold — no trajectory phases
+trajectory:
+  segments:
+    - name: "hold"
+      type: "waypoint"
+      pose: null
+      duration: 120.0
+      hand_coupling_weights:
+        full: 1.0
+
+# Minimal procedural objects (1 shape, won't interfere)
+procedural_objects:
+  generation:
+    num_shapes: 1
+
+# Start at max difficulty (no curriculum progression)
+curriculum:
+  difficulty:
+    initial: 10
+    min: 10
+    max: 10
+
+# No visualization overhead
+visualization:
+  targets: false
+  current_object: false
+  waypoint_region: false
+  goal_region: false
+  pose_axes: false
+  debug_print_rewards: false
