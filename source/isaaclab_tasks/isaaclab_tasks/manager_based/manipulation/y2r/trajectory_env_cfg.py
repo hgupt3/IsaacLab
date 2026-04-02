@@ -274,6 +274,7 @@ def _build_observations_cfg(cfg: Y2RConfig):
         """Observations for proprioception group."""
         joint_pos = ObsTerm(func=mdp.joint_pos, noise=Unoise(n_min=-0.0, n_max=0.0))
         joint_vel = ObsTerm(func=mdp.joint_vel, noise=Unoise(n_min=-0.0, n_max=0.0))
+        joint_pos_targets = ObsTerm(func=mdp.joint_pos_targets, noise=Unoise(n_min=-0.0, n_max=0.0))
         hand_eigen = ObsTerm(
             func=mdp.allegro_hand_eigen_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),
@@ -427,6 +428,7 @@ def _build_observations_cfg(cfg: Y2RConfig):
         No joint_vel, hand_tips_state, contacts, or object_pose_palm (all privileged).
         """
         joint_pos = ObsTerm(func=mdp.joint_pos, noise=Unoise(n_min=-0.0, n_max=0.0))
+        joint_pos_targets = ObsTerm(func=mdp.joint_pos_targets, noise=Unoise(n_min=-0.0, n_max=0.0))
         hand_eigen = ObsTerm(
             func=mdp.allegro_hand_eigen_b,
             noise=Unoise(n_min=-0.0, n_max=0.0),

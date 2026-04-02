@@ -1193,6 +1193,27 @@ def allegro_hand_eigen_b(
     return hand @ right_pinv
 
 
+def joint_pos_targets(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Joint position targets from the articulation's PD controller.
+
+    Returns targets in the same joint order as ``mdp.joint_pos`` (PhysX order),
+    by reading from the articulation's ``joint_pos_target`` buffer which is
+    populated by ``set_joint_position_target()`` in the action term.
+
+    Args:
+        env: The environment.
+        asset_cfg: Scene entity for the robot articulation. Defaults to ``SceneEntityCfg("robot")``.
+
+    Returns:
+        Tensor of shape ``(num_envs, num_joints)`` with joint position targets.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    return asset.data.joint_pos_target[:, asset_cfg.joint_ids]
+
+
 class target_sequence_obs_b(ManagerTermBase):
     """Trajectory target observations expressed in robot's base frame.
     

@@ -144,6 +144,32 @@ def build_curriculum_cfg(cfg: Y2RConfig):
             },
         )
 
+        joint_pos_targets_unoise_min_adr = CurrTerm(
+            func=mdp.modify_term_cfg,
+            params={
+                "address": "observations.proprio.joint_pos_targets.noise.n_min",
+                "modify_fn": mdp.initial_final_interpolate_fn,
+                "modify_params": {
+                    "initial_value": 0.0,
+                    "final_value": -cfg.curriculum.noise.joint_pos_targets[1],
+                    "difficulty_term_str": "adr",
+                },
+            },
+        )
+
+        joint_pos_targets_unoise_max_adr = CurrTerm(
+            func=mdp.modify_term_cfg,
+            params={
+                "address": "observations.proprio.joint_pos_targets.noise.n_max",
+                "modify_fn": mdp.initial_final_interpolate_fn,
+                "modify_params": {
+                    "initial_value": 0.0,
+                    "final_value": cfg.curriculum.noise.joint_pos_targets[1],
+                    "difficulty_term_str": "adr",
+                },
+            },
+        )
+
         joint_vel_unoise_min_adr = CurrTerm(
             func=mdp.modify_term_cfg,
             params={
@@ -417,7 +443,47 @@ def build_curriculum_cfg(cfg: Y2RConfig):
             },
         )
 
-    return TrajectoryCurriculumCfg()
+    result = TrajectoryCurriculumCfg()
+
+    # Student noise curriculum — mirrors teacher noise for all student obs groups.
+    # Only added when student mode is active (student obs groups are None otherwise).
+    if cfg.mode.use_student_mode:
+        _student_noise_entries = [
+            ("student_jp",      "observations.student_proprio.joint_pos",                 cfg.curriculum.noise.joint_pos),
+            ("student_eigen",   "observations.student_proprio.hand_eigen",                cfg.curriculum.noise.hand_eigen),
+            ("student_jp_tgt",  "observations.student_proprio.joint_pos_targets",         cfg.curriculum.noise.joint_pos_targets),
+            ("student_hpose",   "observations.student_current_poses.hand_pose",           cfg.curriculum.noise.hand_pose),
+            ("student_hpose_t", "observations.student_future_poses.hand_pose_targets",    cfg.curriculum.noise.hand_pose_targets),
+            ("student_vpc",     "observations.student_current_pc.visible_point_cloud",    cfg.curriculum.noise.object_point_cloud),
+            ("student_vtgt",    "observations.student_future_pc.visible_target_sequence", cfg.curriculum.noise.target_point_clouds),
+        ]
+        for name, address, noise_cfg in _student_noise_entries:
+            setattr(result, f"{name}_unoise_min_adr", CurrTerm(
+                func=mdp.modify_term_cfg,
+                params={
+                    "address": f"{address}.noise.n_min",
+                    "modify_fn": mdp.initial_final_interpolate_fn,
+                    "modify_params": {
+                        "initial_value": 0.0,
+                        "final_value": -noise_cfg[1],
+                        "difficulty_term_str": "adr",
+                    },
+                },
+            ))
+            setattr(result, f"{name}_unoise_max_adr", CurrTerm(
+                func=mdp.modify_term_cfg,
+                params={
+                    "address": f"{address}.noise.n_max",
+                    "modify_fn": mdp.initial_final_interpolate_fn,
+                    "modify_params": {
+                        "initial_value": 0.0,
+                        "final_value": noise_cfg[1],
+                        "difficulty_term_str": "adr",
+                    },
+                },
+            ))
+
+    return result
 
 
 # For backwards compatibility - this is now just a type alias

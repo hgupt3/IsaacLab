@@ -117,7 +117,14 @@ class EigenGraspRelativeJointPositionAction(ActionTerm):
         
         # Register PCA matrix as buffer (use only the first eigen_dim components)
         self._pca_matrix = ALLEGRO_PCA_MATRIX[: self._eigen_dim].to(self.device)  # (eigen_dim, 16)
-        
+
+        # Target tracking state (SimToolReal-style delta-from-target + EMA)
+        self._use_target_tracking = cfg.use_target_tracking
+        self._ema_alpha = cfg.ema_alpha
+        if self._use_target_tracking:
+            self._target = torch.zeros(self.num_envs, self._output_dim, device=self.device)
+            self._joint_limits_cached = False
+
         # Parse scale
         if isinstance(cfg.scale, (float, int)):
             self._scale = float(cfg.scale)
@@ -168,15 +175,33 @@ class EigenGraspRelativeJointPositionAction(ActionTerm):
         # Apply scale
         self._processed_actions[:] = full_delta * self._scale
     
+    def _cache_joint_limits(self):
+        """Cache joint limits for target clamping (called lazily on first apply)."""
+        if self._joint_limits_cached:
+            return
+        limits = self._asset.data.soft_joint_pos_limits[:, self._joint_ids]  # (N, J, 2)
+        self._joint_lower = limits[..., 0]  # (N, J)
+        self._joint_upper = limits[..., 1]  # (N, J)
+        self._joint_limits_cached = True
+
     def apply_actions(self):
-        """Apply relative position control."""
-        # Add current joint positions to the processed actions
-        current_actions = self._processed_actions + self._asset.data.joint_pos[:, self._joint_ids]
-        # Set position targets
-        self._asset.set_joint_position_target(current_actions, joint_ids=self._joint_ids)
+        """Apply position control with optional target tracking + EMA."""
+        if not self._use_target_tracking:
+            # Original: delta from current joint position
+            current_actions = self._processed_actions + self._asset.data.joint_pos[:, self._joint_ids]
+            self._asset.set_joint_position_target(current_actions, joint_ids=self._joint_ids)
+        else:
+            # SimToolReal: delta from previous target + EMA
+            self._cache_joint_limits()
+            raw_target = self._target + self._processed_actions
+            raw_target = torch.clamp(raw_target, self._joint_lower, self._joint_upper)
+            self._target = self._ema_alpha * raw_target + (1.0 - self._ema_alpha) * self._target
+            self._asset.set_joint_position_target(self._target, joint_ids=self._joint_ids)
     
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         self._raw_actions[env_ids] = 0.0
+        if self._use_target_tracking:
+            self._target[env_ids] = self._asset.data.joint_pos[env_ids][:, self._joint_ids]
 
 
 @configclass
@@ -211,6 +236,12 @@ class EigenGraspRelativeJointPositionActionCfg(ActionTermCfg):
     
     eigen_dim: int = 5
     """Number of eigen grasp dimensions. Defaults to 5."""
+
+    use_target_tracking: bool = False
+    """If True, use delta-from-target + EMA smoothing (SimToolReal-style). Defaults to False."""
+
+    ema_alpha: float = 0.1
+    """EMA blend factor: target = alpha * raw + (1-alpha) * prev. Only used when use_target_tracking=True."""
 
 
 __all__ = [

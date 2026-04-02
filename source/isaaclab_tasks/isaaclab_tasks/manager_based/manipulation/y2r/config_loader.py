@@ -405,6 +405,7 @@ class AdvancementTolerancesConfig:
 class NoiseConfig:
     joint_pos: tuple[float, float]
     joint_vel: tuple[float, float]
+    joint_pos_targets: tuple[float, float]
     hand_eigen: tuple[float, float]
     hand_tips: tuple[float, float]
     object_point_cloud: tuple[float, float]
@@ -525,6 +526,8 @@ class RobotConfig:
     arm_joint_count: int
     hand_joint_count: int
     eigen_dim: int
+    use_target_tracking: bool
+    ema_alpha: float
     palm_body_name: str
     wrist_joint_name: str
     arm_joint_regex: str

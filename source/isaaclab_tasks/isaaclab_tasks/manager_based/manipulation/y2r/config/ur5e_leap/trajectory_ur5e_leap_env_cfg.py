@@ -61,6 +61,8 @@ def _build_eigen_grasp_action_cfg(cfg: Y2RConfig):
             arm_joint_count=6,
             hand_joint_count=16,
             eigen_dim=cfg.robot.eigen_dim,
+            use_target_tracking=cfg.robot.use_target_tracking,
+            ema_alpha=cfg.robot.ema_alpha,
         )
     return UR5eLeapEigenGraspActionCfg()
 
