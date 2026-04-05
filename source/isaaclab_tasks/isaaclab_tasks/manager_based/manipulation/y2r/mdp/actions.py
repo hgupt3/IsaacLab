@@ -114,6 +114,7 @@ class EigenGraspRelativeJointPositionAction(ActionTerm):
         # Create tensors for raw and processed actions
         self._raw_actions = torch.zeros(self.num_envs, self._input_dim, device=self.device)
         self._processed_actions = torch.zeros(self.num_envs, self._output_dim, device=self.device)
+        self._command_target = torch.zeros(self.num_envs, self._output_dim, device=self.device)
         
         # Register PCA matrix as buffer (use only the first eigen_dim components)
         self._pca_matrix = ALLEGRO_PCA_MATRIX[: self._eigen_dim].to(self.device)  # (eigen_dim, 16)
@@ -149,7 +150,7 @@ class EigenGraspRelativeJointPositionAction(ActionTerm):
         return self._processed_actions
     
     def process_actions(self, actions: torch.Tensor):
-        """Process (7 + eigen_dim + 16)D input to 23D joint deltas.
+        """Process one policy-step action into the held joint target.
         
         Args:
             actions: Input actions of shape (num_envs, 7 + eigen_dim + 16)
@@ -174,9 +175,20 @@ class EigenGraspRelativeJointPositionAction(ActionTerm):
         
         # Apply scale
         self._processed_actions[:] = full_delta * self._scale
+        
+        if not self._use_target_tracking:
+            # Direct mode: compute the absolute command target once per policy step.
+            self._command_target[:] = self._processed_actions + self._asset.data.joint_pos[:, self._joint_ids]
+        else:
+            # Target-tracking mode: update the tracked target once per policy step.
+            self._cache_joint_limits()
+            raw_target = self._target + self._processed_actions
+            raw_target = torch.clamp(raw_target, self._joint_lower, self._joint_upper)
+            self._target = self._ema_alpha * raw_target + (1.0 - self._ema_alpha) * self._target
+            self._command_target[:] = self._target
     
     def _cache_joint_limits(self):
-        """Cache joint limits for target clamping (called lazily on first apply)."""
+        """Cache joint limits for target clamping (called lazily on first use)."""
         if self._joint_limits_cached:
             return
         limits = self._asset.data.soft_joint_pos_limits[:, self._joint_ids]  # (N, J, 2)
@@ -185,23 +197,17 @@ class EigenGraspRelativeJointPositionAction(ActionTerm):
         self._joint_limits_cached = True
 
     def apply_actions(self):
-        """Apply position control with optional target tracking + EMA."""
-        if not self._use_target_tracking:
-            # Original: delta from current joint position
-            current_actions = self._processed_actions + self._asset.data.joint_pos[:, self._joint_ids]
-            self._asset.set_joint_position_target(current_actions, joint_ids=self._joint_ids)
-        else:
-            # SimToolReal: delta from previous target + EMA
-            self._cache_joint_limits()
-            raw_target = self._target + self._processed_actions
-            raw_target = torch.clamp(raw_target, self._joint_lower, self._joint_upper)
-            self._target = self._ema_alpha * raw_target + (1.0 - self._ema_alpha) * self._target
-            self._asset.set_joint_position_target(self._target, joint_ids=self._joint_ids)
+        """Hold the current command target across physics substeps."""
+        self._asset.set_joint_position_target(self._command_target, joint_ids=self._joint_ids)
     
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        env_ids = slice(None) if env_ids is None else env_ids
         self._raw_actions[env_ids] = 0.0
+        self._processed_actions[env_ids] = 0.0
+        current_joint_pos = self._asset.data.joint_pos[env_ids][:, self._joint_ids]
+        self._command_target[env_ids] = current_joint_pos
         if self._use_target_tracking:
-            self._target[env_ids] = self._asset.data.joint_pos[env_ids][:, self._joint_ids]
+            self._target[env_ids] = current_joint_pos
 
 
 @configclass

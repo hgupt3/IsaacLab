@@ -12,7 +12,7 @@
 simulation:
   physics_dt: 0.01              # Physics timestep (seconds)
   decimation: 2                 # Control decimation (steps per action)
-  num_envs: 16384
+  num_envs: 32768
   env_spacing: 3.0
   replicate_physics: false
   solver_position_iteration_count: 16
@@ -372,13 +372,18 @@ terminations:
 # ==============================================================================
 curriculum:
   difficulty:
-    initial: 6                  # Starting difficulty
-    min: 6
+    initial: 0                  # Starting difficulty
+    min: 0
     max: 10
     
   # Step-based scheduler (set step_interval to null to disable)
   scheduler:
-    step_interval: 60000        # Floor increases at this interval
+    step_interval: 50000        # Floor increases at this interval
+    level_overrides:            # Optional per-level overrides; level N controls N -> N+1
+      - level: 0
+        step_interval: 80000
+      - level: 1
+        step_interval: 80000
     use_performance: true       # Performance can still advance faster than floor
     resume_step: true           # Restore step counter from checkpoint on --continue (false = fresh curriculum)
     

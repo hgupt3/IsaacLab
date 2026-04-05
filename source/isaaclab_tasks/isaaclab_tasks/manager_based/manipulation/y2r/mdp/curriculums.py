@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import torch
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from isaaclab.envs import mdp
 from isaaclab.managers import ManagerTermBase
@@ -52,6 +52,57 @@ def _recurse(iv_elem, fv_elem, data_elem, frac):
         return new_val.item()
 
 
+def _get_scheduler_override_value(override: Any, field_name: str):
+    if isinstance(override, dict):
+        return override.get(field_name)
+    return getattr(override, field_name)
+
+
+def _compute_step_based_floor(
+    common_step_counter: int,
+    init_difficulty: int,
+    max_difficulty: int,
+    step_interval: int | None,
+    level_overrides: Sequence[Any] | None,
+) -> int:
+    interval_by_level: dict[int, int | None] = {}
+    for override in level_overrides or []:
+        level = _get_scheduler_override_value(override, "level")
+        interval = _get_scheduler_override_value(override, "step_interval")
+
+        if level is None or level < 0:
+            raise ValueError(f"Invalid scheduler override level: {level}")
+        if level >= max_difficulty:
+            raise ValueError(
+                f"Scheduler override level {level} is invalid for max difficulty {max_difficulty}"
+            )
+        if interval is not None and interval <= 0:
+            raise ValueError(
+                f"Scheduler override step_interval for level {level} must be > 0 or null, got {interval}"
+            )
+        if level in interval_by_level:
+            raise ValueError(f"Duplicate scheduler override for level {level}")
+
+        interval_by_level[level] = interval
+
+    if step_interval is not None and step_interval <= 0:
+        raise ValueError(f"Default scheduler step_interval must be > 0 or null, got {step_interval}")
+
+    floor = init_difficulty
+    steps_remaining = common_step_counter
+
+    while floor < max_difficulty:
+        interval = interval_by_level.get(floor, step_interval)
+        if interval is None:
+            break
+        if steps_remaining < interval:
+            break
+        steps_remaining -= interval
+        floor += 1
+
+    return floor
+
+
 class DifficultyScheduler(ManagerTermBase):
     """Adaptive difficulty scheduler for trajectory curriculum learning.
 
@@ -60,6 +111,7 @@ class DifficultyScheduler(ManagerTermBase):
     
     Step-based scheduler (optional):
     - If step_interval is set, difficulty floor increases every step_interval steps
+    - level_overrides can override the step interval for specific floor transitions
     - Floor guarantees minimum progress regardless of agent performance
     - Performance-based logic can still push difficulty higher than floor
     
@@ -102,14 +154,17 @@ class DifficultyScheduler(ManagerTermBase):
         rot_tol: float | None = None,  # None = use current success threshold
         pc_tol: float | None = None,   # None = use current success threshold
         step_interval: int | None = None,  # Steps between floor increases (None = disabled)
+        level_overrides: Sequence[Any] | None = None,  # Optional per-level interval overrides
         use_performance: bool = True,  # Whether to use performance-based advancement
     ):
         # Compute step-based difficulty floor using Isaac Lab's global step counter
-        if step_interval is not None and step_interval > 0:
-            self.step_based_floor = min(
-                max_difficulty,
-                init_difficulty + (env.common_step_counter // step_interval)
-            )
+        self.step_based_floor = _compute_step_based_floor(
+            common_step_counter=env.common_step_counter,
+            init_difficulty=init_difficulty,
+            max_difficulty=max_difficulty,
+            step_interval=step_interval,
+            level_overrides=level_overrides,
+        )
         
         # Performance-based logic
         if use_performance:

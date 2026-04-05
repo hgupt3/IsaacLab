@@ -129,7 +129,11 @@ def _auto_parse(cls, data: dict) -> Any:
         elif origin is tuple or field_type is tuple:
             kwargs[field_name] = tuple(value) if isinstance(value, list) else value
         elif origin is list:
-            kwargs[field_name] = list(value)
+            item_type = get_args(field_type)[0] if get_args(field_type) else Any
+            if is_dataclass(item_type):
+                kwargs[field_name] = [_auto_parse(item_type, item) for item in value]
+            else:
+                kwargs[field_name] = list(value)
         else:
             kwargs[field_name] = value
 
@@ -388,10 +392,17 @@ class DifficultyConfig:
 
 
 @dataclass
+class SchedulerLevelOverrideConfig:
+    level: int                  # Difficulty floor level whose transition is overridden
+    step_interval: int | None   # Steps required to advance from level -> level + 1
+
+
+@dataclass
 class SchedulerConfig:
-    step_interval: int | None  # Steps between difficulty floor increases (null to disable)
-    use_performance: bool      # Whether performance can advance faster than floor
-    resume_step: bool          # Whether to restore step counter from checkpoint on --continue
+    step_interval: int | None                   # Default steps between floor increases (null to disable)
+    level_overrides: list[SchedulerLevelOverrideConfig]
+    use_performance: bool                       # Whether performance can advance faster than floor
+    resume_step: bool                           # Whether to restore step counter from checkpoint on --continue
 
 
 @dataclass
