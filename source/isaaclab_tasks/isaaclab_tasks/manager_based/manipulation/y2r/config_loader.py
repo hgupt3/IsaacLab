@@ -427,7 +427,8 @@ class CurriculumConfig:
     difficulty: DifficultyConfig
     scheduler: SchedulerConfig
     advancement_tolerances: AdvancementTolerancesConfig
-    noise: NoiseConfig
+    teacher_noise: NoiseConfig
+    student_noise: NoiseConfig
     gate_floor: tuple[float, float]
     grasp_scale: tuple[float, float]
     best_release_error: bool

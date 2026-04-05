@@ -389,11 +389,25 @@ curriculum:
     rotation: null              # null = use success threshold (radians)
     point_cloud: null           # null = use success threshold (meters)
     
-  # Observation noise curriculum: [initial, final]
-  noise:
+  # Teacher observation noise curriculum: [initial, final]
+  teacher_noise:
+    joint_pos: [0.0, 0.0]
+    joint_vel: [0.0, 0.0]
+    joint_pos_targets: [0.0, 0.0]
+    hand_eigen: [0.0, 0.0]
+    hand_tips: [0.0, 0.0]
+    object_point_cloud: [0.0, 0.0]
+    object_pose: [0.0, 0.0]
+    hand_pose: [0.0, 0.0]
+    target_point_clouds: [0.0, 0.0]
+    target_poses: [0.0, 0.0]
+    hand_pose_targets: [0.0, 0.0]
+
+  # Student observation noise curriculum: [initial, final]
+  student_noise:
     joint_pos: [0.0, 0.1]
     joint_vel: [0.0, 0.1]
-    joint_pos_targets: [0.0, 0.1]
+    joint_pos_targets: [0.0, 0.0]
     hand_eigen: [0.0, 0.01]
     hand_tips: [0.0, 0.01]
     object_point_cloud: [0.0, 0.01]
