@@ -34,8 +34,13 @@ class Y2RCheckpointObserver(AlgoObserver):
 
         algo.get_full_state_weights = _get_with_counter
 
-        # Check config: should we restore step counter on load?
-        resume_step = getattr(env, "y2r_cfg", None) is not None and env.y2r_cfg.curriculum.scheduler.resume_step
+        # Y2R config lives on the env cfg object at runtime (env.cfg.y2r_cfg), not on the env itself.
+        # Keep a direct-env fallback for any legacy/debug wrappers that may attach it there.
+        y2r_cfg = getattr(env, "y2r_cfg", None)
+        if y2r_cfg is None:
+            env_cfg = getattr(env, "cfg", None)
+            y2r_cfg = getattr(env_cfg, "y2r_cfg", None) if env_cfg is not None else None
+        resume_step = y2r_cfg is not None and y2r_cfg.curriculum.scheduler.resume_step
 
         # Patch restore: pull counter back out of checkpoint dict
         _orig_set = algo.set_full_state_weights
