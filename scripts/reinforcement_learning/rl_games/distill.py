@@ -102,6 +102,8 @@ from rl_games.common import env_configurations, vecenv
 from rl_games.common.algo_observer import IsaacAlgoObserver
 from rl_games.torch_runner import Runner
 
+from isaaclab_rl.rl_games import MultiObserver
+
 from isaaclab.envs import (
     DirectMARLEnv,
     DirectMARLEnvCfg,
@@ -121,6 +123,7 @@ from isaaclab_tasks.utils import load_cfg_from_registry
 
 # Register custom networks for y2r tasks
 import isaaclab_tasks.manager_based.manipulation.y2r.networks  # noqa: F401
+from isaaclab_tasks.manager_based.manipulation.y2r.rl_games_checkpoint import Y2RCheckpointObserver
 
 # Import and register distillation agent
 from isaaclab_tasks.manager_based.manipulation.y2r.distillation import DistillAgent
@@ -344,7 +347,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg["params"]["config"]["num_actors"] = env.unwrapped.num_envs
     
     # ===== Create Runner and register distill agent =====
-    runner = Runner(IsaacAlgoObserver())
+    runner = Runner(MultiObserver([IsaacAlgoObserver(), Y2RCheckpointObserver()]))
     register_distill_agent_with_runner(runner)
     
     runner.load(agent_cfg)

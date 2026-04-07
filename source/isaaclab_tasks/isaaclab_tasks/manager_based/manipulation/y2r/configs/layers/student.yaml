@@ -13,5 +13,9 @@ simulation:
 
 curriculum:
   difficulty:
-    initial: 10                  # Starting difficulty
-    min: 10
+    initial: 0                   # Gradual curriculum (same as teacher)
+    min: 0
+  
+  scheduler:
+    step_interval: 30000
+    level_overrides:

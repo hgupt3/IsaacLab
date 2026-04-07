@@ -131,15 +131,21 @@ class DifficultyScheduler(ManagerTermBase):
         init_difficulty = self.cfg.params.get("init_difficulty", 0)
         self.current_adr_difficulties = torch.ones(env.num_envs, device=env.device) * init_difficulty
         self.difficulty_frac = 0
-        
+
         # Step-based scheduler state
         self.step_based_floor = init_difficulty
+
+        # Skip-flag: when True, the next __call__ skips performance-based
+        # demotion to avoid undoing restored per-env difficulties on the
+        # initial env reset after checkpoint restore.
+        self._restored = False
 
     def get_state(self):
         return self.current_adr_difficulties
 
     def set_state(self, state: torch.Tensor):
         self.current_adr_difficulties = state.clone().to(self._env.device)
+        self._restored = True
 
     def __call__(
         self,
@@ -166,6 +172,12 @@ class DifficultyScheduler(ManagerTermBase):
             level_overrides=level_overrides,
         )
         
+        # After restore, skip performance-based demotion for one call to avoid
+        # the initial env reset (timed_out=False) demoting all envs by 1.
+        if self._restored:
+            self._restored = False
+            use_performance = False
+
         # Performance-based logic
         if use_performance:
             trajectory_manager = env.trajectory_manager
