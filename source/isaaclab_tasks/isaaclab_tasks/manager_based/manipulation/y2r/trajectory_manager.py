@@ -824,7 +824,7 @@ class TrajectoryManager:
                 env_ids=env_ids_list,
                 prim_path=self.object_prim_path,
                 table_surface_z=self.table_height,
-                randomize_pose=False,  # Use most stable pose
+                randomize_pose=cfg.randomization.reset.randomize_stable_pose,
                 z_offset=cfg.randomization.reset.z_offset,
             )
             goal_z_local = goal_z_local.to(self.device)

@@ -123,6 +123,7 @@ def trajectory_deviation(
     env: ManagerBasedRLEnv,
     threshold: float = 0.15,
     rot_threshold: float = 1.0,
+    manipulation_only: bool = False,
 ) -> torch.Tensor:
     """Terminate if object deviates too far from current trajectory target.
     
@@ -139,16 +140,26 @@ def trajectory_deviation(
         Boolean tensor (num_envs,) - True if should terminate.
     """
     use_point_cloud = env.trajectory_manager.cfg.mode.use_point_cloud
-    
+
     if not use_point_cloud:
         # Pose mode: check both position AND rotation thresholds
         pos_error = env._cached_aligned_pose_errors['pos']  # (N,)
         rot_error = env._cached_aligned_pose_errors['rot']  # (N,)
         # Terminate if EITHER threshold exceeded
-        return (pos_error > threshold) | (rot_error > rot_threshold)
-    
-    # Point cloud mode: use mean errors
-    return env._cached_aligned_mean_error > threshold
+        terminated = (pos_error > threshold) | (rot_error > rot_threshold)
+    else:
+        # Point cloud mode: use mean errors
+        terminated = env._cached_aligned_mean_error > threshold
+
+    # Optionally restrict to manipulation phase only (skip grasp/release where object is settling).
+    # Use episode_length_buf (not phase_time, which is stale when terminations run).
+    if manipulation_only:
+        tm = env.trajectory_manager
+        t_now = env.episode_length_buf.float() * env.step_dt
+        in_manipulation = (t_now >= tm.t_grasp_end) & (t_now < tm.t_manip_end)
+        terminated = terminated & in_manipulation
+
+    return terminated
 
 
 def hand_pose_deviation(

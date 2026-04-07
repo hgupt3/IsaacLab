@@ -152,91 +152,153 @@ _STABLE_PLACEMENT_CACHE: dict[str, "StablePlacementCache"] = {}
 
 class StablePlacementCache:
     """Cache for stable placement data - built once, indexed many times.
-    
-    Pre-computes EVERYTHING so runtime is pure tensor indexing with NO loops.
+
+    Stores all stable poses per geometry to support randomized pose sampling.
+    Runtime cost is a small loop over unique geometry groups (not envs).
     """
     def __init__(self, prim_path: str, num_envs: int):
         from pxr import Sdf
         from isaaclab.sim.utils import get_current_stage
-        
+
         self.prim_path = prim_path
         self.num_envs = num_envs
-        
-        # Pre-computed per-env data (indexed by env_id) - FINAL VALUES
+
+        # Per-env data
         self.scales_z = torch.ones(num_envs, dtype=torch.float32)
-        self.z_offsets = torch.zeros(num_envs, dtype=torch.float32)  # z offset from stable pose
-        self.quaternions = torch.zeros(num_envs, 4, dtype=torch.float32)
-        self.quaternions[:, 0] = 1.0  # Default identity (w=1)
         self.valid = torch.zeros(num_envs, dtype=torch.bool)
-        
+
+        # Per-env geometry group index (maps env -> geo group for pose lookup)
+        self.env_geo_idx = torch.zeros(num_envs, dtype=torch.long)
+
+        # Per-geometry pose data (populated in phase 2)
+        # Lists indexed by geo_group_idx
+        self._geo_z_offsets: list[torch.Tensor] = []      # each (num_poses,)
+        self._geo_quaternions: list[torch.Tensor] = []     # each (num_poses, 4)
+        self._geo_probabilities: list[torch.Tensor] = []   # each (num_poses,)
+        self._geo_best_idx: list[int] = []                 # argmax index per geo
+
         # Temporary: group envs by geometry for stable pose computation
         geo_to_envs: dict[str, list[int]] = {}  # geo_key -> [env_ids]
         geo_to_prim: dict[str, tuple] = {}  # geo_key -> (prim, prim_type, geom_scale_z)
-        
+        geo_key_order: list[str] = []  # preserve insertion order for indexing
+
         # Build cache - Phase 1: Group envs by geometry
         stage = get_current_stage()
         root_layer = stage.GetRootLayer()
-        
+
         for env_id in range(num_envs):
             obj_path = prim_path.replace(".*", str(env_id))
             prims = get_all_matching_child_prims(
                 obj_path, predicate=lambda p: p.GetTypeName() in ("Mesh", "Cube", "Sphere", "Cylinder", "Capsule", "Cone")
             )
-            
+
             if not prims:
                 continue
-            
+
             geo_key = _compute_geometry_group_key(prims)
-            
+
             if geo_key not in geo_to_envs:
                 geo_to_envs[geo_key] = []
+                geo_key_order.append(geo_key)
                 prim = prims[0]
                 prim_type = prim.GetTypeName()
                 geom_scale_attr = prim.GetAttribute("xformOp:scale")
                 geom_scale_val = geom_scale_attr.Get() if geom_scale_attr else None
                 geom_scale_z = geom_scale_val[2] if geom_scale_val else 1.0
                 geo_to_prim[geo_key] = (prim, prim_type, geom_scale_z)
-            
+
             geo_to_envs[geo_key].append(env_id)
-            
+
             # Read root scale
             prim_spec = root_layer.GetPrimAtPath(obj_path)
             if prim_spec:
                 scale_attr = prim_spec.attributes.get("xformOp:scale")
                 if scale_attr and scale_attr.default is not None:
                     self.scales_z[env_id] = float(scale_attr.default[2])
-        
-        # Build cache - Phase 2: Compute stable poses per geometry, assign to envs
-        for geo_key, env_list in geo_to_envs.items():
+
+        # Build cache - Phase 2: Compute ALL stable poses per geometry, assign geo index to envs
+        for geo_group_idx, geo_key in enumerate(geo_key_order):
+            env_list = geo_to_envs[geo_key]
             prim, prim_type, geom_scale_z = geo_to_prim[geo_key]
-            
+
             pose_data = _get_stable_pose_data(prim, prim_type)
             if pose_data is None:
+                # Store dummy single-pose entry so indices stay aligned
+                self._geo_z_offsets.append(torch.tensor([0.1]))
+                self._geo_quaternions.append(torch.tensor([[1.0, 0.0, 0.0, 0.0]]))
+                self._geo_probabilities.append(torch.tensor([1.0]))
+                self._geo_best_idx.append(0)
                 continue
-            
+
             transforms, probabilities, mesh_tm = pose_data
-            
-            # Use most stable pose (randomization happens at runtime via index selection)
-            pose_idx = np.argmax(probabilities)
-            stable_transform = transforms[pose_idx]
-            rotation_matrix = stable_transform[:3, :3]
-            
-            # Quaternion
-            quat = Rotation.from_matrix(rotation_matrix).as_quat()  # [x,y,z,w]
-            quat_wxyz = torch.tensor([quat[3], quat[0], quat[1], quat[2]], dtype=torch.float32)
-            
-            # Transformed mesh for z-offset
-            transformed_mesh = mesh_tm.copy()
-            transformed_mesh.apply_transform(stable_transform)
-            z_center = (transformed_mesh.bounds[0, 2] + transformed_mesh.bounds[1, 2]) / 2
-            z_bottom = transformed_mesh.bounds[0, 2]
-            z_offset_unscaled = z_center - z_bottom
-            
-            # Assign to all envs with this geometry (vectorized)
+            num_poses = len(transforms)
+
+            # Pre-compute z_offset and quaternion for ALL stable poses
+            z_offsets_list = []
+            quats_list = []
+            for i in range(num_poses):
+                transform = transforms[i]
+                rotation_matrix = transform[:3, :3]
+                quat = Rotation.from_matrix(rotation_matrix).as_quat()  # [x,y,z,w]
+                quat_wxyz = torch.tensor([quat[3], quat[0], quat[1], quat[2]], dtype=torch.float32)
+
+                transformed_mesh = mesh_tm.copy()
+                transformed_mesh.apply_transform(transform)
+                z_center = (transformed_mesh.bounds[0, 2] + transformed_mesh.bounds[1, 2]) / 2
+                z_bottom = transformed_mesh.bounds[0, 2]
+                z_offset_unscaled = z_center - z_bottom
+
+                z_offsets_list.append(z_offset_unscaled * geom_scale_z)
+                quats_list.append(quat_wxyz)
+
+            self._geo_z_offsets.append(torch.tensor(z_offsets_list))
+            self._geo_quaternions.append(torch.stack(quats_list))
+            self._geo_probabilities.append(torch.tensor(probabilities, dtype=torch.float32))
+            self._geo_best_idx.append(int(np.argmax(probabilities)))
+
+            # Assign geo group index and mark valid
             env_tensor = torch.tensor(env_list, dtype=torch.long)
-            self.z_offsets[env_tensor] = z_offset_unscaled * geom_scale_z
-            self.quaternions[env_tensor] = quat_wxyz
+            self.env_geo_idx[env_tensor] = geo_group_idx
             self.valid[env_tensor] = True
+
+    def get_placement(self, env_ids_t: torch.Tensor, randomize_pose: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        """Get z_offsets and quaternions for given env_ids.
+
+        Args:
+            env_ids_t: (n,) tensor of env indices.
+            randomize_pose: If True, sample from stable poses weighted by probability.
+                           If False, use most stable pose.
+
+        Returns:
+            z_offsets: (n,) tensor of z offsets (unscaled by root scale).
+            quaternions: (n, 4) tensor of quaternions (w, x, y, z).
+        """
+        n = len(env_ids_t)
+        z_offsets = torch.zeros(n, dtype=torch.float32)
+        quaternions = torch.zeros(n, 4, dtype=torch.float32)
+        quaternions[:, 0] = 1.0  # Default identity
+
+        geo_indices = self.env_geo_idx[env_ids_t]
+
+        # Process per geometry group (small loop over unique geometries, not envs)
+        for geo_idx in geo_indices.unique().tolist():
+            mask = geo_indices == geo_idx
+            count = mask.sum().item()
+
+            probs = self._geo_probabilities[geo_idx]
+            geo_quats = self._geo_quaternions[geo_idx]
+            geo_z = self._geo_z_offsets[geo_idx]
+
+            if randomize_pose and len(probs) > 1:
+                # Sample pose index per env weighted by probability
+                pose_indices = torch.multinomial(probs.unsqueeze(0).expand(count, -1), 1).squeeze(1)
+            else:
+                pose_indices = torch.full((count,), self._geo_best_idx[geo_idx], dtype=torch.long)
+
+            z_offsets[mask] = geo_z[pose_indices]
+            quaternions[mask] = geo_quats[pose_indices]
+
+        return z_offsets, quaternions
 
 
 def read_object_scales_from_usd(prim_path: str, num_envs: int) -> torch.Tensor:
@@ -604,9 +666,9 @@ def get_stable_object_placement(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compute stable z-positions and orientations for placing objects on table.
-    
-    OPTIMIZED: Uses global cache built once on first call. Subsequent calls
-    just index into cached data - no USD traversal or for loops.
+
+    Uses global cache built once on first call. Subsequent calls
+    sample or select from cached per-geometry pose data.
 
     Args:
         env_ids: List of environment indices to compute placements for.
@@ -630,27 +692,28 @@ def get_stable_object_placement(
         _STABLE_PLACEMENT_CACHE[prim_path] = StablePlacementCache(prim_path, num_envs)
     
     cache = _STABLE_PLACEMENT_CACHE[prim_path]
-    
-    # === Pure tensor indexing - NO LOOPS! ===
+
     env_ids_t = torch.tensor(env_ids, dtype=torch.long)
-    
-    # Index into pre-computed cache
+
+    # Get pose-specific z_offsets and quaternions (sampled or argmax)
     scales_z = cache.scales_z[env_ids_t]
-    z_offsets = cache.z_offsets[env_ids_t]
-    quaternions = cache.quaternions[env_ids_t].clone()
     valid = cache.valid[env_ids_t]
-    
+    pose_z_offsets, quaternions = cache.get_placement(env_ids_t, randomize_pose)
+
     # Compute final z positions: table + (z_offset * scale) + safety margin
-    z_positions = table_surface_z + (z_offsets * scales_z) + z_offset
-    
-    # Apply fallback for invalid envs
+    z_positions = table_surface_z + (pose_z_offsets * scales_z) + z_offset
+
+    # Apply fallback for invalid envs (z + identity quaternion)
     z_positions = torch.where(valid, z_positions, torch.full_like(z_positions, table_surface_z + 0.1))
-    
+    invalid = ~valid
+    if invalid.any():
+        quaternions[invalid] = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=quaternions.dtype)
+
     # Safety clamp: ensure z-position is never below table surface + minimum clearance
     # This protects against any numerical errors or edge cases in stable pose computation
     min_z = table_surface_z + max(z_offset, 0.003)  # At least 3mm above table
     z_positions = torch.maximum(z_positions, torch.full_like(z_positions, min_z))
-    
+
     return z_positions, quaternions
 
 

@@ -363,6 +363,7 @@ class RewardsConfig:
 class TrajectoryDeviationConfig:
     position_threshold: tuple[float, float]
     rotation_threshold: tuple[float, float]
+    manipulation_only: bool
 
 
 @dataclass
@@ -482,6 +483,7 @@ class ResetRandomizationConfig:
     camera_forward: tuple[float, float]
     camera_lateral: tuple[float, float]
     camera_vertical: tuple[float, float]
+    randomize_stable_pose: bool
 
 
 @dataclass

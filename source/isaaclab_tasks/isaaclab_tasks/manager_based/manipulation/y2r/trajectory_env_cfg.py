@@ -662,7 +662,7 @@ def _build_events_cfg(cfg: Y2RConfig):
                     "yaw": list(cfg.randomization.reset.object_yaw),
                 },
                 "table_surface_z": cfg.workspace.table_surface_z,
-                "randomize_stable_pose": False,
+                "randomize_stable_pose": cfg.randomization.reset.randomize_stable_pose,
                 "asset_cfg": SceneEntityCfg("object"),
                 "z_offset": cfg.randomization.reset.z_offset,
             },
@@ -986,6 +986,7 @@ def _build_terminations_cfg(cfg: Y2RConfig):
             params={
                 "threshold": cfg.terminations.trajectory_deviation.position_threshold[0],
                 "rot_threshold": cfg.terminations.trajectory_deviation.rotation_threshold[0],
+                "manipulation_only": cfg.terminations.trajectory_deviation.manipulation_only,
             },
         )
 
