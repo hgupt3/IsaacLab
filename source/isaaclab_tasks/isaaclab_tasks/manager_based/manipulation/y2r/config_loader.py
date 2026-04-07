@@ -578,6 +578,7 @@ class GenerationConfig:
     base_size: tuple[float, float]
     size_decay: float
     primitive_types: dict[str, float]
+    shape_families: dict[str, float]
     seed: int | None
 
 

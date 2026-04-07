@@ -136,6 +136,12 @@ def _make_primitive(ptype: str, size: float):
         r_max = size * np.random.uniform(0.6, 1.0)
         height = size * np.random.uniform(0.2, 0.5)
         mesh = trimesh.creation.annulus(r_min=r_min, r_max=r_max, height=height)
+    elif ptype == "cone":
+        # Cone with randomized radius and height, centered at origin
+        radius = size * np.random.uniform(0.3, 1.0)
+        height = size * np.random.uniform(0.4, 1.0)
+        mesh = trimesh.creation.cone(radius=radius, height=height)
+        mesh.vertices -= mesh.centroid
     else:
         # Default to sphere
         mesh = trimesh.creation.icosphere(subdivisions=2, radius=size)
@@ -152,31 +158,199 @@ def _sample_surface_point(mesh) -> tuple:
     return point, normal
 
 
+def _scale_to_max_extent(mesh, target_max_extent):
+    """Scale mesh uniformly so its largest dimension equals target_max_extent."""
+    import numpy as np
+    current_max = np.max(mesh.extents)
+    if current_max > 0:
+        scale = target_max_extent / current_max
+        mesh.apply_scale(scale)
+    return mesh
+
+
+def _grow_tool(cfg: dict[str, Any], rng):
+    """
+    Generate a tool-shaped object: elongated handle + wider head at one end.
+
+    The handle is forced to be elongated (6-12x length/width ratio).
+    The head is wider than the handle (1.6-2.8x) and attached at one end.
+    Optional extras (collar, end-cap, second head) fill remaining primitive budget.
+
+    Args:
+        cfg: Generation config dict (same keys as grow_object)
+        rng: numpy random generator
+
+    Returns:
+        Combined mesh, or None if boolean union fails
+    """
+    import numpy as np
+    import trimesh
+
+    # Sample primitive budget
+    min_prims, max_prims = cfg["primitives_per_shape"]
+    num_primitives = int(rng.integers(max(min_prims, 2), max_prims + 1))
+
+    # Handle size from base_size config
+    base_size_min, base_size_max = cfg["base_size"]
+    handle_width = rng.uniform(base_size_min, base_size_max)
+
+    # === HANDLE (1 primitive) ===
+    elongation = rng.uniform(6.0, 12.0)
+    handle_length = handle_width * elongation
+    handle_radius = handle_width / 2
+
+    handle_type = rng.choice(["cylinder", "capsule", "box"])
+    if handle_type == "cylinder":
+        handle = trimesh.creation.cylinder(radius=handle_radius, height=handle_length)
+    elif handle_type == "capsule":
+        handle = trimesh.creation.capsule(radius=handle_radius, height=handle_length)
+    else:  # box
+        # Slight width variation for box cross-section
+        w2 = handle_width * rng.uniform(0.6, 1.0)
+        handle = trimesh.creation.box(extents=(handle_width, w2, handle_length))
+
+    # Use actual bounding box for endpoints (capsule total height includes caps)
+    handle_top_z = handle.bounds[1][2]
+    handle_bot_z = handle.bounds[0][2]
+
+    primitives = [handle]
+    budget_remaining = num_primitives - 1  # At least 1 for primary head
+
+    # === PRIMARY HEAD (1 primitive) ===
+    head_type = _weighted_choice(cfg["primitive_types"])
+    head_width_ratio = rng.uniform(1.8, 3.2)
+    head_target_width = handle_width * head_width_ratio
+    head = _make_primitive(head_type, head_target_width)
+    # Enforce size: scale so max extent matches desired width
+    _scale_to_max_extent(head, head_target_width)
+
+    # Place head at top end of handle with guaranteed overlap
+    head_bounds = head.bounds
+    head_half_extent_z = (head_bounds[1][2] - head_bounds[0][2]) / 2
+    overlap_factor = rng.uniform(0.3, 0.6)
+    head_z = handle_top_z + head_half_extent_z * (1.0 - overlap_factor)
+
+    # Random rotation biased toward perpendicular to handle axis
+    # Tilt angle from Z axis: 60-120 degrees
+    tilt = rng.uniform(np.pi / 3, 2 * np.pi / 3)
+    spin = rng.uniform(0, 2 * np.pi)
+    rot_axis = np.array([np.cos(spin), np.sin(spin), 0.0])
+    rot_matrix = trimesh.transformations.rotation_matrix(tilt, rot_axis)[:3, :3]
+    head.apply_transform(
+        np.vstack([
+            np.hstack([rot_matrix, np.array([[0], [0], [head_z]])]),
+            [0, 0, 0, 1]
+        ])
+    )
+    primitives.append(head)
+    budget_remaining -= 1
+
+    # === OPTIONAL EXTRAS (use remaining budget) ===
+
+    # Collar near head
+    if budget_remaining > 0 and rng.random() < 0.3:
+        collar_radius = handle_radius * rng.uniform(1.1, 1.3)
+        collar_height = handle_width * rng.uniform(0.3, 0.6)
+        collar = trimesh.creation.cylinder(radius=collar_radius, height=collar_height)
+        collar_z = handle_top_z - collar_height
+        collar.apply_translation([0, 0, collar_z])
+        primitives.append(collar)
+        budget_remaining -= 1
+
+    # End-cap at butt end
+    if budget_remaining > 0 and rng.random() < 0.2:
+        cap_type = rng.choice(["sphere", "cylinder"])
+        cap_size = handle_radius * rng.uniform(1.0, 1.3)
+        if cap_type == "sphere":
+            cap = trimesh.creation.icosphere(subdivisions=2, radius=cap_size)
+        else:
+            cap = trimesh.creation.cylinder(radius=cap_size, height=handle_width * 0.4)
+        cap.apply_translation([0, 0, handle_bot_z])
+        primitives.append(cap)
+        budget_remaining -= 1
+
+    # Second head at opposite end (smaller)
+    if budget_remaining > 0 and rng.random() < 0.2:
+        head2_type = _weighted_choice(cfg["primitive_types"])
+        head2_target = head_target_width * rng.uniform(0.5, 0.8)
+        head2 = _make_primitive(head2_type, head2_target)
+        _scale_to_max_extent(head2, head2_target)
+
+        head2_bounds = head2.bounds
+        head2_half_z = (head2_bounds[1][2] - head2_bounds[0][2]) / 2
+        head2_z = handle_bot_z - head2_half_z * (1.0 - overlap_factor)
+
+        tilt2 = rng.uniform(np.pi / 3, 2 * np.pi / 3)
+        spin2 = rng.uniform(0, 2 * np.pi)
+        rot_axis2 = np.array([np.cos(spin2), np.sin(spin2), 0.0])
+        rot_matrix2 = trimesh.transformations.rotation_matrix(tilt2, rot_axis2)[:3, :3]
+        head2.apply_transform(
+            np.vstack([
+                np.hstack([rot_matrix2, np.array([[0], [0], [head2_z]])]),
+                [0, 0, 0, 1]
+            ])
+        )
+        primitives.append(head2)
+        budget_remaining -= 1
+
+    # === BOOLEAN UNION ===
+    result = primitives[0]
+    for mesh in primitives[1:]:
+        try:
+            result = result.union(mesh, engine="manifold")
+        except (ValueError, Exception):
+            return None
+
+    # Clean up mesh
+    result.merge_vertices()
+    result.remove_unreferenced_vertices()
+    result.fill_holes()
+    result.process(validate=True)
+
+    # Center at origin
+    result.vertices -= result.centroid
+    return result
+
+
 def grow_object(cfg: dict[str, Any], rng=None):
     """
     Generate a random object using the grow-the-object algorithm.
-    
+
+    Dispatches to family-specific generators based on shape_families weights.
+
     Args:
         cfg: Generation config with keys:
             - primitives_per_shape: [min, max] number of primitives
             - base_size: [min, max] size of root primitive
             - size_decay: multiplier for child primitive sizes
             - primitive_types: dict of type -> weight
+            - shape_families: dict of family -> weight
         rng: Optional numpy random generator for reproducibility
-    
+
     Returns:
         Combined mesh of all primitives
     """
     import numpy as np
     import trimesh
-    
+
     if rng is None:
         rng = np.random.default_rng()
-    
+
     # Use numpy's random state
     old_state = np.random.get_state()
     np.random.seed(rng.integers(0, 2**31))
-    
+
+    # Select shape family (after RNG seeding for determinism)
+    family = _weighted_choice(cfg["shape_families"])
+    if family == "tool":
+        result = _grow_tool(cfg, rng)
+        np.random.set_state(old_state)
+        return result
+    elif family != "blob":
+        raise ValueError(f"Unknown shape family: '{family}'. Expected 'blob' or 'tool'.")
+
+    # === Blob family (original behavior) ===
+
     # Determine number of primitives
     min_prims, max_prims = cfg.get("primitives_per_shape", [3, 8])
     num_primitives = rng.integers(min_prims, max_prims + 1)
