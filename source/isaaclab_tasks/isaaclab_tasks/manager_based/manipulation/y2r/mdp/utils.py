@@ -251,7 +251,7 @@ class StablePlacementCache:
                 z_offsets_list.append(z_offset_unscaled * geom_scale_z)
                 quats_list.append(quat_wxyz)
 
-            self._geo_z_offsets.append(torch.tensor(z_offsets_list))
+            self._geo_z_offsets.append(torch.tensor(z_offsets_list, dtype=torch.float32))
             self._geo_quaternions.append(torch.stack(quats_list))
             self._geo_probabilities.append(torch.tensor(probabilities, dtype=torch.float32))
             self._geo_best_idx.append(int(np.argmax(probabilities)))
