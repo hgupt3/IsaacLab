@@ -84,7 +84,7 @@ def get_procedural_shape_paths(cfg, y2r_dir: Path) -> list[Path]:
             f"Please generate shapes first by running:\n"
             f"  ./isaaclab.sh -p source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/y2r/scripts/generate_shapes.py\n"
             f"\n"
-            f"Or disable procedural objects in configs/base.yaml:\n"
+            f"Or disable procedural objects in configs/env.yaml:\n"
             f"  procedural_objects:\n"
             f"    enabled: false"
         )

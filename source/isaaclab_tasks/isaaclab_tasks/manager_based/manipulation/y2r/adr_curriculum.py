@@ -119,286 +119,160 @@ def build_curriculum_cfg(cfg: Y2RConfig):
             },
         )
 
-        joint_pos_unoise_min_adr = CurrTerm(
+        # --- Teacher noise: Gaussian std curriculum ---
+        # joint_pos split into arm/hand
+        joint_pos_arm_noise_adr = CurrTerm(
             func=mdp.modify_term_cfg,
             params={
-                "address": "observations.proprio.joint_pos.noise.n_min",
+                "address": "observations.proprio.joint_pos_arm.noise.std",
                 "modify_fn": mdp.initial_final_interpolate_fn,
                 "modify_params": {
-                    "initial_value": 0.0,
-                    "final_value": -cfg.curriculum.teacher_noise.joint_pos[1],
+                    "initial_value": cfg.curriculum.teacher_noise.joint_pos_arm[0],
+                    "final_value": cfg.curriculum.teacher_noise.joint_pos_arm[1],
                     "difficulty_term_str": "adr",
                 },
             },
         )
-
-        joint_pos_unoise_max_adr = CurrTerm(
+        joint_pos_hand_noise_adr = CurrTerm(
             func=mdp.modify_term_cfg,
             params={
-                "address": "observations.proprio.joint_pos.noise.n_max",
+                "address": "observations.proprio.joint_pos_hand.noise.std",
                 "modify_fn": mdp.initial_final_interpolate_fn,
                 "modify_params": {
-                    "initial_value": 0.0,
-                    "final_value": cfg.curriculum.teacher_noise.joint_pos[1],
+                    "initial_value": cfg.curriculum.teacher_noise.joint_pos_hand[0],
+                    "final_value": cfg.curriculum.teacher_noise.joint_pos_hand[1],
                     "difficulty_term_str": "adr",
                 },
             },
         )
-
-        joint_pos_targets_unoise_min_adr = CurrTerm(
+        # joint_vel split into arm/hand
+        joint_vel_arm_noise_adr = CurrTerm(
             func=mdp.modify_term_cfg,
             params={
-                "address": "observations.proprio.joint_pos_targets.noise.n_min",
+                "address": "observations.proprio.joint_vel_arm.noise.std",
                 "modify_fn": mdp.initial_final_interpolate_fn,
                 "modify_params": {
-                    "initial_value": 0.0,
-                    "final_value": -cfg.curriculum.teacher_noise.joint_pos_targets[1],
+                    "initial_value": cfg.curriculum.teacher_noise.joint_vel_arm[0],
+                    "final_value": cfg.curriculum.teacher_noise.joint_vel_arm[1],
                     "difficulty_term_str": "adr",
                 },
             },
         )
-
-        joint_pos_targets_unoise_max_adr = CurrTerm(
+        joint_vel_hand_noise_adr = CurrTerm(
             func=mdp.modify_term_cfg,
             params={
-                "address": "observations.proprio.joint_pos_targets.noise.n_max",
+                "address": "observations.proprio.joint_vel_hand.noise.std",
                 "modify_fn": mdp.initial_final_interpolate_fn,
                 "modify_params": {
-                    "initial_value": 0.0,
+                    "initial_value": cfg.curriculum.teacher_noise.joint_vel_hand[0],
+                    "final_value": cfg.curriculum.teacher_noise.joint_vel_hand[1],
+                    "difficulty_term_str": "adr",
+                },
+            },
+        )
+        joint_pos_targets_noise_adr = CurrTerm(
+            func=mdp.modify_term_cfg,
+            params={
+                "address": "observations.proprio.joint_pos_targets.noise.std",
+                "modify_fn": mdp.initial_final_interpolate_fn,
+                "modify_params": {
+                    "initial_value": cfg.curriculum.teacher_noise.joint_pos_targets[0],
                     "final_value": cfg.curriculum.teacher_noise.joint_pos_targets[1],
                     "difficulty_term_str": "adr",
                 },
             },
         )
-
-        joint_vel_unoise_min_adr = CurrTerm(
+        hand_tips_noise_adr = CurrTerm(
             func=mdp.modify_term_cfg,
             params={
-                "address": "observations.proprio.joint_vel.noise.n_min",
+                "address": "observations.proprio.hand_tips_state_b.noise.std",
                 "modify_fn": mdp.initial_final_interpolate_fn,
                 "modify_params": {
-                    "initial_value": 0.0,
-                    "final_value": -cfg.curriculum.teacher_noise.joint_vel[1],
-                    "difficulty_term_str": "adr",
-                },
-            },
-        )
-
-        joint_vel_unoise_max_adr = CurrTerm(
-            func=mdp.modify_term_cfg,
-            params={
-                "address": "observations.proprio.joint_vel.noise.n_max",
-                "modify_fn": mdp.initial_final_interpolate_fn,
-                "modify_params": {
-                    "initial_value": 0.0,
-                    "final_value": cfg.curriculum.teacher_noise.joint_vel[1],
-                    "difficulty_term_str": "adr",
-                },
-            },
-        )
-
-        hand_tips_pos_unoise_min_adr = CurrTerm(
-            func=mdp.modify_term_cfg,
-            params={
-                "address": "observations.proprio.hand_tips_state_b.noise.n_min",
-                "modify_fn": mdp.initial_final_interpolate_fn,
-                "modify_params": {
-                    "initial_value": 0.0,
-                    "final_value": -cfg.curriculum.teacher_noise.hand_tips[1],
-                    "difficulty_term_str": "adr",
-                },
-            },
-        )
-
-        hand_tips_pos_unoise_max_adr = CurrTerm(
-            func=mdp.modify_term_cfg,
-            params={
-                "address": "observations.proprio.hand_tips_state_b.noise.n_max",
-                "modify_fn": mdp.initial_final_interpolate_fn,
-                "modify_params": {
-                    "initial_value": 0.0,
+                    "initial_value": cfg.curriculum.teacher_noise.hand_tips[0],
                     "final_value": cfg.curriculum.teacher_noise.hand_tips[1],
                     "difficulty_term_str": "adr",
                 },
             },
         )
-
-        hand_eigen_unoise_min_adr = CurrTerm(
+        hand_eigen_noise_adr = CurrTerm(
             func=mdp.modify_term_cfg,
             params={
-                "address": "observations.proprio.hand_eigen.noise.n_min",
+                "address": "observations.proprio.hand_eigen.noise.std",
                 "modify_fn": mdp.initial_final_interpolate_fn,
                 "modify_params": {
-                    "initial_value": 0.0,
-                    "final_value": -cfg.curriculum.teacher_noise.hand_eigen[1],
-                    "difficulty_term_str": "adr",
-                },
-            },
-        )
-
-        hand_eigen_unoise_max_adr = CurrTerm(
-            func=mdp.modify_term_cfg,
-            params={
-                "address": "observations.proprio.hand_eigen.noise.n_max",
-                "modify_fn": mdp.initial_final_interpolate_fn,
-                "modify_params": {
-                    "initial_value": 0.0,
+                    "initial_value": cfg.curriculum.teacher_noise.hand_eigen[0],
                     "final_value": cfg.curriculum.teacher_noise.hand_eigen[1],
                     "difficulty_term_str": "adr",
                 },
             },
         )
-
-        object_obs_unoise_min_adr = CurrTerm(
+        object_pc_noise_adr = CurrTerm(
             func=mdp.modify_term_cfg,
             params={
-                "address": "observations.current_pc.object_point_cloud.noise.n_min",
+                "address": "observations.current_pc.object_point_cloud.noise.std",
                 "modify_fn": mdp.initial_final_interpolate_fn,
                 "modify_params": {
-                    "initial_value": 0.0,
-                    "final_value": -cfg.curriculum.teacher_noise.object_point_cloud[1],
-                    "difficulty_term_str": "adr",
-                },
-            },
-        )
-
-        object_obs_unoise_max_adr = CurrTerm(
-            func=mdp.modify_term_cfg,
-            params={
-                "address": "observations.current_pc.object_point_cloud.noise.n_max",
-                "modify_fn": mdp.initial_final_interpolate_fn,
-                "modify_params": {
-                    "initial_value": 0.0,
+                    "initial_value": cfg.curriculum.teacher_noise.object_point_cloud[0],
                     "final_value": cfg.curriculum.teacher_noise.object_point_cloud[1],
                     "difficulty_term_str": "adr",
                 },
             },
         )
-
-        target_obs_unoise_min_adr = CurrTerm(
+        target_pc_noise_adr = CurrTerm(
             func=mdp.modify_term_cfg,
             params={
-                "address": "observations.future_pc.target_point_clouds.noise.n_min",
+                "address": "observations.future_pc.target_point_clouds.noise.std",
                 "modify_fn": mdp.initial_final_interpolate_fn,
                 "modify_params": {
-                    "initial_value": 0.0,
-                    "final_value": -cfg.curriculum.teacher_noise.target_point_clouds[1],
-                    "difficulty_term_str": "adr",
-                },
-            },
-        )
-
-        target_obs_unoise_max_adr = CurrTerm(
-            func=mdp.modify_term_cfg,
-            params={
-                "address": "observations.future_pc.target_point_clouds.noise.n_max",
-                "modify_fn": mdp.initial_final_interpolate_fn,
-                "modify_params": {
-                    "initial_value": 0.0,
+                    "initial_value": cfg.curriculum.teacher_noise.target_point_clouds[0],
                     "final_value": cfg.curriculum.teacher_noise.target_point_clouds[1],
                     "difficulty_term_str": "adr",
                 },
             },
         )
-
-        object_pose_unoise_min_adr = CurrTerm(
+        object_pose_noise_adr = CurrTerm(
             func=mdp.modify_term_cfg,
             params={
-                "address": "observations.current_poses.object_pose.noise.n_min",
+                "address": "observations.current_poses.object_pose.noise.std",
                 "modify_fn": mdp.initial_final_interpolate_fn,
                 "modify_params": {
-                    "initial_value": 0.0,
-                    "final_value": -cfg.curriculum.teacher_noise.object_pose[1],
-                    "difficulty_term_str": "adr",
-                },
-            },
-        )
-
-        object_pose_unoise_max_adr = CurrTerm(
-            func=mdp.modify_term_cfg,
-            params={
-                "address": "observations.current_poses.object_pose.noise.n_max",
-                "modify_fn": mdp.initial_final_interpolate_fn,
-                "modify_params": {
-                    "initial_value": 0.0,
+                    "initial_value": cfg.curriculum.teacher_noise.object_pose[0],
                     "final_value": cfg.curriculum.teacher_noise.object_pose[1],
                     "difficulty_term_str": "adr",
                 },
             },
         )
-
-        hand_pose_unoise_min_adr = CurrTerm(
+        hand_pose_noise_adr = CurrTerm(
             func=mdp.modify_term_cfg,
             params={
-                "address": "observations.current_poses.hand_pose.noise.n_min",
+                "address": "observations.current_poses.hand_pose.noise.std",
                 "modify_fn": mdp.initial_final_interpolate_fn,
                 "modify_params": {
-                    "initial_value": 0.0,
-                    "final_value": -cfg.curriculum.teacher_noise.hand_pose[1],
-                    "difficulty_term_str": "adr",
-                },
-            },
-        )
-
-        hand_pose_unoise_max_adr = CurrTerm(
-            func=mdp.modify_term_cfg,
-            params={
-                "address": "observations.current_poses.hand_pose.noise.n_max",
-                "modify_fn": mdp.initial_final_interpolate_fn,
-                "modify_params": {
-                    "initial_value": 0.0,
+                    "initial_value": cfg.curriculum.teacher_noise.hand_pose[0],
                     "final_value": cfg.curriculum.teacher_noise.hand_pose[1],
                     "difficulty_term_str": "adr",
                 },
             },
         )
-
-        target_poses_unoise_min_adr = CurrTerm(
+        target_poses_noise_adr = CurrTerm(
             func=mdp.modify_term_cfg,
             params={
-                "address": "observations.future_poses.target_poses.noise.n_min",
+                "address": "observations.future_poses.target_poses.noise.std",
                 "modify_fn": mdp.initial_final_interpolate_fn,
                 "modify_params": {
-                    "initial_value": 0.0,
-                    "final_value": -cfg.curriculum.teacher_noise.target_poses[1],
-                    "difficulty_term_str": "adr",
-                },
-            },
-        )
-
-        target_poses_unoise_max_adr = CurrTerm(
-            func=mdp.modify_term_cfg,
-            params={
-                "address": "observations.future_poses.target_poses.noise.n_max",
-                "modify_fn": mdp.initial_final_interpolate_fn,
-                "modify_params": {
-                    "initial_value": 0.0,
+                    "initial_value": cfg.curriculum.teacher_noise.target_poses[0],
                     "final_value": cfg.curriculum.teacher_noise.target_poses[1],
                     "difficulty_term_str": "adr",
                 },
             },
         )
-
-        hand_pose_targets_unoise_min_adr = CurrTerm(
+        hand_pose_targets_noise_adr = CurrTerm(
             func=mdp.modify_term_cfg,
             params={
-                "address": "observations.future_poses.hand_pose_targets.noise.n_min",
+                "address": "observations.future_poses.hand_pose_targets.noise.std",
                 "modify_fn": mdp.initial_final_interpolate_fn,
                 "modify_params": {
-                    "initial_value": 0.0,
-                    "final_value": -cfg.curriculum.teacher_noise.hand_pose_targets[1],
-                    "difficulty_term_str": "adr",
-                },
-            },
-        )
-
-        hand_pose_targets_unoise_max_adr = CurrTerm(
-            func=mdp.modify_term_cfg,
-            params={
-                "address": "observations.future_poses.hand_pose_targets.noise.n_max",
-                "modify_fn": mdp.initial_final_interpolate_fn,
-                "modify_params": {
-                    "initial_value": 0.0,
+                    "initial_value": cfg.curriculum.teacher_noise.hand_pose_targets[0],
                     "final_value": cfg.curriculum.teacher_noise.hand_pose_targets[1],
                     "difficulty_term_str": "adr",
                 },
@@ -446,11 +320,12 @@ def build_curriculum_cfg(cfg: Y2RConfig):
 
     result = TrajectoryCurriculumCfg()
 
-    # Student noise curriculum for student observation groups only.
+    # Student noise curriculum (Gaussian std) for student observation groups only.
     # Only added when student mode is active (student obs groups are None otherwise).
     if cfg.mode.use_student_mode:
         _student_noise_entries = [
-            ("student_jp",      "observations.student_proprio.joint_pos",                 cfg.curriculum.student_noise.joint_pos),
+            ("student_jp_arm",  "observations.student_proprio.joint_pos_arm",             cfg.curriculum.student_noise.joint_pos_arm),
+            ("student_jp_hand", "observations.student_proprio.joint_pos_hand",            cfg.curriculum.student_noise.joint_pos_hand),
             ("student_eigen",   "observations.student_proprio.hand_eigen",                cfg.curriculum.student_noise.hand_eigen),
             ("student_jp_tgt",  "observations.student_proprio.joint_pos_targets",         cfg.curriculum.student_noise.joint_pos_targets),
             ("student_hpose",   "observations.student_current_poses.hand_pose",           cfg.curriculum.student_noise.hand_pose),
@@ -459,25 +334,13 @@ def build_curriculum_cfg(cfg: Y2RConfig):
             ("student_vtgt",    "observations.student_future_pc.visible_target_sequence", cfg.curriculum.student_noise.target_point_clouds),
         ]
         for name, address, noise_cfg in _student_noise_entries:
-            setattr(result, f"{name}_unoise_min_adr", CurrTerm(
+            setattr(result, f"{name}_noise_adr", CurrTerm(
                 func=mdp.modify_term_cfg,
                 params={
-                    "address": f"{address}.noise.n_min",
+                    "address": f"{address}.noise.std",
                     "modify_fn": mdp.initial_final_interpolate_fn,
                     "modify_params": {
-                        "initial_value": 0.0,
-                        "final_value": -noise_cfg[1],
-                        "difficulty_term_str": "adr",
-                    },
-                },
-            ))
-            setattr(result, f"{name}_unoise_max_adr", CurrTerm(
-                func=mdp.modify_term_cfg,
-                params={
-                    "address": f"{address}.noise.n_max",
-                    "modify_fn": mdp.initial_final_interpolate_fn,
-                    "modify_params": {
-                        "initial_value": 0.0,
+                        "initial_value": noise_cfg[0],
                         "final_value": noise_cfg[1],
                         "difficulty_term_str": "adr",
                     },

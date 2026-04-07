@@ -4,10 +4,10 @@
 
 """Configuration loader for Y2R task with layer-based YAML composition.
 
-YAML is the single source of truth - all values must be defined in configs/base.yaml.
-Layers (robot, mode, task) are composed on top of base config at runtime.
+YAML is the single source of truth - env config in configs/env.yaml, robot config in configs/robots/.
+Layers (robot, mode, task) are composed on top of env config at runtime.
 
-Layer order: base → robot → mode → task
+Layer order: env.yaml → robots/{robot}.yaml → mode → task
 
 All parameters default to env vars (Y2R_MODE, Y2R_TASK, Y2R_ROBOT),
 with fallback defaults defined in _DEFAULT_* constants below.
@@ -414,8 +414,8 @@ class AdvancementTolerancesConfig:
 
 @dataclass
 class NoiseConfig:
-    joint_pos: tuple[float, float]
-    joint_vel: tuple[float, float]
+    joint_pos_arm: tuple[float, float]
+    joint_pos_hand: tuple[float, float]
     joint_pos_targets: tuple[float, float]
     hand_eigen: tuple[float, float]
     hand_tips: tuple[float, float]
@@ -425,6 +425,8 @@ class NoiseConfig:
     target_point_clouds: tuple[float, float]
     target_poses: tuple[float, float]
     hand_pose_targets: tuple[float, float]
+    joint_vel_arm: tuple[float, float] | None = None
+    joint_vel_hand: tuple[float, float] | None = None
 
 
 @dataclass
@@ -764,12 +766,10 @@ def get_config_file_paths(mode: str | None = None, task: str | None = None, robo
     mode, task, robot = _resolve_defaults(mode, task, robot)
 
     config_dir = Path(__file__).parent / "configs"
-    files = [config_dir / "base.yaml"]
+    files = [config_dir / "env.yaml"]
 
-    # Robot layer (applied first, before mode/task)
-    robot_layer = config_dir / "layers" / "robots" / f"{robot}.yaml"
-    if robot_layer.exists():
-        files.append(robot_layer)
+    # Robot config (required)
+    files.append(config_dir / "robots" / f"{robot}.yaml")
 
     # Mode layers (mirrors get_config() logic exactly)
     if mode == "distill":
@@ -818,12 +818,10 @@ def get_config(mode: str | None = None, task: str | None = None, robot: str | No
     """
     mode, task, robot = _resolve_defaults(mode, task, robot)
 
-    cfg = _load_yaml("base")
+    cfg = _load_yaml("env")
 
-    # Robot layer (applied first, before mode/task)
-    robot_layer = Path(__file__).parent / "configs" / "layers" / "robots" / f"{robot}.yaml"
-    if robot_layer.exists():
-        cfg = _deep_merge(cfg, _load_yaml(f"layers/robots/{robot}"))
+    # Robot config (required — crash if missing)
+    cfg = _deep_merge(cfg, _load_yaml(f"robots/{robot}"))
 
     # Mode layers (mutually exclusive paths)
     if mode == "distill":
@@ -856,3 +854,20 @@ def get_config(mode: str | None = None, task: str | None = None, robot: str | No
         cfg["trajectory"]["segments"] = _parse_segments(cfg["trajectory"]["segments"])
 
     return _auto_parse(Y2RConfig, cfg)
+
+
+def _tuples_to_lists(obj: Any) -> Any:
+    """Recursively convert tuples to lists for safe YAML serialization."""
+    if isinstance(obj, dict):
+        return {k: _tuples_to_lists(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_tuples_to_lists(v) for v in obj]
+    return obj
+
+
+def save_config(cfg: Y2RConfig, path: str | Path) -> None:
+    """Save a Y2RConfig to a safe-loadable YAML file."""
+    from dataclasses import asdict
+    data = _tuples_to_lists(asdict(cfg))
+    with open(path, "w") as f:
+        yaml.dump(data, f, default_flow_style=False, sort_keys=False)

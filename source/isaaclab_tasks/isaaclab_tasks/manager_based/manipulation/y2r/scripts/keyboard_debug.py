@@ -23,7 +23,7 @@ Joint modes (cycle with Up/Down):
     [1..16]         - Individual finger joints
 
 Usage:
-    ./isaac_scripts/keyboard.sh
+    ./y2r_sim/run/keyboard.sh
 """
 
 import argparse

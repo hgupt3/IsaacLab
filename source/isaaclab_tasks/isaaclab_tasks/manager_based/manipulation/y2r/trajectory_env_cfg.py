@@ -30,7 +30,7 @@ from isaaclab.sensors import ContactSensorCfg
 from isaaclab.sim import CapsuleCfg, ConeCfg, CuboidCfg, CylinderCfg, RigidBodyMaterialCfg, SphereCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
-from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
+from isaaclab.utils.noise import GaussianNoiseCfg as Gnoise
 
 from . import mdp
 from .adr_curriculum import build_curriculum_cfg
@@ -282,12 +282,30 @@ def _build_observations_cfg(cfg: Y2RConfig):
     @configclass
     class ProprioObsCfg(ObsGroup):
         """Observations for proprioception group."""
-        joint_pos = ObsTerm(func=mdp.joint_pos, noise=Unoise(n_min=-0.0, n_max=0.0))
-        joint_vel = ObsTerm(func=mdp.joint_vel, noise=Unoise(n_min=-0.0, n_max=0.0))
-        joint_pos_targets = ObsTerm(func=mdp.joint_pos_targets, noise=Unoise(n_min=-0.0, n_max=0.0))
+        joint_pos_arm = ObsTerm(
+            func=mdp.joint_pos,
+            noise=Gnoise(mean=0.0, std=0.0),
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=[cfg.robot.arm_joint_regex])},
+        )
+        joint_pos_hand = ObsTerm(
+            func=mdp.joint_pos,
+            noise=Gnoise(mean=0.0, std=0.0),
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=mdp.ALLEGRO_HAND_JOINT_NAMES)},
+        )
+        joint_vel_arm = ObsTerm(
+            func=mdp.joint_vel,
+            noise=Gnoise(mean=0.0, std=0.0),
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=[cfg.robot.arm_joint_regex])},
+        )
+        joint_vel_hand = ObsTerm(
+            func=mdp.joint_vel,
+            noise=Gnoise(mean=0.0, std=0.0),
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=mdp.ALLEGRO_HAND_JOINT_NAMES)},
+        )
+        joint_pos_targets = ObsTerm(func=mdp.joint_pos_targets, noise=Gnoise(mean=0.0, std=0.0))
         hand_eigen = ObsTerm(
             func=mdp.allegro_hand_eigen_b,
-            noise=Unoise(n_min=-0.0, n_max=0.0),
+            noise=Gnoise(mean=0.0, std=0.0),
             params={
                 "arm_joint_count": cfg.robot.arm_joint_count,
                 "hand_joint_count": cfg.robot.hand_joint_count,
@@ -297,7 +315,7 @@ def _build_observations_cfg(cfg: Y2RConfig):
         )
         hand_tips_state_b = ObsTerm(
             func=mdp.body_state_b,
-            noise=Unoise(n_min=-0.0, n_max=0.0),
+            noise=Gnoise(mean=0.0, std=0.0),
             params={
                 "body_asset_cfg": SceneEntityCfg("robot"),
                 "base_asset_cfg": SceneEntityCfg("robot"),
@@ -319,7 +337,7 @@ def _build_observations_cfg(cfg: Y2RConfig):
         """Current object point cloud with history."""
         object_point_cloud = ObsTerm(
             func=mdp.object_point_cloud_b,
-            noise=Unoise(n_min=-0.0, n_max=0.0),
+            noise=Gnoise(mean=0.0, std=0.0),
             params={
                 "num_points": cfg.observations.num_points,
                 "flatten": True,
@@ -338,11 +356,11 @@ def _build_observations_cfg(cfg: Y2RConfig):
         """Current poses: object + hand (teacher sees both)."""
         object_pose = ObsTerm(
             func=mdp.object_pose_b,
-            noise=Unoise(n_min=-0.0, n_max=0.0),
+            noise=Gnoise(mean=0.0, std=0.0),
         )
         hand_pose = ObsTerm(
             func=mdp.hand_pose_b,
-            noise=Unoise(n_min=-0.0, n_max=0.0),
+            noise=Gnoise(mean=0.0, std=0.0),
         )
 
         def __post_init__(self):
@@ -357,7 +375,7 @@ def _build_observations_cfg(cfg: Y2RConfig):
         """Future point cloud trajectory targets."""
         target_point_clouds = ObsTerm(
             func=mdp.target_sequence_obs_b,
-            noise=Unoise(n_min=-0.0, n_max=0.0),
+            noise=Gnoise(mean=0.0, std=0.0),
             params={},
         )
 
@@ -373,11 +391,11 @@ def _build_observations_cfg(cfg: Y2RConfig):
         """Future poses: object + hand targets (teacher sees both)."""
         target_poses = ObsTerm(
             func=mdp.target_sequence_poses_b,
-            noise=Unoise(n_min=-0.0, n_max=0.0),
+            noise=Gnoise(mean=0.0, std=0.0),
         )
         hand_pose_targets = ObsTerm(
             func=mdp.hand_pose_targets_b,
-            noise=Unoise(n_min=-0.0, n_max=0.0),
+            noise=Gnoise(mean=0.0, std=0.0),
         )
         timing = ObsTerm(
             func=mdp.trajectory_timing,
@@ -403,7 +421,7 @@ def _build_observations_cfg(cfg: Y2RConfig):
         """Current poses: hand ONLY (student can't see object pose perfectly)."""
         hand_pose = ObsTerm(
             func=mdp.hand_pose_b,
-            noise=Unoise(n_min=-0.0, n_max=0.0),
+            noise=Gnoise(mean=0.0, std=0.0),
         )
 
         def __post_init__(self):
@@ -418,7 +436,7 @@ def _build_observations_cfg(cfg: Y2RConfig):
         """Future poses: hand targets ONLY (student can't see object targets perfectly)."""
         hand_pose_targets = ObsTerm(
             func=mdp.hand_pose_targets_b,
-            noise=Unoise(n_min=-0.0, n_max=0.0),
+            noise=Gnoise(mean=0.0, std=0.0),
         )
         timing = ObsTerm(
             func=mdp.trajectory_timing,
@@ -433,15 +451,24 @@ def _build_observations_cfg(cfg: Y2RConfig):
 
     @configclass
     class StudentProprioObsCfg(ObsGroup):
-        """Student proprioception: joint_pos, hand_eigen only.
+        """Student proprioception: joint_pos (arm+hand split), hand_eigen only.
 
         No joint_vel, hand_tips_state, contacts, or object_pose_palm (all privileged).
         """
-        joint_pos = ObsTerm(func=mdp.joint_pos, noise=Unoise(n_min=-0.0, n_max=0.0))
-        joint_pos_targets = ObsTerm(func=mdp.joint_pos_targets, noise=Unoise(n_min=-0.0, n_max=0.0))
+        joint_pos_arm = ObsTerm(
+            func=mdp.joint_pos,
+            noise=Gnoise(mean=0.0, std=0.0),
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=[cfg.robot.arm_joint_regex])},
+        )
+        joint_pos_hand = ObsTerm(
+            func=mdp.joint_pos,
+            noise=Gnoise(mean=0.0, std=0.0),
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=mdp.ALLEGRO_HAND_JOINT_NAMES)},
+        )
+        joint_pos_targets = ObsTerm(func=mdp.joint_pos_targets, noise=Gnoise(mean=0.0, std=0.0))
         hand_eigen = ObsTerm(
             func=mdp.allegro_hand_eigen_b,
-            noise=Unoise(n_min=-0.0, n_max=0.0),
+            noise=Gnoise(mean=0.0, std=0.0),
             params={
                 "arm_joint_count": cfg.robot.arm_joint_count,
                 "hand_joint_count": cfg.robot.hand_joint_count,
@@ -460,7 +487,7 @@ def _build_observations_cfg(cfg: Y2RConfig):
         """Student visible point cloud from visibility camera."""
         visible_point_cloud = ObsTerm(
             func=mdp.visible_object_point_cloud_b,
-            noise=Unoise(n_min=-0.0, n_max=0.0),
+            noise=Gnoise(mean=0.0, std=0.0),
             params={
                 "num_points": cfg.observations.student_num_points,
                 "flatten": True,
@@ -479,7 +506,7 @@ def _build_observations_cfg(cfg: Y2RConfig):
         """Student visible target sequence."""
         visible_target_sequence = ObsTerm(
             func=mdp.visible_target_sequence_obs_b,
-            noise=Unoise(n_min=-0.0, n_max=0.0),
+            noise=Gnoise(mean=0.0, std=0.0),
             params={},
         )
 

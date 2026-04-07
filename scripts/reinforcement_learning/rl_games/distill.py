@@ -299,7 +299,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     os.makedirs(os.path.join(log_root_path, log_dir, "params"), exist_ok=True)
     dump_yaml(os.path.join(log_root_path, log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_root_path, log_dir, "params", "agent.yaml"), agent_cfg)
-    
+    # Save composed Y2R config for deployment reproducibility
+    from isaaclab_tasks.manager_based.manipulation.y2r.config_loader import get_config, save_config
+    save_config(get_config(), os.path.join(log_root_path, log_dir, "params", "y2r_config.yaml"))
+
     print(f"[INFO] Experiment directory: {os.path.join(log_root_path, log_dir)}")
     print(f"[INFO] Teacher checkpoint: {teacher_ckpt}")
     print(f"[INFO] Beta (teacher env ratio): {agent_cfg['params']['distillation']['beta']}")
@@ -411,15 +414,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             y2r_task = os.environ.get("Y2R_TASK", "base")
 
             # Structured config logging - maximizes signal, minimizes noise
+            from isaaclab_tasks.manager_based.manipulation.y2r.config_loader import get_config_file_paths
             wandb.config.update({
                 "run_metadata": {
                     "y2r_mode": y2r_mode,
                     "y2r_task": y2r_task,
-                    "config_layers": [
-                        "base.yaml",
-                        "layers/student.yaml",  # Distillation always uses student layer
-                        *([] if y2r_task == "base" else [f"layers/tasks/{y2r_task}.yaml"])
-                    ],
+                    "config_layers": [p.name for p in get_config_file_paths()],
                     "num_envs": env_cfg.scene.num_envs,
                     "device": str(env_cfg.sim.device),
                     "seed": agent_cfg["params"]["seed"],

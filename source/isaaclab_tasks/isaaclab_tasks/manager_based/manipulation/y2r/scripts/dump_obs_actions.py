@@ -13,8 +13,8 @@ and eigen values. This reveals exactly what each action channel does.
 Action layout: [arm(6) | eigen(5) | hand_raw(16)] = 27D
 
 Usage:
-    ./isaac_scripts/dump_obs.sh
-    ./isaac_scripts/dump_obs.sh --interactive --tick-delay 0.2
+    ./y2r_sim/run/dump_obs.sh
+    ./y2r_sim/run/dump_obs.sh --interactive --tick-delay 0.2
 """
 
 import argparse

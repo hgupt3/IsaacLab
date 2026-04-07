@@ -228,6 +228,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_root_path, log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_root_path, log_dir, "params", "agent.yaml"), agent_cfg)
+    # Save composed Y2R config for deployment reproducibility
+    from isaaclab_tasks.manager_based.manipulation.y2r.config_loader import get_config, save_config
+    save_config(get_config(), os.path.join(log_root_path, log_dir, "params", "y2r_config.yaml"))
     print(f"Exact experiment name requested from command line: {os.path.join(log_root_path, log_dir)}")
 
     # read configurations about the agent-training
@@ -346,15 +349,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             log_y2r_config_files()
 
             # Structured config logging - maximizes signal, minimizes noise
+            from isaaclab_tasks.manager_based.manipulation.y2r.config_loader import get_config_file_paths
             wandb.config.update({
                 "run_metadata": {
                     "y2r_mode": y2r_mode,
                     "y2r_task": y2r_task,
-                    "config_layers": [
-                        "base.yaml",
-                        *([] if y2r_mode == "train" else [f"layers/{y2r_mode}.yaml"]),
-                        *([] if y2r_task == "base" else [f"layers/tasks/{y2r_task}.yaml"])
-                    ],
+                    "config_layers": [p.name for p in get_config_file_paths()],
                     "num_envs": env_cfg.scene.num_envs,
                     "device": str(env_cfg.sim.device),
                     "seed": agent_cfg["params"]["seed"],
