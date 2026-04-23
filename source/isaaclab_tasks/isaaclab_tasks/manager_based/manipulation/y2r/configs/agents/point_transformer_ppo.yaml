@@ -36,8 +36,8 @@ params:
     point_encoder_norm: True  # LayerNorm on point tokens
     proprio_encoder_layers: [64, 64]  # 2-layer proprio encoder
     proprio_encoder_norm: True  # LayerNorm on proprio token
-    flash_attention: True        # True = allow fused/flash SDPA when supported; False = force math backend (batch > 65535)
-    torch_compile: True           # torch.compile the network (reduce-overhead + dynamic)
+    flash_attention: False       # Force MATH SDPA backend: at tiny S_kv (32 tokens) EFFICIENT_ATTENTION reserves ~10 GB workspace; MATH uses ~300 MB
+    torch_compile: False           # torch.compile the network (reduce-overhead + dynamic)
     mlp:
       units: [512, 256, 128]
       activation: elu
