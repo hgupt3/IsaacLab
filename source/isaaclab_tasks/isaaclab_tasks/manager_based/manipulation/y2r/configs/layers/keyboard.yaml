@@ -41,3 +41,9 @@ procedural_objects:
   generation:
     num_shapes: 1
 
+# Keyboard mode is interactive teleop with a single "hold" segment (always
+# phase 1). Random object wrenches would fight the operator — disable.
+randomization:
+  object_perturbation:
+    enabled: false
+

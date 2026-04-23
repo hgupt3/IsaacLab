@@ -499,10 +499,19 @@ class ResetRandomizationConfig:
 
 
 @dataclass
+class ObjectPerturbationConfig:
+    enabled: bool
+    interval_s: tuple[float, float]
+    force: tuple[float, float]
+    torque: tuple[float, float]
+
+
+@dataclass
 class RandomizationConfig:
     object: ObjectRandomizationConfig
     robot: RobotRandomizationConfig
     reset: ResetRandomizationConfig
+    object_perturbation: ObjectPerturbationConfig
 
 
 @dataclass

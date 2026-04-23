@@ -19,6 +19,7 @@ from isaaclab.utils.math import (
     quat_from_euler_xyz,
     quat_inv,
     quat_mul,
+    sample_uniform,
     subtract_frame_transforms,
 )
 
@@ -1362,6 +1363,74 @@ class target_sequence_obs_b(ManagerTermBase):
         self._last_final_rot_error = torch.zeros(N, device=device)
         self._last_grasp_contact_rate = torch.zeros(N, device=device)
 
+        # --- Object wrench perturbation state (manipulation-phase only) ---
+        # See _apply_object_perturbation. Buffers are full-size (all envs) so we can
+        # always issue ONE set_external_force_and_torque(env_ids=None) call per step,
+        # which keeps the asset-wide has_external_wrench flag correct.
+        self._perturb_cfg = y2r_cfg.randomization.object_perturbation
+        self._wrench_buffers_initialized = False
+
+    def _init_wrench_buffers(self, env):
+        """Lazy allocation: object.num_bodies is only valid after sim init."""
+        if self._wrench_buffers_initialized:
+            return
+        N = env.num_envs
+        nb = self.object.num_bodies
+        device = env.device
+        self._wrench_force = torch.zeros((N, nb, 3), device=device)
+        self._wrench_torque = torch.zeros((N, nb, 3), device=device)
+        # time_left is in *manipulation seconds*; only decrements while phase == 1.
+        # Initialized to 0 so the first manipulation step triggers an immediate sample.
+        self._wrench_time_left = torch.zeros(N, device=device)
+        self._wrench_num_bodies = nb
+        self._wrench_buffers_initialized = True
+
+    def _apply_object_perturbation(self, env):
+        """Apply random body-local wrench to the object during manipulation phase.
+
+        Resamples force/torque every interval_s of *manipulation time* per env.
+        For envs not in phase 1, buffers are zero and timer is reset, so the first
+        manipulation step after re-entry resamples immediately.
+
+        Issues a single set_external_force_and_torque(env_ids=None) call so the
+        asset-wide has_external_wrench flag is True iff any env has a nonzero
+        wrench (avoids the global-disable footgun in rigid_object.py:420-423).
+        """
+        self._init_wrench_buffers(env)
+        cfg = self._perturb_cfg
+
+        phase = env.trajectory_manager.get_phase()  # (N,) int64
+        in_manip = (phase == 1)
+        not_manip = ~in_manip
+
+        # Tick down the timer only for envs currently in manipulation
+        if in_manip.any():
+            self._wrench_time_left[in_manip] = self._wrench_time_left[in_manip] - self.dt
+
+        # Resample where timer expired AND env is in manipulation
+        resample = in_manip & (self._wrench_time_left <= 0.0)
+        if resample.any():
+            n = int(resample.sum().item())
+            nb = self._wrench_num_bodies
+            device = self._wrench_force.device
+            f_lo, f_hi = cfg.force
+            t_lo, t_hi = cfg.torque
+            i_lo, i_hi = cfg.interval_s
+            self._wrench_force[resample] = sample_uniform(f_lo, f_hi, (n, nb, 3), device)
+            self._wrench_torque[resample] = sample_uniform(t_lo, t_hi, (n, nb, 3), device)
+            self._wrench_time_left[resample] = sample_uniform(i_lo, i_hi, (n,), device)
+
+        # Hold zero (and reset timer) for non-manipulation envs
+        if not_manip.any():
+            self._wrench_force[not_manip] = 0.0
+            self._wrench_torque[not_manip] = 0.0
+            self._wrench_time_left[not_manip] = 0.0
+
+        # Single full-buffer call — keeps has_external_wrench correct globally
+        self.object.set_external_force_and_torque(
+            self._wrench_force, self._wrench_torque, env_ids=None
+        )
+
     def reset(self, env_ids=None):
         """Compute episode metrics for resetting envs and reset accumulators.
 
@@ -1413,6 +1482,16 @@ class target_sequence_obs_b(ManagerTermBase):
             self._ep_success_ever[ids] = False
             self._ep_grasp_contact_steps[ids] = 0
             self._ep_grasp_total_steps[ids] = 0
+
+            # Clear object perturbation state so an env that resets directly into
+            # phase 1 (e.g. configs whose first segment is "manipulation"/"hold")
+            # doesn't carry over the previous episode's sampled wrench. The asset's
+            # own external-wrench buffer is already zeroed by scene.reset(); this
+            # clears OUR mirror so the first manipulation step resamples cleanly.
+            if self._wrench_buffers_initialized:
+                self._wrench_force[ids] = 0.0
+                self._wrench_torque[ids] = 0.0
+                self._wrench_time_left[ids] = 0.0
 
         # Report global mean over all envs (like Episode_Termination/*)
         metrics = {}
@@ -2007,7 +2086,13 @@ class target_sequence_obs_b(ManagerTermBase):
             self.trajectory_manager.step(self.dt, object_poses=object_poses)
         else:
             self.trajectory_manager.step(self.dt)
-        
+
+        # Apply manipulation-phase wrench perturbation (after traj.step() so phase is fresh).
+        # The wrench lives in body-local frame; written into the asset's external-wrench
+        # buffer here and pushed to PhysX by scene.write_data_to_sim() on the next step.
+        if self._perturb_cfg.enabled:
+            self._apply_object_perturbation(env)
+
         # Get window targets: (N, W, 7) - pos(3) + quat(4)
         window_targets = self.trajectory_manager.get_window_targets()
         

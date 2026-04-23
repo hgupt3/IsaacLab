@@ -25,6 +25,10 @@ randomization:
     camera_forward: [0.0, 0.0]
     camera_lateral: [0.0, 0.0]
     camera_vertical: [0.0, 0.0]
+  # Sysid hold segment maps to phase 1 (manipulation), so the perturbation
+  # would fire continuously and corrupt actuator-parameter fitting. Disable.
+  object_perturbation:
+    enabled: false
 
 # Disable terminations so envs don't reset during trials
 terminations:
