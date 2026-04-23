@@ -137,24 +137,49 @@ class KukaAllegroTrajectoryMixinCfg:
         # Add Kuka-specific rewards
         _build_kuka_allegro_rewards_cfg(cfg, self.rewards)
 
-        # Setup contact sensors for fingertips
-        finger_tip_body_list = ["index_link_3", "middle_link_3", "ring_link_3", "thumb_link_3"]
-        for link_name in finger_tip_body_list:
+        # Setup contact sensors from contact_layout (single source of truth).
+        layout = cfg.robot.contact_layout
+        tier1_bodies = set(layout.thumb_bodies)
+        for bodies in layout.finger_bodies:
+            tier1_bodies.update(bodies)
+        all_sensor_bodies = sorted(
+            tier1_bodies
+            | set(layout.palm_proximal_bodies)
+            | set(layout.self_contact_bodies)
+        )
+        for link_name in all_sensor_bodies:
             setattr(
                 self.scene,
                 f"{link_name}_object_s",
                 ContactSensorCfg(
-                    prim_path="{ENV_REGEX_NS}/Robot/ee_link/" + link_name,
+                    prim_path="{ENV_REGEX_NS}/Robot/" + layout.sensor_prim_prefix + link_name,
                     filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
                 ),
             )
 
-        # Contact force observation
+        # Contact force observation (fingertips — first body of each finger group)
+        finger_tip_body_list = layout.thumb_bodies + [bodies[0] for bodies in layout.finger_bodies]
         self.observations.proprio.contact = ObsTerm(
             func=mdp.fingers_contact_force_b,
             params={"contact_sensor_names": [f"{link}_object_s" for link in finger_tip_body_list]},
             clip=(-20.0, 20.0),
         )
+
+        # Link_2 contact force observation — present when finger_bodies has a second body.
+        # Allegro only lists link_3 per finger, so this falls back to fingertip sensors
+        # (teacher privileged obs keeps same shape across robots).
+        link_2_sensor_names = [
+            f"{bodies[1]}_object_s" if len(bodies) > 1 else f"{bodies[0]}_object_s"
+            for bodies in layout.finger_bodies
+        ]
+        self.observations.proprio.link_2_contact = ObsTerm(
+            func=mdp.fingers_contact_force_b,
+            params={"contact_sensor_names": link_2_sensor_names},
+            clip=(-20.0, 20.0),
+        )
+
+        # Object pose in palm frame (teacher-only privileged) — robot-agnostic function.
+        self.observations.proprio.object_pose_palm = ObsTerm(func=mdp.object_pose_palm_b)
 
         # Hand tips state observation
         self.observations.proprio.hand_tips_state_b.params["body_asset_cfg"].body_names = ["palm_link", ".*_tip"]

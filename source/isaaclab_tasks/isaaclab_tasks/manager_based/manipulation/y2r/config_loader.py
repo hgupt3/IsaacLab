@@ -333,6 +333,10 @@ class ContactFactorConfig:
     ramp: float
     min_factor: float
     thumb_gate_floor: float
+    # Tier 2 (palm + proximal links, flat capped bonus)
+    palm_weight: float      # Max additive contribution from palm + link_1 contact (0 = disabled)
+    palm_threshold: float   # Total force below this ignored (N)
+    palm_ramp: float        # Range over which palm factor ramps 0→1 (N)
 
 
 @dataclass
@@ -357,6 +361,7 @@ class RewardsConfig:
     finger_regularizer: RewardConfig
     object_stillness: RewardConfig
     timeout_bonus: RewardConfig
+    finger_self_contact_penalty: RewardConfig
 
 
 @dataclass
@@ -450,6 +455,13 @@ class CurriculumConfig:
 
 
 @dataclass
+class ObjectConfig:
+    """Static object physics properties (non-randomized)."""
+    linear_damping: float | None   # None/null = PhysX default (0.0)
+    angular_damping: float | None  # None/null = PhysX default (0.05)
+
+
+@dataclass
 class ObjectRandomizationConfig:
     scale: tuple[float, float]
     mass_scale: tuple[float, float]
@@ -537,6 +549,31 @@ class PalmFrameOffsetConfig:
 
 
 @dataclass
+class ContactLayoutConfig:
+    """Per-robot contact sensor layout.
+
+    Declares which bodies have ContactSensorCfg entries (filtered to Object) and their
+    geometry for nail-gating. Drives both sensor creation in robot mixins and per-step
+    contact reward computation in mdp/rewards.py — single source of truth.
+    """
+    # Prefix between "{ENV_REGEX_NS}/Robot/" and the body name (e.g. "" for LEAP,
+    # "ee_link/" for kuka_allegro where hand bodies live under the end-effector).
+    sensor_prim_prefix: str
+    # Tier 1 sensors (per-finger contact): body names for thumb gate + non-thumb finger groups.
+    # Each finger group takes max force across its listed bodies (usually link_2 + link_3).
+    thumb_bodies: list[str]
+    finger_bodies: list[list[str]]   # outer: per finger (index/middle/ring); inner: bodies per finger
+    # Tier 2 sensors (palm + proximal flat bonus). Empty list → Tier 2 disabled for this robot.
+    palm_proximal_bodies: list[str]
+    # Sensors used for finger_self_contact_penalty residual (net_forces − object_filter).
+    self_contact_bodies: list[str]
+    # Pad-normal direction in each body's local frame, for nail-contact gating.
+    # Bodies not listed skip gating (treat all force as valid). Tier 2 uses raw force,
+    # ignores this dict.
+    pad_normals: dict[str, list[float]]
+
+
+@dataclass
 class RobotConfig:
     action_scale: float
     arm_joint_count: int
@@ -548,6 +585,7 @@ class RobotConfig:
     wrist_joint_name: str
     arm_joint_regex: str
     hand_body_regex: str
+    contact_layout: ContactLayoutConfig
     palm_frame_offset: PalmFrameOffsetConfig | None = None
     tip_offsets: dict[str, list[float]] | None = None
 
@@ -640,6 +678,7 @@ class Y2RConfig:
     robot: RobotConfig
     push_t: PushTConfig
     procedural_objects: ProceduralObjectsConfig
+    object: ObjectConfig
     wrist_camera: WristCameraConfig
     visibility_camera: VisibilityCameraConfig
 

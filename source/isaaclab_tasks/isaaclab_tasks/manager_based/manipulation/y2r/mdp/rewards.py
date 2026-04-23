@@ -107,99 +107,79 @@ def _get_hand_pose_gate(env: ManagerBasedRLEnv) -> torch.Tensor:
 
 
 def _get_finger_contact_mags(env: ManagerBasedRLEnv):
-    """Cached per-step finger contact magnitudes: max(link_3, link_2) per finger.
+    """Cached per-step finger contact magnitudes driven by cfg.robot.contact_layout.
 
-    Applies nail-contact gating: contacts on the back/nail side of finger links
-    are multiplied by nail_contact_gate (0.0 = ignore, 1.0 = no gating).
-    Pad-normal directions are from URDF analysis (pad = -X for all links except
-    thumb_link_2 which is +X due to 180° yaw in thumb_joint_3).
+    Returns (thumb_mag, *other_mags) where each magnitude is max force across that
+    finger's listed bodies. Applies nail-contact gating to any body listed in
+    contact_layout.pad_normals; bodies without a pad_normal skip gating (raw magnitude).
+
+    Layout shape: thumb_bodies and each entry of finger_bodies are lists of body names
+    (usually link_2 + link_3 for LEAP, link_3 only for allegro). No hardcoded names.
     """
     step = env.common_step_counter
     cached = getattr(env, '_cached_finger_mags', None)
     if cached is not None and cached[0] == step:
         return cached[1]
 
-    nail_gate = env.cfg.y2r_cfg.rewards.contact_factor.nail_gate
-    nail_gate_min = env.cfg.y2r_cfg.rewards.contact_factor.nail_gate_min
+    cf_cfg = env.cfg.y2r_cfg.rewards.contact_factor
+    layout = env.cfg.y2r_cfg.robot.contact_layout
+    nail_gate = cf_cfg.nail_gate
+    nail_gate_min = cf_cfg.nail_gate_min
+    use_gating = (nail_gate < 1.0) and len(layout.pad_normals) > 0
 
-    # Fast path: no gating needed
-    if nail_gate >= 1.0:
-        thumb_mag = env.scene.sensors["thumb_link_3_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1)
-        index_mag = torch.maximum(
-            env.scene.sensors["index_link_3_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
-            env.scene.sensors["index_link_2_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
-        )
-        middle_mag = torch.maximum(
-            env.scene.sensors["middle_link_3_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
-            env.scene.sensors["middle_link_2_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
-        )
-        ring_mag = torch.maximum(
-            env.scene.sensors["ring_link_3_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
-            env.scene.sensors["ring_link_2_object_s"].data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1),
-        )
-        mags = (thumb_mag, index_mag, middle_mag, ring_mag)
-        env._cached_finger_mags = (step, mags)
-        return mags
-
-    # Pad-normal in each link's local frame (from URDF joint analysis)
-    # Thumb uses only link_3 (fingertip mesh is large enough)
-    _PAD_NORMALS = {
-        "thumb_link_3":  (-1.0, 0.0, 0.0),
-        "index_link_3":  (-1.0, 0.0, 0.0), "index_link_2":  (-1.0, 0.0, 0.0),
-        "middle_link_3": (-1.0, 0.0, 0.0), "middle_link_2": (-1.0, 0.0, 0.0),
-        "ring_link_3":   (-1.0, 0.0, 0.0), "ring_link_2":   (-1.0, 0.0, 0.0),
-    }
-
-    # Cache body indices and pad-normal tensors on first call
-    if not hasattr(env, '_nail_gate_cache'):
+    # Build per-step gate cache once per environment
+    if use_gating and not hasattr(env, '_nail_gate_cache'):
         robot: Articulation = env.scene["robot"]
-        cache = {}
-        for link_name, normal in _PAD_NORMALS.items():
+        cache: dict[str, tuple[int, torch.Tensor]] = {}
+        for link_name, normal in layout.pad_normals.items():
             ids = robot.find_bodies(link_name)[0]
             body_idx = ids[0] if len(ids) > 0 else None
-            pad_tensor = torch.tensor(normal, device=env.device, dtype=torch.float32)
+            pad_tensor = torch.tensor(tuple(normal), device=env.device, dtype=torch.float32)
             cache[link_name] = (body_idx, pad_tensor)
         env._nail_gate_cache = cache
 
-    robot: Articulation = env.scene["robot"]
-    cache = env._nail_gate_cache
+    robot: Articulation = env.scene["robot"] if use_gating else None
+    cache = env._nail_gate_cache if use_gating else None
 
-    def _gated_mag(link_name: str) -> torch.Tensor:
+    def _mag(link_name: str) -> torch.Tensor:
         sensor = env.scene.sensors[f"{link_name}_object_s"]
         force_w = sensor.data.force_matrix_w.view(env.num_envs, 3)
         mag = force_w.norm(dim=-1)
+        # Gate only if pad-normal is defined for this body
+        if not use_gating or link_name not in layout.pad_normals:
+            return mag
         body_idx, pad_local = cache[link_name]
-        link_quat = robot.data.body_quat_w[:, body_idx]  # (N, 4) wxyz
+        link_quat = robot.data.body_quat_w[:, body_idx]
         pad_w = math_utils.quat_apply(link_quat, pad_local.unsqueeze(0).expand(env.num_envs, 3))
-        dot = (force_w * pad_w).sum(dim=-1)
-        # Directional gate: cos_angle ∈ [-1, +1] (pad_w is unit length)
-        #   -1 = force perfectly into pad → gate = 1.0
-        #   nail_gate = cutoff cosine angle → gate = 0.0
-        #   beyond cutoff → gate = 0.0 (force does not register)
-        cos_angle = dot / (mag + 1e-8)
+        cos_angle = (force_w * pad_w).sum(dim=-1) / (mag + 1e-8)
         gate = torch.clamp((nail_gate - cos_angle) / (nail_gate + 1.0 + 1e-8), min=0.0, max=1.0)
         gate = nail_gate_min + (1.0 - nail_gate_min) * gate
         return mag * gate
 
-    # Store contact debug data for visualization (drawn by observations.py render_debug)
-    if env.cfg.y2r_cfg.visualization.contact_forces:
+    def _finger_max(body_list) -> torch.Tensor:
+        out = _mag(body_list[0])
+        for name in body_list[1:]:
+            out = torch.maximum(out, _mag(name))
+        return out
+
+    # Debug visualization data (drawn by observations.py render_debug). Only emit when
+    # gating is active and we have pad normals to show.
+    if use_gating and env.cfg.y2r_cfg.visualization.contact_forces:
         debug_data = []
-        for link_name in _PAD_NORMALS:
+        for link_name in layout.pad_normals:
             sensor = env.scene.sensors[f"{link_name}_object_s"]
             force_w = sensor.data.force_matrix_w.view(env.num_envs, 3)
             body_idx, pad_local = cache[link_name]
-            link_pos = robot.data.body_pos_w[:, body_idx]  # (N, 3)
+            link_pos = robot.data.body_pos_w[:, body_idx]
             link_quat = robot.data.body_quat_w[:, body_idx]
             pad_w = math_utils.quat_apply(link_quat, pad_local.unsqueeze(0).expand(env.num_envs, 3))
             debug_data.append((link_name, link_pos.clone(), force_w.clone(), pad_w.clone()))
         env._contact_debug_data = debug_data
 
-    thumb_mag = _gated_mag("thumb_link_3")
-    index_mag = torch.maximum(_gated_mag("index_link_3"), _gated_mag("index_link_2"))
-    middle_mag = torch.maximum(_gated_mag("middle_link_3"), _gated_mag("middle_link_2"))
-    ring_mag = torch.maximum(_gated_mag("ring_link_3"), _gated_mag("ring_link_2"))
+    thumb_mag = _finger_max(layout.thumb_bodies)
+    other_mags = tuple(_finger_max(body_list) for body_list in layout.finger_bodies)
 
-    mags = (thumb_mag, index_mag, middle_mag, ring_mag)
+    mags = (thumb_mag, *other_mags)
     env._cached_finger_mags = (step, mags)
     return mags
 
@@ -232,10 +212,9 @@ def _get_finger_release_gate(
         Gate tensor (num_envs,) in range [floor, 1.0].
     """
     
-    # Get max finger contact force
-    thumb_mag, index_mag, middle_mag, ring_mag = _get_finger_contact_mags(env)
-
-    max_finger_force = torch.stack([thumb_mag, index_mag, middle_mag, ring_mag], dim=-1).max(dim=-1).values
+    # Get max finger contact force across all finger groups (thumb + non-thumb)
+    mags = _get_finger_contact_mags(env)
+    max_finger_force = torch.stack(list(mags), dim=-1).max(dim=-1).values
     
     # INVERTED ramp: high contact = low gate, no contact = high gate
     # When max_finger_force > threshold: raw_factor = 0 (gate = floor)
@@ -424,17 +403,63 @@ def good_finger_contact(
     return reward
 
 
+def _get_palm_proximal_contact_sum(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Cached per-step total object-contact force magnitude across palm + link_1 sensors.
+
+    Iterates over cfg.robot.contact_layout.palm_proximal_bodies. Empty list → returns
+    zeros (Tier 2 disabled for this robot). Sums raw force magnitudes (no pad-normal
+    gating — palm/link_1 orientation varies).
+    """
+    step = env.common_step_counter
+    cached = getattr(env, '_cached_palm_prox_sum', None)
+    if cached is not None and cached[0] == step:
+        return cached[1]
+
+    total = torch.zeros(env.num_envs, device=env.device)
+    for link_name in env.cfg.y2r_cfg.robot.contact_layout.palm_proximal_bodies:
+        sensor = env.scene.sensors[f"{link_name}_object_s"]
+        total = total + sensor.data.force_matrix_w.view(env.num_envs, 3).norm(dim=-1)
+
+    env._cached_palm_prox_sum = (step, total)
+    return total
+
+
+def _get_finger_self_contact_force(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Cached per-step sum of non-object contact force magnitude across finger links.
+
+    Uses (net_forces_w - force_matrix_w[Object]) residual per sensor listed in
+    cfg.robot.contact_layout.self_contact_bodies. The residual is force on the link
+    from ANY non-object source — in practice other fingers OR the table (fingertip
+    brushes during tabletop grasps). This is intentional: penalize both.
+    """
+    step = env.common_step_counter
+    cached = getattr(env, '_cached_self_contact_sum', None)
+    if cached is not None and cached[0] == step:
+        return cached[1]
+
+    total = torch.zeros(env.num_envs, device=env.device)
+    for link_name in env.cfg.y2r_cfg.robot.contact_layout.self_contact_bodies:
+        sensor = env.scene.sensors[f"{link_name}_object_s"]
+        net = sensor.data.net_forces_w.view(env.num_envs, 3)
+        obj = sensor.data.force_matrix_w.view(env.num_envs, 3)
+        total = total + (net - obj).norm(dim=-1)
+
+    env._cached_self_contact_sum = (step, total)
+    return total
+
+
 def contact_factor(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Cached per-step contact factor with diminishing returns for multi-finger contact.
 
-    Reads all parameters from rewards.contact_factor config block.
-    Computes per-finger soft factors (0-1 ramp) and combines with diminishing weights:
+    Two tiers:
+      Tier 1 (per-finger): thumb gates; other 3 sorted and weighted by finger_weights.
+                           Each finger's score is max(link_2, link_3) — one score per
+                           finger, preventing multi-link double-counting on one digit.
+      Tier 2 (palm/proximal): flat capped bonus from palm + link_1 contact. Added on
+                              top of Tier 1, also gated by thumb so palm contact alone
+                              doesn't score.
 
-        thumb_f gates everything (prerequisite for any grasp)
-        other fingers sorted by contact strength, weighted by finger_weights
-        factor = thumb_f * (w0 * best + w1 * second + w2 * third)
-
-    With weights summing > 1.0, full grasp gets a bonus multiplier.
+    factor = thumb_gate * ( Σ_sorted(w_i * finger_i)  +  palm_flat )
     """
     step = env.common_step_counter
     cached = getattr(env, '_cached_contact_factor', None)
@@ -452,25 +477,60 @@ def contact_factor(env: ManagerBasedRLEnv) -> torch.Tensor:
         w = torch.tensor(cf_cfg.finger_weights, device=env.device, dtype=torch.float32)
         env._contact_finger_weights_t = w
 
-    thumb_mag, index_mag, middle_mag, ring_mag = _get_finger_contact_mags(env)
+    thumb_mag, *other_mags = _get_finger_contact_mags(env)
 
-    # Per-finger soft factor (0-1 each)
+    # Per-finger soft factor (0-1 each). Number of non-thumb fingers is robot-dependent
+    # (3 for LEAP/allegro; slice weights to match).
     thumb_f = ((thumb_mag - threshold) * inv_ramp).clamp(0.0, 1.0)
-    other_f = torch.stack([
-        ((index_mag - threshold) * inv_ramp).clamp(0.0, 1.0),
-        ((middle_mag - threshold) * inv_ramp).clamp(0.0, 1.0),
-        ((ring_mag - threshold) * inv_ramp).clamp(0.0, 1.0),
-    ], dim=-1)  # (N, 3)
+    other_f = torch.stack(
+        [((m - threshold) * inv_ramp).clamp(0.0, 1.0) for m in other_mags],
+        dim=-1,
+    )  # (N, K)
 
-    # Sort descending: best-contacting finger first, then weighted sum
+    # Tier 1: sorted descending, diminishing weights (gated by thumb)
     other_sorted = other_f.sort(dim=-1, descending=True).values
+    tier1 = (other_sorted * w[: other_sorted.shape[-1]]).sum(dim=-1)
     thumb_gate_floor = float(max(cf_cfg.thumb_gate_floor, 0.0))
     soft_thumb = thumb_gate_floor + (1.0 - thumb_gate_floor) * thumb_f
-    raw_factor = soft_thumb * (other_sorted * w).sum(dim=-1)
+
+    # Tier 2: flat capped palm/proximal bonus, NOT thumb-gated — enables legitimate
+    # non-fingertip strategies (palm push, scoop, trap-against-surface). Capped at
+    # palm_weight so it can't dominate a real grasp.
+    palm_weight = float(cf_cfg.palm_weight)
+    if palm_weight > 0.0:
+        palm_sum = _get_palm_proximal_contact_sum(env)
+        palm_factor = ((palm_sum - cf_cfg.palm_threshold) / cf_cfg.palm_ramp).clamp(0.0, 1.0)
+        tier2 = palm_weight * palm_factor
+    else:
+        tier2 = torch.zeros_like(tier1)
+
+    raw_factor = soft_thumb * tier1 + tier2
 
     result = min_factor + (1.0 - min_factor) * raw_factor
     env._cached_contact_factor = (step, result)
     return result
+
+
+def finger_self_contact_penalty(
+    env: ManagerBasedRLEnv,
+    threshold: float = 0.5,
+    ramp: float = 1.0,
+    cap: float = 4.0,
+) -> torch.Tensor:
+    """Penalty for inter-finger self-contact (non-object contact on finger links).
+
+    Returns a non-negative scalar per env, to be multiplied by a negative weight.
+    Uses the existing 8 finger contact sensors; self-contact magnitude is computed
+    as (net_forces - force_matrix[Object]) per sensor — no new sensors needed.
+
+    Args:
+        threshold: Total self-contact force below this value is ignored (N).
+        ramp: Range over which penalty ramps 0→1 (N).
+        cap: Max penalty magnitude (before reward weight).
+    """
+    self_force = _get_finger_self_contact_force(env)
+    penalty = ((self_force - threshold) / ramp).clamp(min=0.0)
+    return penalty.clamp(max=cap)
 
 
 def joint_pos_limits_margin(

@@ -147,31 +147,46 @@ class UR5eLeapTrajectoryMixinCfg:
             "robot", body_names=["ur5e_link_(3|4|5|6)"]
         )
 
-        # Setup contact sensors for fingertips (link_3) and mid-phalanx (link_2)
-        # USD hierarchy is flat: all bodies are at {ENV_REGEX_NS}/Robot/{link_name}
-        finger_tip_body_list = ["index_link_3", "middle_link_3", "ring_link_3", "thumb_link_3"]
-        finger_mid_body_list = ["index_link_2", "middle_link_2", "ring_link_2", "thumb_link_2"]
-        for link_name in finger_tip_body_list + finger_mid_body_list:
+        # Setup contact sensors from contact_layout (single source of truth).
+        # Sensors cover: per-finger Tier 1 bodies (thumb + non-thumb fingers), Tier 2
+        # palm + proximal bodies, and self-contact bodies. Names uniqued so overlap
+        # between the lists (e.g. link_3 used for both Tier 1 and self-contact) creates
+        # one sensor, not two.
+        layout = cfg.robot.contact_layout
+        tier1_bodies = set(layout.thumb_bodies)
+        for bodies in layout.finger_bodies:
+            tier1_bodies.update(bodies)
+        all_sensor_bodies = sorted(
+            tier1_bodies
+            | set(layout.palm_proximal_bodies)
+            | set(layout.self_contact_bodies)
+        )
+        for link_name in all_sensor_bodies:
             setattr(
                 self.scene,
                 f"{link_name}_object_s",
                 ContactSensorCfg(
-                    prim_path="{ENV_REGEX_NS}/Robot/" + link_name,
+                    prim_path="{ENV_REGEX_NS}/Robot/" + layout.sensor_prim_prefix + link_name,
                     filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
                 ),
             )
 
-        # Contact force observation
+        # Contact force observation (fingertips only — link_3 of each finger)
+        finger_tip_body_list = layout.thumb_bodies + [bodies[0] for bodies in layout.finger_bodies]
         self.observations.proprio.contact = ObsTerm(
             func=mdp.fingers_contact_force_b,
             params={"contact_sensor_names": [f"{link}_object_s" for link in finger_tip_body_list]},
             clip=(-20.0, 20.0),
         )
 
-        # Link_2 (mid-phalanx) contact force observation (teacher-only privileged)
+        # Link_2 (mid-phalanx) contact force observation (teacher-only privileged).
+        # Pulled from each non-thumb finger's second body (index 1) when present.
+        link_2_sensor_names = [
+            f"{bodies[1]}_object_s" for bodies in layout.finger_bodies if len(bodies) > 1
+        ]
         self.observations.proprio.link_2_contact = ObsTerm(
             func=mdp.fingers_contact_force_b,
-            params={"contact_sensor_names": ["index_link_2_object_s", "middle_link_2_object_s", "ring_link_2_object_s"]},
+            params={"contact_sensor_names": link_2_sensor_names},
             clip=(-20.0, 20.0),
         )
 

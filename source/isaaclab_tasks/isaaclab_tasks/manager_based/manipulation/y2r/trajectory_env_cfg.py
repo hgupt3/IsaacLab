@@ -72,16 +72,6 @@ _PRIMITIVE_ASSETS = [
     CapsuleCfg(radius=0.04, height=0.025, physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
     CapsuleCfg(radius=0.04, height=0.1, physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
     CapsuleCfg(radius=0.025, height=0.1, physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
-    
-    CapsuleCfg(radius=0.025, height=0.2, physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
-    CapsuleCfg(radius=0.01, height=0.2, physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
-    CapsuleCfg(radius=0.025, height=0.2, physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
-    CapsuleCfg(radius=0.01, height=0.2, physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
-    CapsuleCfg(radius=0.015, height=0.2, physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
-    CapsuleCfg(radius=0.01, height=0.2, physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
-    CapsuleCfg(radius=0.02, height=0.2, physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
-    CapsuleCfg(radius=0.01, height=0.2, physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
-    
     CapsuleCfg(radius=0.025, height=0.2, physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
     CapsuleCfg(radius=0.01, height=0.2, physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
     CylinderCfg(radius=0.05, height=0.1, physics_material=RigidBodyMaterialCfg(static_friction=0.5)),
@@ -121,6 +111,8 @@ def _build_object_cfg(cfg: Y2RConfig) -> RigidObjectCfg:
                     solver_position_iteration_count=cfg.simulation.solver_position_iteration_count,
                     solver_velocity_iteration_count=cfg.simulation.solver_velocity_iteration_count,
                     disable_gravity=False,
+                    linear_damping=cfg.object.linear_damping,
+                    angular_damping=cfg.object.angular_damping,
                 ),
                 collision_props=sim_utils.CollisionPropertiesCfg(),
                 mass_props=sim_utils.MassPropertiesCfg(mass=0.2),
@@ -141,6 +133,8 @@ def _build_object_cfg(cfg: Y2RConfig) -> RigidObjectCfg:
                         solver_position_iteration_count=cfg.simulation.solver_position_iteration_count,
                         solver_velocity_iteration_count=cfg.simulation.solver_velocity_iteration_count,
                         disable_gravity=False,
+                        linear_damping=cfg.object.linear_damping,
+                        angular_damping=cfg.object.angular_damping,
                     ),
                     collision_props=sim_utils.CollisionPropertiesCfg(),
                     mass_props=sim_utils.MassPropertiesCfg(mass=0.2),
@@ -185,6 +179,8 @@ def _build_object_cfg(cfg: Y2RConfig) -> RigidObjectCfg:
                 solver_position_iteration_count=cfg.simulation.solver_position_iteration_count,
                 solver_velocity_iteration_count=cfg.simulation.solver_velocity_iteration_count,
                 disable_gravity=False,
+                linear_damping=cfg.object.linear_damping,
+                angular_damping=cfg.object.angular_damping,
             ),
             collision_props=sim_utils.CollisionPropertiesCfg(),
             mass_props=sim_utils.MassPropertiesCfg(mass=0.2),
@@ -964,6 +960,17 @@ def _build_rewards_cfg(cfg: Y2RConfig, terminations_cfg=None):
             weight=cfg.rewards.timeout_bonus.weight,
         )
 
+        # Robot-agnostic: iterates over cfg.robot.contact_layout.self_contact_bodies.
+        finger_self_contact_penalty = RewTerm(
+            func=mdp.finger_self_contact_penalty,
+            weight=cfg.rewards.finger_self_contact_penalty.weight,
+            params={
+                "threshold": cfg.rewards.finger_self_contact_penalty.params["threshold"],
+                "ramp": cfg.rewards.finger_self_contact_penalty.params["ramp"],
+                "cap": cfg.rewards.finger_self_contact_penalty.params["cap"],
+            },
+        )
+
     return RewardsCfg()
 
 
@@ -1133,6 +1140,8 @@ class TrajectoryEnvCfg(ManagerBasedEnvCfg):
                     solver_position_iteration_count=cfg.simulation.solver_position_iteration_count,
                     solver_velocity_iteration_count=cfg.simulation.solver_velocity_iteration_count,
                     disable_gravity=False,
+                    linear_damping=cfg.object.linear_damping,
+                    angular_damping=cfg.object.angular_damping,
                 ),
                 collision_props=sim_utils.CollisionPropertiesCfg(),
                 mass_props=sim_utils.MassPropertiesCfg(mass=0.2),

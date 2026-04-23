@@ -6,7 +6,7 @@ robot:
   hand_joint_count: 16
   eigen_dim: 5                  # PCA dimensions for eigen grasp
   use_target_tracking: true     # delta-from-target + EMA (SimToolReal-style)
-  ema_alpha: 0.1                # EMA blend factor (0.1 = heavy smoothing, 1.0 = no smoothing)
+  ema_alpha: 0.2                # EMA blend factor (0.1 = heavy smoothing, 1.0 = no smoothing)
   palm_body_name: "ur5e_link_6"  # Body used for palm pose tracking (palm_link merged into link_6)
   wrist_joint_name: "ur5e_joint_6"         # Wrist joint (separate randomization range)
   arm_joint_regex: "ur5e_joint_.*"         # Regex matching all arm joints (including wrist)
@@ -19,6 +19,37 @@ robot:
     middle: [0.0, -0.048, 0.015]
     ring: [0.0, -0.048, 0.015]
     thumb: [0.0, -0.06, -0.015]
+
+  # Contact sensor layout — drives both sensor creation in the robot mixin and the
+  # reward computation in mdp/rewards.py. Single source of truth for this robot.
+  contact_layout:
+    sensor_prim_prefix: ""           # LEAP hand bodies live directly under /Robot/
+    # Tier 1: per-finger contact. Thumb gates; index/middle/ring sorted+weighted.
+    thumb_bodies: ["thumb_link_3"]
+    finger_bodies:
+      - ["index_link_3",  "index_link_2"]
+      - ["middle_link_3", "middle_link_2"]
+      - ["ring_link_3",   "ring_link_2"]
+    # Tier 2: flat capped bonus from proximal phalanges + palm (non-fingertip strategies).
+    # palm_link itself is not sensable — the fixed hand_base_joint causes URDF→USD
+    # (merge_fixed_joints=True) to weld palm_link's collision boxes into ur5e_link_6.
+    # So palm-object contacts are reported on the ur5e_link_6 rigid body; sensing it
+    # here captures real palm contact. Minor contamination: ur5e_link_6 also has a
+    # small wrist cylinder (35mm × 40mm) behind the palm — rarely contacts the object.
+    palm_proximal_bodies: ["ur5e_link_6", "index_link_1", "middle_link_1", "ring_link_1", "thumb_link_1"]
+    # Self-contact penalty: residual of net_forces - object_filter on these sensors.
+    self_contact_bodies:
+      ["thumb_link_3", "index_link_3", "middle_link_3", "ring_link_3",
+       "thumb_link_2", "index_link_2", "middle_link_2", "ring_link_2"]
+    # Pad-normal in body local frame. Pad = -X for all LEAP finger links.
+    pad_normals:
+      thumb_link_3:  [-1.0, 0.0, 0.0]
+      index_link_3:  [-1.0, 0.0, 0.0]
+      index_link_2:  [-1.0, 0.0, 0.0]
+      middle_link_3: [-1.0, 0.0, 0.0]
+      middle_link_2: [-1.0, 0.0, 0.0]
+      ring_link_3:   [-1.0, 0.0, 0.0]
+      ring_link_2:   [-1.0, 0.0, 0.0]
 
 
 # ==============================================================================

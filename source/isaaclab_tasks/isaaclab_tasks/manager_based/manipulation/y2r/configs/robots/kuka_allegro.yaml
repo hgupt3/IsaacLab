@@ -14,6 +14,21 @@ robot:
   palm_frame_offset: null       # Kuka palm_link is already the correct frame
   tip_offsets: null              # Kuka tip bodies exist as real bodies
 
+  # Contact sensor layout — Allegro only has link_3 (fingertip) sensors.
+  # Tier 2 (palm/proximal) and self-contact (link_2) are disabled; nail-gating is
+  # skipped since pad_normals is empty (contact_factor's fast path kicks in).
+  contact_layout:
+    sensor_prim_prefix: "ee_link/"   # Allegro bodies live under /Robot/ee_link/
+    thumb_bodies: ["thumb_link_3"]
+    finger_bodies:
+      - ["index_link_3"]
+      - ["middle_link_3"]
+      - ["ring_link_3"]
+    palm_proximal_bodies: []         # Disabled — no palm/link_1 sensors on allegro
+    self_contact_bodies:             # Only fingertips are sensed on allegro
+      ["thumb_link_3", "index_link_3", "middle_link_3", "ring_link_3"]
+    pad_normals: {}                  # Empty → skip nail-gating (not characterized for allegro yet)
+
 wrist_camera:
   width: 64                      # Kuka uses square image
   height: 64
