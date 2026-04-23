@@ -3,20 +3,19 @@
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Hybrid Depth ResNet + Point Transformer Student Network for rl_games.
+"""AME-style Depth ResNet + Point Transformer Student Network for rl_games.
 
-This module implements a student policy that combines:
-1. SmallResNet depth encoder for wrist camera images
-2. Point Transformer (self-attention + cross-attention) for visible point clouds
-3. MLP trunk for action/value outputs
+Student policy combining a depth encoder and an AME-style point transformer.
 
 Architecture:
     - Depth (last H×W of obs) → SmallResNet → depth_features
-    - Point clouds (before depth) → reshape (B, num_points, num_timesteps*3)
-        → point_encoder MLP → self-attention → FFN
-    - Query input = [proprio | depth_features] → proprio_encoder → 1 token
-        → cross-attention (queries enriched point tokens) → attn_out
-    - Trunk: [proprio | depth_features | attn_out] → MLP → mu, sigma, value
+    - Point clouds → reshape (B, num_points, num_timesteps*3)
+        → point_encoder MLP → point tokens (B, N, H)
+    - Global feature (AME-2): amax over point tokens → (B, H)
+    - Query = proprio_encoder([proprio, depth_features?, global_feat?]) → 1 token
+    - Optional self-attention on point tokens (off in AME recipe)
+    - Cross-attention: query attends to point tokens → attn_out (B, H)
+    - Trunk: [proprio, depth_features, global_feat?, attn_out] → MLP → mu, sigma, value
 
 Depth handling:
     Depth is ALWAYS packed at the END of the obs tensor.
@@ -26,18 +25,19 @@ Depth handling:
 Usage in YAML config:
     network:
       name: depth_point_transformer_student
-      hidden_dim: 64
-      num_heads: 2
-      self_attention: True
-      fuse_depth_in_query: True  # concatenate depth_features into query token input
-      point_encoder_layers: [64, 64]
+      hidden_dim: 128
+      num_heads: 16
+      self_attention: False
+      use_global_feature: True
+      fuse_depth_in_query: True
+      point_encoder_layers: [128, 128]
       point_encoder_norm: True
-      proprio_encoder_layers: [64, 64]
+      proprio_encoder_layers: [128, 128]
       proprio_encoder_norm: True
       depth_encoder:
-        channels: [32, 128, 256]
+        channels: [32, 64, 128]
       mlp:
-        units: [512, 256, 128]
+        units: [1024, 512, 256, 128]
         activation: elu
 """
 
@@ -168,6 +168,8 @@ class DepthPointTransformerStudentBuilder(NetworkBuilder):
             attn_dropout = params.get("attn_dropout", 0.0)
             ffn_ratio = params.get("ffn_ratio", 0.0)
             ffn_dropout = params.get("ffn_dropout", 0.0)
+            # AME-2 global feature: max-pooled point tokens are concatenated into the query.
+            self.use_global_feature = params["use_global_feature"]
 
             # =====================================================================
             # Normalization: RunningMeanStd on non-depth obs (proprio + point clouds)
@@ -209,7 +211,8 @@ class DepthPointTransformerStudentBuilder(NetworkBuilder):
             # Proprio encoder
             # =====================================================================
             self.fuse_depth_in_query = params.get("fuse_depth_in_query", True)
-            query_input_dim = self.proprio_dim + self.depth_features_dim if self.fuse_depth_in_query else self.proprio_dim
+            query_input_dim = self.proprio_dim + (self.depth_features_dim if self.fuse_depth_in_query else 0) \
+                                               + (self.hidden_dim if self.use_global_feature else 0)
             proprio_encoder_layers = params.get("proprio_encoder_layers", [self.hidden_dim])
             proprio_encoder_norm = params.get("proprio_encoder_norm", False)
             self.proprio_encoder = self._build_encoder(
@@ -225,9 +228,15 @@ class DepthPointTransformerStudentBuilder(NetworkBuilder):
             self.cross_attn = CrossAttentionBlock(self.hidden_dim, self.num_heads, dropout=attn_dropout)
 
             # =====================================================================
-            # Trunk MLP: [proprio | depth_features | attn_out] → hidden
+            # Trunk MLP: [proprio | depth_features | global_feat? | attn_out] → hidden
+            # AME-2 fuses the global feature again at the trunk input (not just the query).
             # =====================================================================
-            trunk_input_dim = self.proprio_dim + self.depth_features_dim + self.hidden_dim
+            trunk_input_dim = (
+                self.proprio_dim
+                + self.depth_features_dim
+                + (self.hidden_dim if self.use_global_feature else 0)
+                + self.hidden_dim
+            )
             mlp_units = self.units
             if len(mlp_units) == 0:
                 out_size = trunk_input_dim
@@ -287,6 +296,7 @@ class DepthPointTransformerStudentBuilder(NetworkBuilder):
             print(f"  trunk_input: {trunk_input_dim} → mlp {mlp_units} → {out_size}")
             print(f"  normalize_non_depth: {self.normalize_non_depth}")
             print(f"  fuse_depth_in_query: {self.fuse_depth_in_query}")
+            print(f"  use_global_feature: {self.use_global_feature}")
 
         def _build_encoder(self, input_dim: int, layers: list, use_norm: bool) -> nn.Module:
             """Build MLP encoder (reusable for point and proprio encoders)."""
@@ -416,11 +426,17 @@ class DepthPointTransformerStudentBuilder(NetworkBuilder):
             # Encode points: (B, num_points, num_timesteps*3) → (B, num_points, hidden_dim)
             point_tokens = self.point_encoder(point_obs)
 
-            # Encode query: (B, proprio_dim [+ depth_features_dim]) → (B, 1, hidden_dim)
+            # Global feature (AME-2): max-pool over point tokens before attention.
+            if self.use_global_feature:
+                global_feat = point_tokens.amax(dim=1)  # (B, hidden_dim)
+
+            # Encode query: (B, proprio_dim [+ depth_features_dim] [+ hidden_dim]) → (B, 1, hidden_dim)
+            query_parts = [proprio]
             if self.fuse_depth_in_query:
-                query_input = torch.cat([proprio, depth_features], dim=-1)
-            else:
-                query_input = proprio
+                query_parts.append(depth_features)
+            if self.use_global_feature:
+                query_parts.append(global_feat)
+            query_input = torch.cat(query_parts, dim=-1) if len(query_parts) > 1 else query_parts[0]
             proprio_encoded = self.proprio_encoder(query_input)
             proprio_token = proprio_encoded.unsqueeze(1)
 
@@ -436,9 +452,13 @@ class DepthPointTransformerStudentBuilder(NetworkBuilder):
             attn_features = attn_out[:, 0]  # (B, hidden_dim)
 
             # =================================================================
-            # Trunk: [proprio | depth_features | attn_out]
+            # Trunk: [proprio | depth_features | global_feat? | attn_out]
             # =================================================================
-            trunk_input = torch.cat([proprio, depth_features, attn_features], dim=-1)
+            trunk_parts = [proprio, depth_features]
+            if self.use_global_feature:
+                trunk_parts.append(global_feat)
+            trunk_parts.append(attn_features)
+            trunk_input = torch.cat(trunk_parts, dim=-1)
             out = self.trunk(trunk_input)
 
             # =================================================================

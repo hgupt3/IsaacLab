@@ -53,11 +53,12 @@ params:
 
     # --- Point Transformer ---
     hidden_dim: 128                   # Token embedding dimension
-    num_heads: 4                     # Attention heads
-    self_attention: True             # Self-attention on point tokens
-    flash_attention: True            # Use CUDA Flash Attention kernels
+    num_heads: 16                    # Attention heads (AME-style: many narrow heads)
+    self_attention: False            # AME-style: no self-attention on point tokens
+    use_global_feature: True         # AME-2: max-pool point tokens → concat into query
+    flash_attention: True            # Allow fused/flash SDPA when supported; False forces math backend
     torch_compile: False             # Keep disabled in distillation by default
-    ffn_ratio: 2.0                   # FFN expansion ratio (0 = disabled)
+    ffn_ratio: 2.0                   # FFN expansion ratio (unused when self_attention: False)
     ffn_dropout: 0.0
     attn_dropout: 0.0
 

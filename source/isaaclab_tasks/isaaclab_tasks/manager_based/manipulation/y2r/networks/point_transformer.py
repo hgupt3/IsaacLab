@@ -4,17 +4,16 @@
 
 """Cross-Attention Point Network for rl_games.
 
-This module implements a self+cross-attention policy that processes point cloud
-observations across time.
+Cross-attention policy that processes per-point temporal histories and
+attends from a proprio+global query to the point tokens (AME-style).
 
 Architecture:
-    - 320 point tokens: 32 points × 10 timesteps (5 history + 5 targets)
-    - Each point: xyz → MLP → 64-dim
-    - 1 proprio token: all other features → MLP → 64-dim (query)
-    - Self-attention on point tokens
-    - Cross-attention: proprio queries point tokens
-    - Optional lightweight FFN on tokens
-    - Policy/Value heads from updated proprio token
+    - N point tokens: num_points × num_timesteps → per-point MLP → hidden_dim
+    - Global feature: max-pool over point tokens → hidden_dim (AME-2)
+    - 1 query token: [proprio, global_feat] → MLP → hidden_dim
+    - Optional self-attention on point tokens (off by default, matches AME)
+    - Cross-attention: query attends to point tokens
+    - Policy/Value heads from updated query token
 """
 
 from __future__ import annotations
@@ -134,20 +133,24 @@ class FeedForwardBlock(nn.Module):
 
 
 class PointTransformerBuilder(A2CBuilder):
-    """Builder for Hybrid Self+Cross Attention Point Network.
-    
+    """Builder for AME-style Cross-Attention Point Network.
+
     Architecture:
-        1. Self-attention among 32 point tokens (points share spatial info)
-        2. Cross-attention: proprio queries the enriched point tokens
-    
+        1. Per-point encoder turns (num_points, num_timesteps*3) into point tokens.
+        2. Global feature = max-pool over point tokens (AME-2).
+        3. Query = proprio_encoder([proprio, global_feat]) → 1 token.
+        4. Optional self-attention on point tokens (AME-1 has this off).
+        5. Cross-attention: query attends to point tokens.
+        6. Trunk input = [proprio, global_feat, attn_out] → actor/critic heads.
+
     YAML Config Example:
         network:
             name: point_transformer
-            separate: True
-            num_points: 32
-            num_timesteps: 10
+            separate: False
             hidden_dim: 64
-            num_heads: 4
+            num_heads: 16
+            self_attention: False
+            use_global_feature: True
     """
 
     def __init__(self, **kwargs):
@@ -155,15 +158,16 @@ class PointTransformerBuilder(A2CBuilder):
         self.params = None  # Will be set by load()
 
     class Network(A2CBuilder.Network):
-        """Hybrid Self+Cross Attention Point Network for actor-critic RL.
-        
+        """AME-style Cross-Attention Point Network for actor-critic RL.
+
         Architecture:
-            1. Split obs → point cloud (B, 32, 10, 3) and proprio (B, D)
-            2. Point encoder: (B*32, 30) → Linear → 32 tokens (B, 32, 64)
-            3. Proprio encoder: (B, D) → Linear → 1 token (B, 1, 64)
-            4. Self-attention: 32 point tokens share spatial info
-            5. Cross-attention: proprio queries enriched points
-            6. Concat [raw_proprio, attn_out] → heads
+            1. Split obs → point cloud (B, N, T, 3) and proprio (B, D)
+            2. Point encoder: (B, N, T*3) → Linear → (B, N, H) point tokens
+            3. Global feature: amax over N point tokens → (B, H)
+            4. Query encoder: [proprio, global_feat] → Linear → (B, 1, H)
+            5. Optional self-attention on point tokens (off in AME recipe)
+            6. Cross-attention: query attends to point tokens → (B, 1, H)
+            7. Trunk: [proprio, global_feat, attn_out] → actor/critic heads
         """
 
         def load(self, params: Dict[str, Any]):
@@ -187,6 +191,8 @@ class PointTransformerBuilder(A2CBuilder):
             self.proprio_encoder_norm = params.get("proprio_encoder_norm", False)
             self.proprio_encoder_layers = params.get("proprio_encoder_layers", None)
             self.partial_separate = params.get("partial_separate", False)
+            # AME-2 global feature: max-pooled point tokens are concatenated into the query.
+            self.use_global_feature = params["use_global_feature"]
             if self.separate and self.partial_separate:
                 self.partial_separate = False
 
@@ -298,7 +304,12 @@ class PointTransformerBuilder(A2CBuilder):
                 self.critic_cross_attn = CrossAttentionBlock(self.hidden_dim, self.num_heads, dropout=self.attn_dropout)
 
             # Build trunks and output layers
-            trunk_input_dim = (self.proprio_dim + self.hidden_dim) if self.proprio_dim > 0 else self.hidden_dim
+            # Trunk input = [proprio, global_feat?, attn_out] — AME-2 fuses global again at the trunk.
+            trunk_input_dim = (
+                self.proprio_dim
+                + (self.hidden_dim if self.use_global_feature else 0)
+                + self.hidden_dim
+            )
             self.actor_trunk, trunk_output_dim = self._build_trunk(trunk_input_dim)
             if self.separate or self.partial_separate:
                 self.critic_trunk, _ = self._build_trunk(trunk_input_dim)
@@ -360,8 +371,13 @@ class PointTransformerBuilder(A2CBuilder):
             return nn.Sequential(*modules)
 
         def _build_proprio_encoder(self) -> nn.Module:
-            """Build single linear encoder for proprioceptive features."""
-            if self.proprio_dim == 0:
+            """Build single linear encoder for the query input.
+
+            Input dim is ``proprio_dim`` plus ``hidden_dim`` when the global
+            point feature is fused into the query.
+            """
+            query_in_dim = self.proprio_dim + (self.hidden_dim if self.use_global_feature else 0)
+            if query_in_dim == 0:
                 return nn.Identity()
             layers = self.proprio_encoder_layers
             if not layers:
@@ -372,7 +388,7 @@ class PointTransformerBuilder(A2CBuilder):
                 )
 
             modules = []
-            in_dim = self.proprio_dim
+            in_dim = query_in_dim
             for i, out_dim in enumerate(layers):
                 modules.append(nn.Linear(in_dim, out_dim))
                 if i < len(layers) - 1:
@@ -521,10 +537,21 @@ class PointTransformerBuilder(A2CBuilder):
             # Encode points: (B, num_points, num_timesteps*3) → (B, num_points, hidden_dim)
             # nn.Linear works on arbitrary leading dims — no reshape needed.
             point_tokens = self.point_encoder(point_obs)
-            
-            # Encode proprio: (B, proprio_dim) → (B, 1, hidden_dim)
-            if self.proprio_dim > 0:
-                proprio_encoded = self.proprio_encoder(proprio_obs)  # (B, hidden_dim)
+
+            # Global feature: max-pool over point tokens (AME-2).
+            if self.use_global_feature:
+                global_feat = point_tokens.amax(dim=1)  # (B, hidden_dim)
+
+            # Build query: [proprio, global_feat] → proprio_encoder → (B, 1, hidden_dim)
+            query_in_dim = self.proprio_dim + (self.hidden_dim if self.use_global_feature else 0)
+            if query_in_dim > 0:
+                if self.proprio_dim > 0 and self.use_global_feature:
+                    query_input = torch.cat([proprio_obs, global_feat], dim=-1)
+                elif self.use_global_feature:
+                    query_input = global_feat
+                else:
+                    query_input = proprio_obs
+                proprio_encoded = self.proprio_encoder(query_input)  # (B, hidden_dim)
                 if self.proprio_norm is not None:
                     proprio_encoded = self.proprio_norm(proprio_encoded)
                 proprio_token = proprio_encoded.unsqueeze(1)  # (B, 1, hidden_dim)
@@ -543,23 +570,34 @@ class PointTransformerBuilder(A2CBuilder):
                 attn_out = self.cross_attn(proprio_token, point_tokens)  # (B, 1, hidden_dim)
             attn_features = attn_out[:, 0]  # (B, hidden_dim)
 
-            # Concat raw proprio + attention output
+            # Trunk input: [proprio, global_feat?, attn_out]
+            trunk_parts = []
             if self.proprio_dim > 0:
-                trunk_input = torch.cat([proprio_obs, attn_features], dim=-1)  # (B, proprio_dim + hidden_dim)
-            else:
-                trunk_input = attn_features
+                trunk_parts.append(proprio_obs)
+            if self.use_global_feature:
+                trunk_parts.append(global_feat)
+            trunk_parts.append(attn_features)
+            trunk_input = torch.cat(trunk_parts, dim=-1) if len(trunk_parts) > 1 else trunk_parts[0]
 
             # Trunks
             actor_latent = self.actor_trunk(trunk_input)
             if self.separate:
                 # Recompute critic features with separate encoders/attention
                 critic_point_tokens = self.critic_point_encoder(point_obs)
+                if self.use_global_feature:
+                    critic_global_feat = critic_point_tokens.amax(dim=1)
                 with attn_ctx:
                     if self.use_self_attention:
                         critic_point_tokens = self.critic_self_attn(critic_point_tokens)
                         critic_point_tokens = self.critic_self_ffn(critic_point_tokens)
-                    if self.proprio_dim > 0:
-                        critic_proprio_encoded = self.critic_proprio_encoder(proprio_obs)
+                    if query_in_dim > 0:
+                        if self.proprio_dim > 0 and self.use_global_feature:
+                            critic_query_input = torch.cat([proprio_obs, critic_global_feat], dim=-1)
+                        elif self.use_global_feature:
+                            critic_query_input = critic_global_feat
+                        else:
+                            critic_query_input = proprio_obs
+                        critic_proprio_encoded = self.critic_proprio_encoder(critic_query_input)
                         if self.proprio_norm is not None:
                             critic_proprio_encoded = self.proprio_norm(critic_proprio_encoded)
                         critic_proprio_token = critic_proprio_encoded.unsqueeze(1)
@@ -567,16 +605,24 @@ class PointTransformerBuilder(A2CBuilder):
                         critic_proprio_token = torch.zeros(B, 1, self.hidden_dim, device=obs.device)
                     critic_attn_out = self.critic_cross_attn(critic_proprio_token, critic_point_tokens)
                 critic_attn_features = critic_attn_out[:, 0]
+                critic_trunk_parts = []
                 if self.proprio_dim > 0:
-                    critic_trunk_input = torch.cat([proprio_obs, critic_attn_features], dim=-1)
-                else:
-                    critic_trunk_input = critic_attn_features
+                    critic_trunk_parts.append(proprio_obs)
+                if self.use_global_feature:
+                    critic_trunk_parts.append(critic_global_feat)
+                critic_trunk_parts.append(critic_attn_features)
+                critic_trunk_input = (torch.cat(critic_trunk_parts, dim=-1)
+                                      if len(critic_trunk_parts) > 1 else critic_trunk_parts[0])
                 critic_latent = self.critic_trunk(critic_trunk_input)
             elif self.partial_separate:
+                critic_trunk_parts = []
                 if self.proprio_dim > 0:
-                    critic_trunk_input = torch.cat([proprio_obs, attn_features.detach()], dim=-1)
-                else:
-                    critic_trunk_input = attn_features.detach()
+                    critic_trunk_parts.append(proprio_obs)
+                if self.use_global_feature:
+                    critic_trunk_parts.append(global_feat.detach())
+                critic_trunk_parts.append(attn_features.detach())
+                critic_trunk_input = (torch.cat(critic_trunk_parts, dim=-1)
+                                      if len(critic_trunk_parts) > 1 else critic_trunk_parts[0])
                 critic_latent = self.critic_trunk(critic_trunk_input)
             else:
                 critic_latent = actor_latent

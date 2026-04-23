@@ -25,17 +25,18 @@ params:
     name: point_transformer
     separate: False
     partial_separate: False     # Share PT, detach critic features if true
-    self_attention: True       # Self-attention on point tokens before cross-attention
+    self_attention: False      # AME-style: no self-attention on point tokens
+    use_global_feature: True   # AME-2: max-pool point tokens → concat into query
     hidden_dim: 64            # Token embedding dimension
-    num_heads: 2              # Cross-attention heads
-    ffn_ratio: 1.0            # Token FFN expansion ratio
+    num_heads: 16             # Cross-attention heads (AME-1 recipe: 64/16)
+    ffn_ratio: 1.0            # Token FFN expansion ratio (unused when self_attention: False)
     ffn_dropout: 0.0         # FFN dropout (light regularization)
     attn_dropout: 0.0        # Attention dropout (light regularization)
     point_encoder_layers: [64, 64]  # 2-layer point encoder
     point_encoder_norm: True  # LayerNorm on point tokens
     proprio_encoder_layers: [64, 64]  # 2-layer proprio encoder
     proprio_encoder_norm: True  # LayerNorm on proprio token
-    flash_attention: True        # False = math backend (bypasses CUDA grid limit for batch > 65535)
+    flash_attention: True        # True = allow fused/flash SDPA when supported; False = force math backend (batch > 65535)
     torch_compile: True           # torch.compile the network (reduce-overhead + dynamic)
     mlp:
       units: [512, 256, 128]
