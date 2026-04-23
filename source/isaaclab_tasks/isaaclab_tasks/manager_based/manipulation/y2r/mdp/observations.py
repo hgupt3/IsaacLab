@@ -1369,6 +1369,8 @@ class target_sequence_obs_b(ManagerTermBase):
         # which keeps the asset-wide has_external_wrench flag correct.
         self._perturb_cfg = y2r_cfg.randomization.object_perturbation
         self._wrench_buffers_initialized = False
+        # Lazy-cached ADR scheduler reference (resolved on first apply when adr_ramp=true).
+        self._wrench_adr_scheduler = None
 
     def _init_wrench_buffers(self, env):
         """Lazy allocation: object.num_bodies is only valid after sim init."""
@@ -1413,8 +1415,17 @@ class target_sequence_obs_b(ManagerTermBase):
             n = int(resample.sum().item())
             nb = self._wrench_num_bodies
             device = self._wrench_force.device
-            f_lo, f_hi = cfg.force
-            t_lo, t_hi = cfg.torque
+
+            # Optional ADR ramp: scale magnitudes by global difficulty_frac (0→1).
+            # Same scheduler used by gravity, joint-noise, etc. — see adr_curriculum.py.
+            scale = 1.0
+            if cfg.adr_ramp:
+                if self._wrench_adr_scheduler is None:
+                    self._wrench_adr_scheduler = env.curriculum_manager.cfg.adr.func
+                scale = float(self._wrench_adr_scheduler.difficulty_frac)
+
+            f_lo, f_hi = cfg.force[0] * scale, cfg.force[1] * scale
+            t_lo, t_hi = cfg.torque[0] * scale, cfg.torque[1] * scale
             i_lo, i_hi = cfg.interval_s
             self._wrench_force[resample] = sample_uniform(f_lo, f_hi, (n, nb, 3), device)
             self._wrench_torque[resample] = sample_uniform(t_lo, t_hi, (n, nb, 3), device)

@@ -501,9 +501,10 @@ class ResetRandomizationConfig:
 @dataclass
 class ObjectPerturbationConfig:
     enabled: bool
+    adr_ramp: bool                       # scale force/torque by ADR difficulty_frac (0→1)
     interval_s: tuple[float, float]
-    force: tuple[float, float]
-    torque: tuple[float, float]
+    force: tuple[float, float]           # value at full difficulty (frac == 1.0)
+    torque: tuple[float, float]          # value at full difficulty (frac == 1.0)
 
 
 @dataclass
