@@ -8,7 +8,7 @@
 # Start at max difficulty
 curriculum:
   difficulty:
-    initial: 10
+    initial: 1
 
 mode:                                                                                                                                                                                                    
   use_student_mode: false
@@ -38,4 +38,4 @@ simulation:
 
 procedural_objects:
   generation:
-    num_shapes: 10  
+    num_shapes: 16

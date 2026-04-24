@@ -6,7 +6,8 @@ robot:
   hand_joint_count: 16
   eigen_dim: 5                  # PCA dimensions for eigen grasp
   use_target_tracking: true     # delta-from-target + EMA (SimToolReal-style)
-  ema_alpha: 0.1                # EMA blend factor (0.1 = heavy smoothing, 1.0 = no smoothing)
+  ema_alpha_arm: 0.1            # EMA blend factor for arm joints
+  ema_alpha_hand: 0.1           # EMA blend factor for hand joints (retain prior single-α behavior for Kuka — not retuned)
   palm_body_name: "palm_link"   # Kuka's palm_link frame is already correct
   wrist_joint_name: "iiwa7_joint_7"
   arm_joint_regex: "iiwa7_joint_.*"

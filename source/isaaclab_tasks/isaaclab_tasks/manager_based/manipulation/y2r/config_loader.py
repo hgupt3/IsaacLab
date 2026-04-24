@@ -590,7 +590,8 @@ class RobotConfig:
     hand_joint_count: int
     eigen_dim: int
     use_target_tracking: bool
-    ema_alpha: float
+    ema_alpha_arm: float
+    ema_alpha_hand: float
     palm_body_name: str
     wrist_joint_name: str
     arm_joint_regex: str
@@ -622,6 +623,13 @@ class PushTConfig:
 
 
 @dataclass
+class ToolGenerationConfig:
+    handle_diameter: tuple[float, float]
+    handle_length: tuple[float, float]
+    head_width: tuple[float, float]
+
+
+@dataclass
 class GenerationConfig:
     num_shapes: int
     primitives_per_shape: tuple[int, int]
@@ -629,6 +637,7 @@ class GenerationConfig:
     size_decay: float
     primitive_types: dict[str, float]
     shape_families: dict[str, float]
+    tool: ToolGenerationConfig
     seed: int | None
 
 

@@ -190,13 +190,12 @@ def _grow_tool(cfg: dict[str, Any], rng):
     min_prims, max_prims = cfg["primitives_per_shape"]
     num_primitives = int(rng.integers(max(min_prims, 2), max_prims + 1))
 
-    # Handle size from base_size config
-    base_size_min, base_size_max = cfg["base_size"]
-    handle_width = rng.uniform(base_size_min, base_size_max)
-
-    # === HANDLE (1 primitive) ===
-    elongation = rng.uniform(6.0, 12.0)
-    handle_length = handle_width * elongation
+    # Handle + head sizing from tool config (independent ranges)
+    tool_cfg = cfg["tool"]
+    hd_min, hd_max = tool_cfg["handle_diameter"]
+    hl_min, hl_max = tool_cfg["handle_length"]
+    handle_width = rng.uniform(hd_min, hd_max)
+    handle_length = rng.uniform(hl_min, hl_max)
     handle_radius = handle_width / 2
 
     handle_type = rng.choice(["cylinder", "capsule", "box"])
@@ -218,8 +217,8 @@ def _grow_tool(cfg: dict[str, Any], rng):
 
     # === PRIMARY HEAD (1 primitive) ===
     head_type = _weighted_choice(cfg["primitive_types"])
-    head_width_ratio = rng.uniform(1.8, 3.2)
-    head_target_width = handle_width * head_width_ratio
+    hw_min, hw_max = tool_cfg["head_width"]
+    head_target_width = rng.uniform(hw_min, hw_max)
     head = _make_primitive(head_type, head_target_width)
     # Enforce size: scale so max extent matches desired width
     _scale_to_max_extent(head, head_target_width)

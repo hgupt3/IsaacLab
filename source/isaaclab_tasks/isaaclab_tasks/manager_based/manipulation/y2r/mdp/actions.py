@@ -121,7 +121,13 @@ class EigenGraspRelativeJointPositionAction(ActionTerm):
 
         # Target tracking state (SimToolReal-style delta-from-target + EMA)
         self._use_target_tracking = cfg.use_target_tracking
-        self._ema_alpha = cfg.ema_alpha
+        # Per-joint EMA α: first arm_dim entries = arm α, remaining = hand α.
+        # Fingers need higher α than arm because equivalent task-space motion
+        # requires larger joint-space deltas on the hand (small effective moment arm).
+        self._ema_alpha = torch.tensor(
+            [cfg.ema_alpha_arm] * self._arm_dim + [cfg.ema_alpha_hand] * self._hand_dim,
+            device=self.device, dtype=torch.float32,
+        )
         if self._use_target_tracking:
             self._target = torch.zeros(self.num_envs, self._output_dim, device=self.device)
             self._joint_limits_cached = False
@@ -246,8 +252,11 @@ class EigenGraspRelativeJointPositionActionCfg(ActionTermCfg):
     use_target_tracking: bool = False
     """If True, use delta-from-target + EMA smoothing (SimToolReal-style). Defaults to False."""
 
-    ema_alpha: float = 0.1
-    """EMA blend factor: target = alpha * raw + (1-alpha) * prev. Only used when use_target_tracking=True."""
+    ema_alpha_arm: float = 0.15
+    """EMA blend factor for arm joints: target = α * raw + (1-α) * prev. Only used when use_target_tracking=True."""
+
+    ema_alpha_hand: float = 0.65
+    """EMA blend factor for hand joints. Higher than arm α because fingers need larger joint-space deltas to produce equivalent task-space motion."""
 
 
 __all__ = [
