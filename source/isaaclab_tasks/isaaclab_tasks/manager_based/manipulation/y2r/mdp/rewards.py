@@ -258,15 +258,15 @@ def action_rate_l2_clamped(
         Weighted sum of squared action rate for each environment.
     """
     action_diff = env.action_manager.action - env.action_manager.prev_action
-    
+
     # Split into arm and hand actions
     arm_diff = action_diff[:, :arm_joint_count]
     hand_diff = action_diff[:, arm_joint_count:]
-    
-    # Apply different weights: full penalty on arm, reduced on hand
-    arm_penalty = torch.sum(torch.square(arm_diff), dim=1)
-    hand_penalty = torch.sum(torch.square(hand_diff), dim=1) * finger_scale
-    
+
+    # Mean per-action squared (joint-count agnostic). Hand reduced by finger_scale.
+    arm_penalty = torch.mean(torch.square(arm_diff), dim=1)
+    hand_penalty = torch.mean(torch.square(hand_diff), dim=1) * finger_scale
+
     return (arm_penalty + hand_penalty).clamp(-1000, 1000)
 
 
@@ -290,15 +290,15 @@ def action_l2_clamped(
         Weighted sum of squared actions for each environment.
     """
     action = env.action_manager.action
-    
+
     # Split into arm and hand actions
     arm_action = action[:, :arm_joint_count]
     hand_action = action[:, arm_joint_count:]
-    
-    # Apply different weights: full penalty on arm, reduced on hand
-    arm_penalty = torch.sum(torch.square(arm_action), dim=1)
-    hand_penalty = torch.sum(torch.square(hand_action), dim=1) * finger_scale
-    
+
+    # Mean per-action squared (joint-count agnostic). Hand reduced by finger_scale.
+    arm_penalty = torch.mean(torch.square(arm_action), dim=1)
+    hand_penalty = torch.mean(torch.square(hand_action), dim=1) * finger_scale
+
     return (arm_penalty + hand_penalty).clamp(-1000, 1000)
 
 
@@ -1632,9 +1632,9 @@ def finger_regularizer(
     # Default joints tensor (must be in canonical order: index, middle, ring, thumb)
     default_tensor = torch.tensor(default_joints, device=device, dtype=torch.float32)  # (16,)
     
-    # L2 distance from default
-    finger_error = (finger_pos - default_tensor).norm(dim=-1)  # (N,)
-    
+    # RMS per-joint deviation from default (std is the per-joint scale in radians)
+    finger_error = (finger_pos - default_tensor).pow(2).mean(dim=-1).sqrt()  # (N,)
+
     # Penalty: 0 at default, approaches 1 as error grows
     penalty = 1.0 - torch.exp(-finger_error / std)
     
