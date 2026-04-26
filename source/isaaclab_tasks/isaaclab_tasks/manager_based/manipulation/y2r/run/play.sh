@@ -21,6 +21,8 @@ source "$(dirname "$0")/common.sh"
 TASK_LAYER="base"
 STUDENT=0
 AGENT_ALIAS=""
+VIDEO=0
+VIDEO_SECONDS=60
 REMAINING_ARGS=()
 
 # Parse all arguments, extract our flags, collect the rest
@@ -42,6 +44,22 @@ while [[ $# -gt 0 ]]; do
         --agent)
             AGENT_ALIAS="$2"
             shift 2
+            ;;
+        --video)
+            # --video [N]: record N seconds (default 60). Forces num_envs=1, headless,
+            # no livestream. Translates below to play.py's --video --video_length flags.
+            VIDEO=1
+            if [[ -n "$2" && "$2" =~ ^[0-9]+$ ]]; then
+                if [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
+                    VIDEO_SECONDS="$2"
+                    shift 2
+                else
+                    echo "Error: --video N must be a positive integer (got '$2')"
+                    exit 1
+                fi
+            else
+                shift
+            fi
             ;;
         *)
             REMAINING_ARGS+=("$1")
@@ -116,25 +134,42 @@ fi
 
 cd "$ISAACLAB_DIR"
 
+# Display vs recording mode. Sim runs at 50Hz control rate (physics_dt=0.01 * decimation=2),
+# so video_length = N*50. In recording mode all flags are FORCED (placed after user "$@") so
+# user can't accidentally re-enable livestream/multi-env. Live mode lets user override the
+# default --livestream 2 (e.g. add --headless for some debugging case).
+if [ "$VIDEO" = "1" ]; then
+    DISPLAY_ARGS=()
+    OVERRIDE_ARGS=(--livestream 0 --headless --video --video_length $((VIDEO_SECONDS * 50)) --num_envs 1)
+    echo "========================================"
+    echo "Recording: ${VIDEO_SECONDS}s ($((VIDEO_SECONDS * 50)) steps @ 50Hz), num_envs=1"
+    echo "========================================"
+else
+    DISPLAY_ARGS=(--livestream 2)
+    OVERRIDE_ARGS=()
+fi
+
 if [ "$STUDENT" = "1" ]; then
     echo "========================================"
     echo "Mode: Student | Task: $TASK_LAYER"
     echo "========================================"
     Y2R_MODE=play_student Y2R_TASK=$TASK_LAYER Y2R_ROBOT=$ROBOT ./isaaclab.sh -p scripts/reinforcement_learning/rl_games/play.py \
         --task "$TASK" \
-        --livestream 2 \
+        "${DISPLAY_ARGS[@]}" \
         --enable_cameras \
         --agent "$STUDENT_AGENT" \
         --checkpoint "$CHECKPOINT" \
-        "$@"
+        "$@" \
+        "${OVERRIDE_ARGS[@]}"
 else
     echo "========================================"
     echo "Mode: Teacher${AGENT_ALIAS:+ ($AGENT_ALIAS)} | Task: $TASK_LAYER"
     echo "========================================"
     Y2R_MODE=play Y2R_TASK=$TASK_LAYER Y2R_ROBOT=$ROBOT ./isaaclab.sh -p scripts/reinforcement_learning/rl_games/play.py \
         --task "$TASK" \
-        --livestream 2 \
+        "${DISPLAY_ARGS[@]}" \
         ${AGENT_ARGS} \
         --checkpoint "$CHECKPOINT" \
-        "$@"
+        "$@" \
+        "${OVERRIDE_ARGS[@]}"
 fi

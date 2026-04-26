@@ -275,24 +275,29 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if agent.is_rnn:
         agent.init_rnn()
 
-    # Setup keyboard event listener for manual reset
+    # Setup keyboard event listener for manual reset.
+    # Skipped in --video mode: headless app has no keyboard; recording is one-shot.
     reset_requested = {"flag": False}
+    kb_input = None
+    keyboard = None
+    kb_sub = None
 
-    def on_keyboard_event(event, *args):
-        """Handle keyboard events for manual reset."""
-        if event.type == carb.input.KeyboardEventType.KEY_PRESS:
-            if event.input.name == "KEY_1" or event.input.name == "NUMPAD_1":
-                reset_requested["flag"] = True
-                print("[INFO] Manual reset requested (Key: 1)")
-        return True
+    if not args_cli.video:
+        def on_keyboard_event(event, *args):
+            """Handle keyboard events for manual reset."""
+            if event.type == carb.input.KeyboardEventType.KEY_PRESS:
+                if event.input.name == "KEY_1" or event.input.name == "NUMPAD_1":
+                    reset_requested["flag"] = True
+                    print("[INFO] Manual reset requested (Key: 1)")
+            return True
 
-    # Subscribe to keyboard events
-    appwindow = omni.appwindow.get_default_app_window()
-    kb_input = carb.input.acquire_input_interface()
-    keyboard = appwindow.get_keyboard()
-    kb_sub = kb_input.subscribe_to_keyboard_events(keyboard, on_keyboard_event)
+        # Subscribe to keyboard events
+        appwindow = omni.appwindow.get_default_app_window()
+        kb_input = carb.input.acquire_input_interface()
+        keyboard = appwindow.get_keyboard()
+        kb_sub = kb_input.subscribe_to_keyboard_events(keyboard, on_keyboard_event)
 
-    print("[INFO] Keyboard controls enabled: Press '1' to reset environments")
+        print("[INFO] Keyboard controls enabled: Press '1' to reset environments")
 
     # simulate environment
     # note: We simplified the logic in rl-games player.py (:func:`BasePlayer.run()`) function in an
@@ -358,11 +363,46 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
 
-    # cleanup keyboard subscription
-    kb_input.unsubscribe_to_keyboard_events(keyboard, kb_sub)
+    # cleanup keyboard subscription (only if subscribed; --video mode skips it)
+    if kb_sub is not None:
+        kb_input.unsubscribe_to_keyboard_events(keyboard, kb_sub)
 
-    # close the simulator
+    # close the simulator (also flushes RecordVideo's ffmpeg writer)
     env.close()
+
+    if args_cli.video:
+        _publish_recording(log_dir)
+
+
+def _publish_recording(log_dir):
+    """Move the recorded MP4 to Y2R_DATA_ROOT/y2r_sim/recordings/<run>/<ts>.mp4 and upload to W&B."""
+    import datetime
+    import shutil
+    from pathlib import Path
+
+    # RecordVideo names the file from step_trigger (lambda s: s == 0) → rl-video-step-0.mp4.
+    # Hardcode the expected name to avoid picking up stale MP4s from prior runs.
+    src = Path(log_dir) / "videos" / "play" / "rl-video-step-0.mp4"
+    if not src.exists():
+        print(f"[WARN] expected MP4 not found at {src}; skipping move/upload")
+        return
+
+    run_name = Path(log_dir).name
+    ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    repo_root = Path.cwd().parent  # play.sh cds into IsaacLab/
+    data_root = Path(os.environ.get("Y2R_DATA_ROOT", str(repo_root)))
+    dst_dir = data_root / "y2r_sim" / "recordings" / run_name
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst = dst_dir / f"{ts}.mp4"
+    shutil.move(str(src), str(dst))
+    print(f"[VIDEO] saved: {dst}")
+
+    import wandb
+    wandb.init(project="trajectory-play", entity="hgupt3", name=f"{run_name}_{ts}")
+    wandb.log({"play/video": wandb.Video(str(dst), fps=50, format="mp4")})
+    url = wandb.run.url
+    wandb.finish()
+    print(f"[VIDEO] uploaded: {url}")
 
 
 def _save_recording(
