@@ -53,7 +53,7 @@ params:
 
     # --- Point Transformer ---
     hidden_dim: 128                   # Token embedding dimension
-    num_heads: 4                    # AME-2 ratio: head_dim = 128/32 = 4
+    num_heads: 16                    # AME-2 ratio: head_dim = 128/32 = 4
     self_attention: False            # AME-style: no self-attention on point tokens
     use_global_feature: True         # AME-2: max-pool point tokens → concat into query
     flash_attention: False           # Force MATH SDPA: at S_kv=32 EFFICIENT_ATTENTION reserves ~13 GB workspace; MATH uses ~500 MB

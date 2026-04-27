@@ -83,32 +83,19 @@ def quat_to_euler_deg(quat: torch.Tensor) -> tuple[float, float, float]:
     return float(euler[0]), float(euler[1]), float(euler[2])
 
 
-# ==================== DEBUG: default_joints from base.yaml ====================
-# These are the values used in finger_regularizer reward
-CONFIG_DEFAULT_JOINTS = [
-    0.0315, 0.0764, 0.0196, 0.2944,   # index (0-3)
-    -0.0010, 0.1109, 0.0309, 0.2541,  # middle (0-3)
-    -0.0067, 0.1260, 0.0697, 0.2933,  # ring (0-3)
-    1.5165, 0.5420, 0.3112, 0.3816    # thumb (0-3)
-]
+def compute_finger_regularizer(
+    finger_pos: torch.Tensor,
+    default_joints: list,
+    std: float,
+) -> tuple[float, float]:
+    """Mirror of mdp.finger_regularizer (RMS form), no phase filter.
 
-
-def debug_finger_regularizer(finger_pos: torch.Tensor, default_joints: list, std: float = 1.5) -> tuple[float, float]:
-    """
-    Compute finger_regularizer penalty exactly as the reward function does.
-    
-    Args:
-        finger_pos: Current finger joint positions (16,)
-        default_joints: Default joint positions from config (16,)
-        std: Standard deviation for penalty computation
-    
-    Returns:
-        Tuple of (penalty value in [0, 1], L2 error)
+    Returns (penalty in [0, 1], RMS deviation in radians).
     """
     device = finger_pos.device
     default_tensor = torch.tensor(default_joints, device=device, dtype=torch.float32)
-    finger_error = (finger_pos - default_tensor).norm().item()
-    penalty = 1.0 - torch.exp(torch.tensor(-finger_error / std)).item()
+    finger_error = (finger_pos - default_tensor).pow(2).mean().sqrt().item()
+    penalty = 1.0 - float(torch.exp(torch.tensor(-finger_error / std)))
     return penalty, finger_error
 
 
@@ -157,6 +144,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         )
         print(f"[INFO] Wrist depth camera enabled: {wrist_cfg.width}x{wrist_cfg.height}, "
               f"clip=[{wrist_cfg.clipping_range[0]}, {wrist_cfg.clipping_range[1]}]m")
+
+    # ==================== DEBUG: finger_regularizer config (live, from env_cfg) ====================
+    fr_cfg = env_cfg.y2r_cfg.rewards.finger_regularizer
+    fr_weight = float(fr_cfg.weight)
+    fr_default_joints = list(fr_cfg.params["default_joints"])
+    fr_std = float(fr_cfg.params["std"])
+    fr_phases = fr_cfg.params.get("phases")
+    print("\n" + "=" * 80)
+    print("FINGER_REGULARIZER CONFIG (live from env_cfg)")
+    print("=" * 80)
+    print(f"  weight  : {fr_weight}")
+    print(f"  std     : {fr_std} rad")
+    print(f"  phases  : {fr_phases}")
+    print(f"  default_joints (16):")
+    for i, val in enumerate(fr_default_joints):
+        print(f"    [{i:2d}] {val:+.4f} rad ({val * 57.2958:+7.2f} deg)")
+    print("=" * 80 + "\n")
 
     # Create environment
     print("[INFO] Creating environment...")
@@ -207,16 +211,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"  [{i:2d}] {name:16s} -> PhysX[{physx_idx:2d}] = {physx_name:16s} {match}")
     
     
-    # Print config default_joints
-    print(f"\n[Config default_joints from base.yaml]")
-    for i, (name, val) in enumerate(zip(hand_joint_names, CONFIG_DEFAULT_JOINTS)):
+    # Print config default_joints (live from env_cfg)
+    print(f"\n[Config default_joints from finger_regularizer (live)]")
+    for i, (name, val) in enumerate(zip(hand_joint_names, fr_default_joints)):
         print(f"  [{i:2d}] {name:16s}: {val:+.4f} rad ({val * 57.2958:+7.2f} deg)")
-    
+
     # Print robot's default joint positions for hand
     robot_default_hand = robot.data.default_joint_pos[0, hand_joint_ids].cpu().tolist()
     print(f"\n[Robot default_joint_pos (via find_joints)]")
     for i, (name, val) in enumerate(zip(hand_joint_names, robot_default_hand)):
-        config_val = CONFIG_DEFAULT_JOINTS[i]
+        config_val = fr_default_joints[i]
         diff = abs(val - config_val)
         match = "✓" if diff < 0.01 else f"Δ={diff:.3f}"
         print(f"  [{i:2d}] {name:16s}: {val:+.4f} rad ({val * 57.2958:+7.2f} deg) vs config {config_val:+.4f} {match}")
@@ -410,6 +414,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"    Shape: {depth_norm.shape}, range: [{depth_norm.min():.4f}, {depth_norm.max():.4f}]")
         print(f"    Meters range: [{depth_clamped.min():.4f}, {depth_clamped.max():.4f}]")
 
+    snap_to_reg_state = {"pressed": False}
+
     def on_keyboard_event(event, *args):
         """Handle J/K for joint control and Up/Down for mode cycling."""
         if event.type == carb.input.KeyboardEventType.KEY_PRESS:
@@ -425,6 +431,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 joint_mode[0] = (joint_mode[0] - 1) % num_modes
                 mode_name = joint_mode_names[joint_mode[0]]
                 print(f"  >> Joint mode: [{joint_mode[0]}] {mode_name}")
+            elif event.input.name == "B":
+                snap_to_reg_state["pressed"] = True
             elif event.input.name == "P" and wrist_camera_enabled:
                 save_depth_state["requested"] = True
         elif event.type == carb.input.KeyboardEventType.KEY_RELEASE:
@@ -460,6 +468,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print("  J/K     - Close/Open (hold)")
     print("  Up/Down - Cycle joint mode")
     print("  R       - Reset to default pose")
+    print("  B       - Snap hand to finger_regularizer default (penalty -> 0)")
     if wrist_camera_enabled:
         print("  P       - Save wrist depth image")
     print("  ESC     - Quit")
@@ -501,6 +510,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             joint_offsets.zero_()  # Reset individual joint offsets
             reset_state["pressed"] = False
             print("[INFO] Reset to default pose")
+
+        # Handle B: snap hand target to finger_regularizer default_joints (penalty -> 0)
+        if snap_to_reg_state["pressed"]:
+            fr_default_tensor = torch.tensor(fr_default_joints, device=device, dtype=torch.float32)
+            robot_default_hand_vec = robot.data.default_joint_pos[0, hand_joint_ids]  # (16,)
+            joint_offsets[:] = fr_default_tensor - robot_default_hand_vec
+            eigen_coeff.zero_()
+            snap_to_reg_state["pressed"] = False
+            print("[INFO] Snapped hand target to finger_regularizer default_joints (penalty target)")
         
         # Get keyboard command: [dx, dy, dz, rx, ry, rz, gripper]
         kb_cmd = se3_keyboard.advance()
@@ -592,6 +610,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 mode_info = f"{mode_name}: {cur_pos:.3f} rad ({cur_pos*57.296:.1f} deg)"
             print(f"[Step {step_count:6d}] Palm: ({palm_pos_w[0,0]:.3f}, {palm_pos_w[0,1]:.3f}, {palm_pos_w[0,2]:.3f}) | "
                   f"Euler: ({roll:.1f}, {pitch:.1f}, {yaw:.1f}) | [{mode}] {mode_info}")
+
+            # finger_regularizer live print (uses live env_cfg values, ignores phase filter)
+            finger_pos = robot.data.joint_pos[0, hand_joint_ids]  # (16,) canonical order
+            penalty, rms_err = compute_finger_regularizer(finger_pos, fr_default_joints, fr_std)
+            weighted_reward = fr_weight * penalty
+            default_tensor = torch.tensor(fr_default_joints, device=device, dtype=torch.float32)
+            per_joint_dev = (finger_pos - default_tensor).cpu().tolist()
+            print(f"  [finger_regularizer] rms_err={rms_err:.4f} rad  penalty={penalty:.4f}  "
+                  f"weighted={weighted_reward:+.4f}  (weight={fr_weight}, std={fr_std}, phases={fr_phases})")
+            print(f"  [finger_regularizer] per-joint deviation (current - default) rad:")
+            for i, name in enumerate(hand_joint_names):
+                cur = finger_pos[i].item()
+                dflt = fr_default_joints[i]
+                print(f"    [{i:2d}] {name:16s} cur={cur:+.4f}  default={dflt:+.4f}  delta={per_joint_dev[i]:+.4f}")
             last_print_time = current_time
     
     # Cleanup
