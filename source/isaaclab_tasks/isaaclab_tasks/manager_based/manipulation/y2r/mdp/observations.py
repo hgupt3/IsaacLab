@@ -1319,6 +1319,7 @@ class target_sequence_obs_b(ManagerTermBase):
         # Visualizers
         self.markers = None
         self.grasp_point_marker = None
+        self.pose_axis_markers = None
         self._debug_draw = None
         self._visualizer_initialized = False
         if self.visualize or self.visualize_current:
@@ -1525,21 +1526,22 @@ class target_sequence_obs_b(ManagerTermBase):
         """
         N = self.env.num_envs
 
-        # Debug draw (pose axes + regions + contact forces)
+        # Pose-axis frames are rendered as scene-prim markers (visible to offscreen
+        # cameras), independent of the _debug_draw line-overlay path used below.
+        if self.visualize_pose_axes or self.visualize_hand_pose_targets:
+            object_pos_w = self.object.data.root_pos_w
+            object_quat_w = self.object.data.root_quat_w
+            window_targets = self.trajectory_manager.get_window_targets()
+            target_pos_w = window_targets[:, :, :3]
+            target_quat_w = window_targets[:, :, 3:7]
+            self._visualize_pose_axes(object_pos_w, object_quat_w, target_pos_w, target_quat_w, N)
+
+        # Debug draw (regions + contact forces + camera pose) — viewport overlay only.
         if self._debug_draw is not None and (
-            self.visualize_pose_axes or self.visualize_hand_pose_targets
-            or self.visualize_waypoint_region or self.visualize_goal_region
+            self.visualize_waypoint_region or self.visualize_goal_region
             or self.visualize_contact_forces or self.visualize_camera_pose
         ):
             self._debug_draw.clear_lines()
-
-            if self.visualize_pose_axes or self.visualize_hand_pose_targets:
-                object_pos_w = self.object.data.root_pos_w
-                object_quat_w = self.object.data.root_quat_w
-                window_targets = self.trajectory_manager.get_window_targets()
-                target_pos_w = window_targets[:, :, :3]
-                target_quat_w = window_targets[:, :, 3:7]
-                self._visualize_pose_axes(object_pos_w, object_quat_w, target_pos_w, target_quat_w, N)
 
             if self.visualize_waypoint_region or self.visualize_goal_region:
                 self._visualize_regions(self.env.scene.env_origins, self.trajectory_manager.start_poses[:, :3])
@@ -1634,6 +1636,23 @@ class target_sequence_obs_b(ManagerTermBase):
         except Exception as e:
             print(f"[WARN] Could not initialize debug draw: {e}. Region visualization disabled.")
             self._debug_draw = None
+        # Pose axis markers (real scene prims; visible to offscreen RecordVideo cameras
+        # unlike _debug_draw which only renders into the live viewport).
+        if self.visualize_pose_axes or self.visualize_hand_pose_targets:
+            import isaaclab.sim as sim_utils
+            from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+            from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+            self.pose_axis_markers = VisualizationMarkers(
+                VisualizationMarkersCfg(
+                    prim_path="/Visuals/PoseAxes",
+                    markers={
+                        "frame": sim_utils.UsdFileCfg(
+                            usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/frame_prim.usd",
+                            scale=(1.0, 1.0, 1.0),  # Per-instance scaling via visualize(scales=)
+                        ),
+                    },
+                )
+            )
     
     def _visualize_regions(self, env_origins: torch.Tensor, start_pos: torch.Tensor):
         """Visualize waypoint and goal sampling regions using debug lines."""
@@ -1905,131 +1924,60 @@ class target_sequence_obs_b(ManagerTermBase):
         target_quat_w: torch.Tensor,
         num_envs: int,
     ):
-        """Visualize pose axes (XYZ arrows) for current object, targets, and palm.
-        
-        Args:
-            object_pos_w: (N, 3) current object position in world frame.
-            object_quat_w: (N, 4) current object quaternion in world frame.
-            target_pos_w: (N, W, 3) target positions in world frame.
-            target_quat_w: (N, W, 4) target quaternions in world frame.
-            num_envs: Number of environments.
+        """Visualize pose-axis frames for current object, first target, palm, and hand targets.
+
+        Uses scene prim markers (Isaac frame_prim.usd) so they render through any camera
+        — including the offscreen camera used by gym RecordVideo in --video mode.
         """
-        if self._debug_draw is None:
+        if self.pose_axis_markers is None:
             return
-        
-        # Axis arrow lengths
-        AXIS_LENGTH = 0.08        # Object and target axes
-        PALM_AXIS_LENGTH = 0.10   # Palm axes (medium size)
-        
-        # Select envs to visualize
+
+        # Per-frame scales (uniform XYZ; the frame prim is ~unit-sized in its USD).
+        OBJ_SCALE = 0.08          # Current object + first target
+        PALM_SCALE = 0.10         # Palm + hand pose targets
+
         if self.visualize_env_ids is None:
             env_ids = list(range(num_envs))
         else:
             env_ids = [i for i in self.visualize_env_ids if i < num_envs]
-        
         if not env_ids:
             return
-        
         E = len(env_ids)
-        W = target_pos_w.shape[1]
         device = object_pos_w.device
-        
-        # Local axis directions
-        x_axis = torch.tensor([1.0, 0.0, 0.0], device=device)
-        y_axis = torch.tensor([0.0, 1.0, 0.0], device=device)
-        z_axis = torch.tensor([0.0, 0.0, 1.0], device=device)
-        
-        all_starts = []
-        all_ends = []
-        all_colors = []
-        
-        # === Current object axes (bright colors) ===
-        obj_pos = object_pos_w[env_ids]  # (E, 3)
-        obj_quat = object_quat_w[env_ids]  # (E, 4)
-        
-        # Transform local axes to world
-        for axis, color in [(x_axis, (1.0, 0.0, 0.0, 1.0)),    # Red for X
-                            (y_axis, (0.0, 1.0, 0.0, 1.0)),    # Green for Y
-                            (z_axis, (0.0, 0.0, 1.0, 1.0))]:   # Blue for Z
-            axis_exp = axis.unsqueeze(0).expand(E, 3)
-            axis_world = quat_apply(obj_quat, axis_exp) * AXIS_LENGTH
-            
-            all_starts.append(obj_pos)
-            all_ends.append(obj_pos + axis_world)
-            all_colors.extend([color] * E)
-        
-        # === Target axes (dimmer colors, only first target for clarity) ===
-        # Using first target in window (current target)
-        tgt_pos = target_pos_w[env_ids, 0]  # (E, 3) - first target
-        tgt_quat = target_quat_w[env_ids, 0]  # (E, 4)
-        
-        for axis, color in [(x_axis, (0.5, 0.0, 0.0, 0.8)),    # Dark red for X
-                            (y_axis, (0.0, 0.5, 0.0, 0.8)),    # Dark green for Y
-                            (z_axis, (0.0, 0.0, 0.5, 0.8))]:   # Dark blue for Z
-            axis_exp = axis.unsqueeze(0).expand(E, 3)
-            axis_world = quat_apply(tgt_quat, axis_exp) * AXIS_LENGTH
-            
-            all_starts.append(tgt_pos)
-            all_ends.append(tgt_pos + axis_world)
-            all_colors.extend([color] * E)
-        
-        # === Palm frame axes (standard RGB, medium size) ===
+
+        positions = []   # list of (M, 3) tensors
+        orientations = []  # list of (M, 4)
+        scales = []      # list of (M, 3)
+
+        def push(pos, quat, scale_val):
+            positions.append(pos)
+            orientations.append(quat)
+            s = torch.full((pos.shape[0], 3), scale_val, device=device)
+            scales.append(s)
+
+        # Current object frame.
+        push(object_pos_w[env_ids], object_quat_w[env_ids], OBJ_SCALE)
+        # First (current) target frame.
+        push(target_pos_w[env_ids, 0], target_quat_w[env_ids, 0], OBJ_SCALE)
+        # Palm frame.
         if self._palm_body_idx is not None:
             palm_pos_w, palm_quat_w, _ = get_palm_frame_pose_w(self.ref_asset, self.y2r_cfg)
+            push(palm_pos_w[env_ids], palm_quat_w[env_ids], PALM_SCALE)
+        # All hand-pose targets in the window.
+        if self.visualize_hand_pose_targets and self.y2r_cfg.hand_trajectory.enabled:
+            hand_targets = self.trajectory_manager.get_hand_window_targets()  # (N, W, 7)
+            W = hand_targets.shape[1]
+            for w in range(W):
+                push(hand_targets[env_ids, w, :3], hand_targets[env_ids, w, 3:7], PALM_SCALE)
 
-            palm_pos = palm_pos_w[env_ids]  # (E, 3)
-            palm_quat = palm_quat_w[env_ids]  # (E, 4)
-            
-            # Standard RGB axes (10cm)
-            # Based on observation: X = finger direction, Z = palm normal (out of palm)
-            for axis, color in [(x_axis, (1.0, 0.0, 0.0, 1.0)),    # Red for X (finger direction)
-                                (y_axis, (0.0, 1.0, 0.0, 1.0)),    # Green for Y
-                                (z_axis, (0.0, 0.0, 1.0, 1.0))]:   # Blue for Z (palm normal)
-                axis_exp = axis.unsqueeze(0).expand(E, 3)
-                axis_world = quat_apply(palm_quat, axis_exp) * PALM_AXIS_LENGTH
-                
-                all_starts.append(palm_pos)
-                all_ends.append(palm_pos + axis_world)
-                all_colors.extend([color] * E)
-        
-        # === Hand pose TARGET axes (dim RGB, similar to object target) ===
-        # Show ALL targets in the window, with decreasing brightness for future targets
-        if self.visualize_hand_pose_targets:
-            cfg = self.env.cfg.y2r_cfg
-            if cfg.hand_trajectory.enabled:
-                HAND_TARGET_AXIS_LENGTH = 0.10
-                W = cfg.trajectory.window_size
-                
-                # Get all hand pose targets in window
-                hand_targets = self.trajectory_manager.get_hand_window_targets()  # (N, W, 7)
-                
-                for w in range(W):
-                    hand_pos = hand_targets[env_ids, w, :3]  # (E, 3)
-                    hand_quat = hand_targets[env_ids, w, 3:7]  # (E, 4)
-                    
-                    # Brightness decreases for future targets (1.0 -> 0.3)
-                    brightness = 0.6 - 0.4 * (w / max(W - 1, 1))
-                    
-                    # Dim RGB axes
-                    for axis, base_color in [(x_axis, (1.0, 0.0, 0.0)),    # Red for X
-                                             (y_axis, (0.0, 1.0, 0.0)),    # Green for Y
-                                             (z_axis, (0.0, 0.0, 1.0))]:   # Blue for Z
-                        color = (base_color[0] * brightness, base_color[1] * brightness, base_color[2] * brightness, 0.8)
-                        axis_exp = axis.unsqueeze(0).expand(E, 3)
-                        axis_world = quat_apply(hand_quat, axis_exp) * HAND_TARGET_AXIS_LENGTH
-                        
-                        all_starts.append(hand_pos)
-                        all_ends.append(hand_pos + axis_world)
-                        all_colors.extend([color] * E)
-        
-        # Concatenate and draw
-        starts = torch.cat(all_starts, dim=0)  # (9*E, 3) with palm axes
-        ends = torch.cat(all_ends, dim=0)
-        
-        starts_list = starts.cpu().tolist()
-        ends_list = ends.cpu().tolist()
-        n = len(starts_list)
-        self._debug_draw.draw_lines(starts_list, ends_list, all_colors, [4.0] * n)
+        translations = torch.cat(positions, dim=0)
+        orientations_cat = torch.cat(orientations, dim=0)
+        scales_cat = torch.cat(scales, dim=0)
+        self.pose_axis_markers.visualize(
+            translations=translations,
+            orientations=orientations_cat,
+            scales=scales_cat,
+        )
     
     def __call__(
         self,

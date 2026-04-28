@@ -17,7 +17,7 @@ mode:
 visualization:
   targets: true
   current_object: true
-  pose_axes: false
+  pose_axes: true
   env_ids: null
   debug_print_rewards: false
   hand_pose_targets: true
