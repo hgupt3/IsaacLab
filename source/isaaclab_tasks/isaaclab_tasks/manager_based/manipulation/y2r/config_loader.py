@@ -182,6 +182,7 @@ class TrajectoryConfig:
     target_hz: float
     window_size: int
     easing_power: float
+    release_ease_power: float
     path_mode: bool = False
     timing_aware: bool = True
     skip_manipulation_probability: float = 0.0  # Probability of grasp-only episodes
@@ -289,6 +290,7 @@ class ReleaseConfig:
 class HandTrajectoryConfig:
     enabled: bool
     grasp_rot_completion_fraction: float  # Rotation completes at this fraction of grasp duration
+    boundary_blend_time_s: float  # Blend window duration (seconds) for position_only -> full transitions
     grasp_sampling: GraspSamplingConfig
     keypoints: GraspKeypointsConfig
     feasibility: FeasibilityConfig

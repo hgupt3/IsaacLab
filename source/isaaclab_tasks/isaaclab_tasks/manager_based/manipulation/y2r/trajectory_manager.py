@@ -1310,40 +1310,41 @@ class TrajectoryManager:
 
         return result
 
-    def _get_object_pose_at_keypoint_time(self, env_ids: torch.Tensor, kp_idx: int) -> torch.Tensor:
+    def _get_object_pose_at_keypoint_time(
+        self, env_ids: torch.Tensor, kp_idx: int, num_kp: torch.Tensor
+    ) -> torch.Tensor:
         """Get object pose at the time when keypoint kp_idx is reached.
 
-        Keypoints are evenly distributed through the manipulation phase.
+        Keypoints are evenly distributed through each env's manipulation phase, but the
+        spacing depends on each env's sampled keypoint count (num_kp), not the buffer's
+        max_kp. For envs where kp_idx >= num_kp (the slot is unused by trajectory
+        generation), the returned pose is undefined-but-safe (clamped to trajectory end).
 
         Args:
             env_ids: Environment indices.
-            kp_idx: Keypoint index (0-based).
+            kp_idx: Keypoint index (0-based) into the buffer slot.
+            num_kp: (n,) per-env sampled keypoint counts.
 
         Returns:
             (n, 7) object poses at keypoint time.
         """
         n = len(env_ids)
-        max_kp = self.keypoint_surface_points.shape[1]
 
-        # Keypoints are distributed through manipulation phase
-        # kp_idx=0 is near start of manipulation, kp_idx=max_kp-1 is near end
-
-        # Get per-env manipulation duration
+        # Keypoints distributed through manipulation phase, kp_idx=0 near start.
+        # For env with N keypoints: kp_k is reached at progress (k+1)/N.
+        # Final keypoint (k = N-1) is at progress 1.0 (goal pose).
         grasp_end = self.t_grasp_end[env_ids]  # (n,)
         manip_duration = self.t_manip_end[env_ids] - grasp_end  # (n,)
 
-        # Time within manipulation phase for this keypoint
-        # For forward-only traversal with N segments: grasp → kp_0 → ... → kp_{N-1}
-        # kp_k is reached at progress (k+1)/N, where N = max_kp
-        # Final keypoint (kp_{N-1}) is at progress 1.0 (goal pose)
-        kp_fraction = (kp_idx + 1) / max_kp
+        # Per-env kp_fraction. clamp(min=1) avoids div-by-zero for envs with num_kp=0
+        # (their slot values won't be used by trajectory generation anyway).
+        num_kp_safe = num_kp.clamp(min=1).float()
+        kp_fraction = (kp_idx + 1) / num_kp_safe  # (n,)
         kp_time = grasp_end + kp_fraction * manip_duration  # (n,)
 
-        # Convert to trajectory index
-        kp_traj_idx = (kp_time / self.target_dt).long()  # (n,)
-        kp_traj_idx = kp_traj_idx.clamp(max=self.total_targets - 1)
+        # Convert to trajectory index (clamped — out-of-range slots get the last frame)
+        kp_traj_idx = (kp_time / self.target_dt).long().clamp(min=0, max=self.total_targets - 1)
 
-        # Gather object poses from trajectory
         batch_idx = torch.arange(n, device=self.device)
         return self.trajectory[env_ids][batch_idx, kp_traj_idx]  # (n, 7)
 
@@ -1461,6 +1462,9 @@ class TrajectoryManager:
         # Get goal poses for final keypoint (at progress 1.0)
         goal_poses = self.goal_poses[env_ids]  # (n, 7)
 
+        # Per-env keypoint counts — drive both kp_fraction and is_final detection.
+        num_kp_per_env = self.num_grasp_keypoints[env_ids]  # (n,)
+
         feas_cfg = self.cfg.hand_trajectory.feasibility
 
         # Config for finger direction check (same as grasp sampling)
@@ -1470,13 +1474,13 @@ class TrajectoryManager:
         exclude_z = -1.0 + exclude_bottom_frac * 2
 
         for kp_idx in range(max_kp):
-            is_final = (kp_idx == max_kp - 1)
+            # Per-env: this slot is the final keypoint when kp_idx == num_kp[env] - 1.
+            # For envs with num_kp=0 this is never true (their slots go unused anyway).
+            is_final_per_env = (kp_idx == num_kp_per_env - 1)  # (n,)
 
-            # Final keypoint is at progress 1.0 (goal pose), others at (k+1)/max_kp
-            if is_final:
-                obj_pose_at_kp = goal_poses
-            else:
-                obj_pose_at_kp = self._get_object_pose_at_keypoint_time(env_ids, kp_idx)  # (n, 7)
+            # Always compute the trajectory-based pose; substitute goal_poses where final.
+            traj_pose = self._get_object_pose_at_keypoint_time(env_ids, kp_idx, num_kp_per_env)  # (n, 7)
+            obj_pose_at_kp = torch.where(is_final_per_env.unsqueeze(1), goal_poses, traj_pose)
 
             # ===== FILTER 1: Distance =====
             distances = (pool_points - prev_points.unsqueeze(1)).norm(dim=-1)  # (n, pool_size)
@@ -1509,8 +1513,11 @@ class TrajectoryManager:
                 (torch.rand(n, pool_size, device=self.device) * 2 - 1) * cfg.roll_perturbation
             )  # (n, pool_size)
 
-            # Compute closest feasible roll for each point (apply all constraints simultaneously)
-            constraints = [(0, toward_robot_threshold)]  # x-component (toward robot)
+            # Compute closest feasible roll for each point (apply all constraints simultaneously).
+            # Match grasp-sampling gating (line ~988): each constraint is opt-in via its config flag.
+            constraints = []
+            if grasp_cfg.exclude_toward_robot:
+                constraints.append((0, toward_robot_threshold))  # x-component (toward robot)
             if grasp_cfg.exclude_upward:
                 constraints.append((2, grasp_cfg.upward_threshold))  # z-component (upward)
 
@@ -1540,7 +1547,10 @@ class TrajectoryManager:
             palm_pos_world = pool_points_world + standoffs_exp.unsqueeze(-1) * pool_normals_world
 
             # ===== FILTER 3: Height check =====
-            height_ok = palm_pos_world[..., 2] > (self.table_height + feas_cfg.min_height)
+            # palm_pos_world is world-frame; table_height is per-env-local. Add env_origins.z
+            # to compare in the same frame (matches goal-z convention at line ~834).
+            min_z_world = self.table_height + self.env_origins[env_ids, 2] + feas_cfg.min_height  # (n,)
+            height_ok = palm_pos_world[..., 2] > min_z_world.unsqueeze(1)
 
             # ===== FILTER 4: Finger direction - verify the computed roll is actually feasible =====
             # (It might not be if no feasible roll exists for this surface normal)
@@ -1550,8 +1560,11 @@ class TrajectoryManager:
                 x_axis.expand(n * pool_size, 3)
             ).reshape(n, pool_size, 3)
 
-            # ===== FILTER 4a: Exclude toward robot =====
-            finger_ok = finger_dir_world[..., 0] < toward_robot_threshold
+            # ===== FILTER 4a: Exclude toward robot (gated on config flag) =====
+            if grasp_cfg.exclude_toward_robot:
+                finger_ok = finger_dir_world[..., 0] < toward_robot_threshold
+            else:
+                finger_ok = torch.ones(n, pool_size, dtype=torch.bool, device=self.device)
 
             # ===== FILTER 4b: Exclude upward =====
             if grasp_cfg.exclude_upward:
@@ -1559,12 +1572,15 @@ class TrajectoryManager:
             else:
                 upward_ok = torch.ones(n, pool_size, dtype=torch.bool, device=self.device)
 
-            # ===== FILTER 5: Exclude bottom fraction (final keypoint only) =====
-            if is_final:
-                bottom_ok = pool_normals_world[..., 2] > exclude_z
-                valid_mask = dist_ok & normal_ok & height_ok & finger_ok & upward_ok & bottom_ok
-            else:
-                valid_mask = dist_ok & normal_ok & height_ok & finger_ok & upward_ok
+            # ===== FILTER 5: Exclude bottom fraction (per-env: only on each env's final keypoint) =====
+            # bottom_ok is enforced where this slot is the env's final keypoint;
+            # elsewhere we treat it as always-true so the AND below doesn't reject.
+            bottom_ok = torch.where(
+                is_final_per_env.unsqueeze(1),
+                pool_normals_world[..., 2] > exclude_z,
+                torch.ones(n, pool_size, dtype=torch.bool, device=self.device),
+            )
+            valid_mask = dist_ok & normal_ok & height_ok & finger_ok & upward_ok & bottom_ok
 
             # For scoring + fallback, compute palm_quat_world for prev values (might be invalid!)
             prev_normals_world = quat_apply(obj_quat_at_kp, prev_normals)
@@ -1905,8 +1921,7 @@ class TrajectoryManager:
                 prev_hand_quat_per_seg[carry_mask, seg_idx] = prev_hand_quat_per_seg[carry_mask, seg_idx - 1]
 
         # Blend window for transitions from position_only -> full coupling
-        boundary_blend_time_s = getattr(self.cfg.hand_trajectory, "boundary_blend_time_s", self.target_dt)
-        blend_duration = max(boundary_blend_time_s, self.target_dt)
+        blend_duration = max(self.cfg.hand_trajectory.boundary_blend_time_s, self.target_dt)
 
         # Step 6: Process MANIPULATION segments (coupling mode 0 or 1) - ALL at once
         is_manip_3d = manip_mask_2d.unsqueeze(2).expand(-1, -1, self.total_targets)  # (n, max_segs, total_targets)
@@ -2040,8 +2055,7 @@ class TrajectoryManager:
                          effective_duration_d).clamp(0, 1)
 
             # Apply ease-in: slow start, fast end (t^power)
-            release_ease_power = getattr(self.cfg.trajectory, 'release_ease_power', 2.0)
-            eased_t_d = local_t_d ** release_ease_power
+            eased_t_d = local_t_d ** self.cfg.trajectory.release_ease_power
 
             # Interpolate with easing from previous hand pose to release pose
             hand_pos_d = start_pos_d + eased_t_d.unsqueeze(1) * (target_pos_d - start_pos_d)
@@ -2752,8 +2766,7 @@ class TrajectoryManager:
             hand_quat_full = quat_mul(obj_quat_flat[full_mask], interp_quat_local_flat[full_mask])
 
             # Smooth transition when coming from position_only segment
-            boundary_blend_time_s = getattr(self.cfg.hand_trajectory, "boundary_blend_time_s", self.target_dt)
-            blend_duration = max(boundary_blend_time_s, self.target_dt)
+            blend_duration = max(self.cfg.hand_trajectory.boundary_blend_time_s, self.target_dt)
             prev_seg_idx_flat = seg_idx_flat[full_mask] - 1
             has_prev = prev_seg_idx_flat >= 0
             if has_prev.any():
