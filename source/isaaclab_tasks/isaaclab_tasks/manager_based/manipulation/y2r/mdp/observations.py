@@ -1638,17 +1638,31 @@ class target_sequence_obs_b(ManagerTermBase):
             self._debug_draw = None
         # Pose axis markers (real scene prims; visible to offscreen RecordVideo cameras
         # unlike _debug_draw which only renders into the live viewport).
+        # Three thin cylinder prototypes (red / green / blue), 1m long with fixed radius;
+        # per-instance scale only stretches the cylinder's Z (length); axis orientation
+        # rotates the prim's +Z to the desired world axis (+X / +Y / +Z).
         if self.visualize_pose_axes or self.visualize_hand_pose_targets:
             import isaaclab.sim as sim_utils
             from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
-            from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+            POSE_AXIS_RADIUS = 0.0025  # 2.5 mm shaft radius (5 mm visual thickness)
             self.pose_axis_markers = VisualizationMarkers(
                 VisualizationMarkersCfg(
                     prim_path="/Visuals/PoseAxes",
                     markers={
-                        "frame": sim_utils.UsdFileCfg(
-                            usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/frame_prim.usd",
-                            scale=(1.0, 1.0, 1.0),  # Per-instance scaling via visualize(scales=)
+                        "x": sim_utils.CylinderCfg(
+                            radius=POSE_AXIS_RADIUS,
+                            height=1.0,
+                            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),
+                        ),
+                        "y": sim_utils.CylinderCfg(
+                            radius=POSE_AXIS_RADIUS,
+                            height=1.0,
+                            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0)),
+                        ),
+                        "z": sim_utils.CylinderCfg(
+                            radius=POSE_AXIS_RADIUS,
+                            height=1.0,
+                            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 1.0)),
                         ),
                     },
                 )
@@ -1926,15 +1940,20 @@ class target_sequence_obs_b(ManagerTermBase):
     ):
         """Visualize pose-axis frames for current object, first target, palm, and hand targets.
 
-        Uses scene prim markers (Isaac frame_prim.usd) so they render through any camera
-        — including the offscreen camera used by gym RecordVideo in --video mode.
+        Each frame is rendered as three thin cylinders (red X, green Y, blue Z). Cylinders
+        render through any camera — including the offscreen camera used by gym RecordVideo
+        in --video mode — so the axes survive `play.sh --video`.
         """
         if self.pose_axis_markers is None:
             return
 
-        # Per-frame scales (uniform XYZ; the frame prim is ~unit-sized in its USD).
-        OBJ_SCALE = 0.08          # Current object + first target
-        PALM_SCALE = 0.10         # Palm + hand pose targets
+        # Cylinder length per frame, in meters. Thickness is fixed in the prototype
+        # (POSE_AXIS_RADIUS = 2.5 mm), so per-instance scale touches only the Z axis
+        # (the cylinder's long axis in its local frame), keeping shaft diameter constant.
+        # The cylinder is offset by length/2 along its long axis so the start sits at
+        # the frame origin (instead of the cylinder being centered on the origin).
+        OBJ_LEN = 0.10        # Current object + first target
+        PALM_LEN = 0.12       # Palm + hand pose targets
 
         if self.visualize_env_ids is None:
             env_ids = list(range(num_envs))
@@ -1942,41 +1961,66 @@ class target_sequence_obs_b(ManagerTermBase):
             env_ids = [i for i in self.visualize_env_ids if i < num_envs]
         if not env_ids:
             return
-        E = len(env_ids)
         device = object_pos_w.device
 
-        positions = []   # list of (M, 3) tensors
-        orientations = []  # list of (M, 4)
-        scales = []      # list of (M, 3)
+        # Cylinders are natively Z-aligned. Quaternions that rotate the prim's local +Z
+        # onto each target axis of the frame's local coordinate system.
+        # quat order is (w, x, y, z); s = sin(45°).
+        s = 0.7071067811865476
+        x_axis_rot = torch.tensor([s, 0.0, s, 0.0], device=device)   # +Z → +X (90° about Y)
+        y_axis_rot = torch.tensor([s, -s, 0.0, 0.0], device=device)  # +Z → +Y (-90° about X)
+        z_axis_rot = torch.tensor([1.0, 0.0, 0.0, 0.0], device=device)  # identity (+Z)
+        # Local-axis unit vectors used to offset each cylinder's center to the frame origin.
+        x_unit = torch.tensor([1.0, 0.0, 0.0], device=device)
+        y_unit = torch.tensor([0.0, 1.0, 0.0], device=device)
+        z_unit = torch.tensor([0.0, 0.0, 1.0], device=device)
 
-        def push(pos, quat, scale_val):
-            positions.append(pos)
-            orientations.append(quat)
-            s = torch.full((pos.shape[0], 3), scale_val, device=device)
-            scales.append(s)
+        positions = []
+        orientations = []
+        scales = []
+        marker_indices = []
+
+        def push_frame(pos: torch.Tensor, quat: torch.Tensor, length: float):
+            """Emit 3 cylinder instances (x/y/z) for each (pos, quat) row."""
+            n = pos.shape[0]
+            scale = torch.tensor([1.0, 1.0, length], device=device).expand(n, 3)
+            half = length * 0.5
+            for axis_idx, (axis_rot, axis_unit) in enumerate(
+                ((x_axis_rot, x_unit), (y_axis_rot, y_unit), (z_axis_rot, z_unit))
+            ):
+                world_quat = quat_mul(quat, axis_rot.unsqueeze(0).expand(n, 4))
+                # Offset the cylinder centre along its world-space axis so the proximal
+                # end sits at the frame origin.
+                offset_world = quat_apply(quat, axis_unit.unsqueeze(0).expand(n, 3)) * half
+                positions.append(pos + offset_world)
+                orientations.append(world_quat)
+                scales.append(scale)
+                marker_indices.append(torch.full((n,), axis_idx, dtype=torch.long, device=device))
 
         # Current object frame.
-        push(object_pos_w[env_ids], object_quat_w[env_ids], OBJ_SCALE)
+        push_frame(object_pos_w[env_ids], object_quat_w[env_ids], OBJ_LEN)
         # First (current) target frame.
-        push(target_pos_w[env_ids, 0], target_quat_w[env_ids, 0], OBJ_SCALE)
+        push_frame(target_pos_w[env_ids, 0], target_quat_w[env_ids, 0], OBJ_LEN)
         # Palm frame.
         if self._palm_body_idx is not None:
             palm_pos_w, palm_quat_w, _ = get_palm_frame_pose_w(self.ref_asset, self.y2r_cfg)
-            push(palm_pos_w[env_ids], palm_quat_w[env_ids], PALM_SCALE)
+            push_frame(palm_pos_w[env_ids], palm_quat_w[env_ids], PALM_LEN)
         # All hand-pose targets in the window.
         if self.visualize_hand_pose_targets and self.y2r_cfg.hand_trajectory.enabled:
             hand_targets = self.trajectory_manager.get_hand_window_targets()  # (N, W, 7)
             W = hand_targets.shape[1]
             for w in range(W):
-                push(hand_targets[env_ids, w, :3], hand_targets[env_ids, w, 3:7], PALM_SCALE)
+                push_frame(hand_targets[env_ids, w, :3], hand_targets[env_ids, w, 3:7], PALM_LEN)
 
         translations = torch.cat(positions, dim=0)
         orientations_cat = torch.cat(orientations, dim=0)
         scales_cat = torch.cat(scales, dim=0)
+        marker_indices_cat = torch.cat(marker_indices, dim=0)
         self.pose_axis_markers.visualize(
             translations=translations,
             orientations=orientations_cat,
             scales=scales_cat,
+            marker_indices=marker_indices_cat,
         )
     
     def __call__(

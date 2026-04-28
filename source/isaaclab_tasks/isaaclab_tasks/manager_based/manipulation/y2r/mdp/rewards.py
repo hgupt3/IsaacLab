@@ -451,15 +451,16 @@ def _get_finger_self_contact_force(env: ManagerBasedRLEnv) -> torch.Tensor:
 def contact_factor(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Cached per-step contact factor with diminishing returns for multi-finger contact.
 
-    Two tiers:
-      Tier 1 (per-finger): thumb gates; other 3 sorted and weighted by finger_weights.
-                           Each finger's score is max(link_2, link_3) — one score per
-                           finger, preventing multi-link double-counting on one digit.
-      Tier 2 (palm/proximal): flat capped bonus from palm + link_1 contact. Added on
-                              top of Tier 1, also gated by thumb so palm contact alone
-                              doesn't score.
+    Structure (single-tier with combined gate):
+      Per-finger score: max(link_2, link_3) for each non-thumb finger, soft-ramped → [0, 1].
+      Top-K sorted descending and weighted by finger_weights → tier1.
+      Combined gate input = 1.0 * thumb_sat  +  palm_weight * palm_sat
+        - thumb_sat ∈ [0, 1] from thumb force ramp
+        - palm_sat  ∈ [0, 1] from palm + link_1 force ramp (separate threshold/ramp)
+      Max gate input = 1.0 + palm_weight (no clipping — palm acts as a bonus to a
+      maxed thumb when both are loaded).
 
-    factor = thumb_gate * ( Σ_sorted(w_i * finger_i)  +  palm_flat )
+    factor = (thumb_gate_floor + (1 - floor) * gate_input) * Σ_sorted(w_i * finger_i)
     """
     step = env.common_step_counter
     cached = getattr(env, '_cached_contact_factor', None)
@@ -487,24 +488,23 @@ def contact_factor(env: ManagerBasedRLEnv) -> torch.Tensor:
         dim=-1,
     )  # (N, K)
 
-    # Tier 1: sorted descending, diminishing weights (gated by thumb)
+    # Top-K finger sum, sorted descending and weighted by diminishing finger_weights.
     other_sorted = other_f.sort(dim=-1, descending=True).values
     tier1 = (other_sorted * w[: other_sorted.shape[-1]]).sum(dim=-1)
-    thumb_gate_floor = float(max(cf_cfg.thumb_gate_floor, 0.0))
-    soft_thumb = thumb_gate_floor + (1.0 - thumb_gate_floor) * thumb_f
 
-    # Tier 2: flat capped palm/proximal bonus, NOT thumb-gated — enables legitimate
-    # non-fingertip strategies (palm push, scoop, trap-against-surface). Capped at
-    # palm_weight so it can't dominate a real grasp.
+    # Combined gate input: thumb (max 1.0) + palm_weight * palm_sat (max palm_weight).
     palm_weight = float(cf_cfg.palm_weight)
     if palm_weight > 0.0:
         palm_sum = _get_palm_proximal_contact_sum(env)
-        palm_factor = ((palm_sum - cf_cfg.palm_threshold) / cf_cfg.palm_ramp).clamp(0.0, 1.0)
-        tier2 = palm_weight * palm_factor
+        palm_f = ((palm_sum - cf_cfg.palm_threshold) / cf_cfg.palm_ramp).clamp(0.0, 1.0)
+        gate_input = thumb_f + palm_weight * palm_f
     else:
-        tier2 = torch.zeros_like(tier1)
+        gate_input = thumb_f
 
-    raw_factor = soft_thumb * tier1 + tier2
+    thumb_gate_floor = float(max(cf_cfg.thumb_gate_floor, 0.0))
+    gate = thumb_gate_floor + (1.0 - thumb_gate_floor) * gate_input
+
+    raw_factor = gate * tier1
 
     result = min_factor + (1.0 - min_factor) * raw_factor
     env._cached_contact_factor = (step, result)
