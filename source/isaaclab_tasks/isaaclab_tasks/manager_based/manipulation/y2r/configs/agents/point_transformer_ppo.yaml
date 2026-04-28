@@ -28,7 +28,7 @@ params:
     self_attention: False      # AME-style: no self-attention on point tokens
     use_global_feature: True   # AME-2: max-pool point tokens → concat into query
     hidden_dim: 64            # Token embedding dimension
-    num_heads: 8             # Cross-attention heads (head_dim = 64/8 = 8)
+    num_heads: 16            # Cross-attention heads (head_dim = 64/16 = 4)
     ffn_ratio: 1.0            # Token FFN expansion ratio (unused when self_attention: False)
     ffn_dropout: 0.0         # FFN dropout (light regularization)
     attn_dropout: 0.0        # Attention dropout (light regularization)
