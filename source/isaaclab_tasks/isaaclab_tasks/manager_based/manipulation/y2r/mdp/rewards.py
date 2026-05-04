@@ -305,6 +305,7 @@ def action_l2_clamped(
 def object_ee_distance(
     env: ManagerBasedRLEnv,
     std: float,
+    finger_weights: list[float] | None = None,
     phases: list[str] | None = None,
     use_hand_pose_gate: bool = False,
     error_gate_pos_threshold: float | None = None,
@@ -314,12 +315,22 @@ def object_ee_distance(
     object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Reward reaching the object using a tanh-kernel on end-effector distance.
+    """Reward fingertips approaching the object using a tanh kernel.
 
-    The reward is close to 1 when the maximum distance between the object and any end-effector body is small.
-    
+    Per-fingertip score = ``1 - tanh(d_i / std)`` ∈ [0, 1].
+
+    Aggregation:
+      • ``finger_weights`` provided → drop body[0] (palm), sort fingertip scores
+        descending, take the top-K, do a weighted sum, and normalize by Σ weights so
+        the result stays in [0, 1]. Encourages most fingers close while tolerating one
+        far reacher.
+      • ``finger_weights`` is None → legacy max-distance kernel (worst body sets the
+        reward; kept for kuka_allegro and other robots without tuned per-finger weights).
+
     Args:
-        phases: List of phases to be active in, e.g. ["grasp", "manipulation"]. None = all phases.
+        std: Tanh saturation distance in meters. Tighter std = steeper gradient.
+        finger_weights: Top-K weights for closest fingertips. Length defines K.
+        phases: List of phases to be active in, e.g. ["grasp", "manipulation"]. None = all.
         use_hand_pose_gate: If True, apply hand pose gate from hand_pose_following.
     """
     asset: RigidObject = env.scene[asset_cfg.name]
@@ -344,8 +355,28 @@ def object_ee_distance(
                 asset_pos[:, 1 + i] = asset_pos[:, 1 + i] + offset_w
 
     object_pos = object.data.root_pos_w
-    object_ee_distance = torch.norm(asset_pos - object_pos[:, None, :], dim=-1).max(dim=-1).values
-    reward = 1 - torch.tanh(object_ee_distance / std)
+    body_dists = torch.norm(asset_pos - object_pos[:, None, :], dim=-1)  # (N, B)
+
+    if finger_weights is None:
+        # Legacy: worst-body distance.
+        ee_dist = body_dists.max(dim=-1).values
+        reward = 1.0 - torch.tanh(ee_dist / std)
+    else:
+        # Top-K weighted sum over fingertip bodies (body[0] = palm, dropped).
+        if body_dists.shape[1] <= 1:
+            reward = torch.zeros(env.num_envs, device=env.device)
+        else:
+            finger_dists = body_dists[:, 1:]  # (N, F)
+            per_finger = 1.0 - torch.tanh(finger_dists / std)  # (N, F) ∈ [0, 1]
+
+            # Cache weights tensor (created once per env).
+            w = getattr(env, "_fto_weights_t", None)
+            if w is None or w.shape[0] != len(finger_weights):
+                w = torch.tensor(finger_weights, device=env.device, dtype=per_finger.dtype)
+                env._fto_weights_t = w
+            k = min(w.shape[0], per_finger.shape[-1])
+            top_k = per_finger.sort(dim=-1, descending=True).values[:, :k]
+            reward = (top_k * w[:k]).sum(dim=-1) / w[:k].sum().clamp_min(1e-6)
 
     # Error-dependent gate: when tracking is clearly bad, reduce this reward so that
     # "freeze + squeeze to keep contact" is not a good local optimum.
@@ -492,12 +523,14 @@ def contact_factor(env: ManagerBasedRLEnv) -> torch.Tensor:
     other_sorted = other_f.sort(dim=-1, descending=True).values
     tier1 = (other_sorted * w[: other_sorted.shape[-1]]).sum(dim=-1)
 
-    # Combined gate input: thumb (max 1.0) + palm_weight * palm_sat (max palm_weight).
+    # Combined gate input: max(thumb, palm_weight * palm). Palm acts as a fallback floor
+    # — it only contributes when its weighted saturation exceeds the thumb's. Cap is 1.0
+    # (no overshoot beyond what thumb alone can give).
     palm_weight = float(cf_cfg.palm_weight)
     if palm_weight > 0.0:
         palm_sum = _get_palm_proximal_contact_sum(env)
         palm_f = ((palm_sum - cf_cfg.palm_threshold) / cf_cfg.palm_ramp).clamp(0.0, 1.0)
-        gate_input = thumb_f + palm_weight * palm_f
+        gate_input = torch.maximum(thumb_f, palm_weight * palm_f)
     else:
         gate_input = thumb_f
 

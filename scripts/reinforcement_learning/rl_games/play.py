@@ -195,6 +195,25 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent: BasePlayer = runner.create_player()
     agent.restore(resume_path)
     agent.reset()
+
+    # BasePlayer.restore() only loads model weights — it skips the
+    # Y2RCheckpointObserver path, so common_step_counter and per-env ADR
+    # difficulties from the checkpoint stay unread. Apply them manually so
+    # play.sh --continue runs at the same curriculum level the trainer left off.
+    try:
+        from isaaclab_tasks.manager_based.manipulation.y2r.rl_games_checkpoint import (
+            restore_curriculum_state,
+        )
+        ckpt_state = torch.load(resume_path, map_location="cpu", weights_only=False)
+        info = restore_curriculum_state(env.unwrapped, ckpt_state, force=True)
+        if info["mean_difficulty"] is not None:
+            print(
+                f"[INFO] Play: restored ADR mean_difficulty={info['mean_difficulty']:.2f}, "
+                f"floor={info['floor']}, num_envs_match={info['num_envs_match']}, "
+                f"step={info['restored_counter']}"
+            )
+    except Exception as e:
+        print(f"[WARN] Could not restore curriculum state from checkpoint: {e}")
     # Upcast FP16 observations to FP32 before model preprocessing.
     # Keeps inference numerics and student network assumptions consistent.
     _orig_preproc = agent._preproc_obs

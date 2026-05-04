@@ -802,6 +802,7 @@ def _build_rewards_cfg(cfg: Y2RConfig, terminations_cfg=None):
                 "phases": cfg.rewards.fingers_to_object.params.get("phases"),
                 "use_hand_pose_gate": cfg.rewards.fingers_to_object.params.get("use_hand_pose_gate"),
                 "std": cfg.rewards.fingers_to_object.params["std"],
+                "finger_weights": cfg.rewards.fingers_to_object.params.get("finger_weights"),
                 "error_gate_pos_threshold": cfg.rewards.fingers_to_object.params["error_gate_pos_threshold"],
                 "error_gate_pos_slope": cfg.rewards.fingers_to_object.params["error_gate_pos_slope"],
                 "error_gate_rot_threshold": cfg.rewards.fingers_to_object.params["error_gate_rot_threshold"],

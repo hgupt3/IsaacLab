@@ -2,13 +2,9 @@
 # Play/Evaluation Mode Layer
 # ==============================================================================
 # Applied for teacher play/evaluation.
-# Harder waypoints, max curriculum, basic visualization.
+# Curriculum level is restored from the checkpoint by play.py
+# (see restore_curriculum_state in rl_games_checkpoint.py).
 # ==============================================================================
-
-# Start at max difficulty
-curriculum:
-  difficulty:
-    initial: 1
 
 mode:                                                                                                                                                                                                    
   use_student_mode: false

@@ -452,6 +452,7 @@ class CurriculumConfig:
     student_noise: NoiseConfig
     gate_floor: tuple[float, float]
     grasp_scale: tuple[float, float]
+    fingers_to_object_weight: tuple[float, float]
     best_release_error: bool
     gravity: GravityConfig
 

@@ -318,6 +318,19 @@ def build_curriculum_cfg(cfg: Y2RConfig):
             },
         )
 
+        fingers_to_object_weight_adr = CurrTerm(
+            func=mdp.modify_term_cfg,
+            params={
+                "address": "rewards.fingers_to_object.weight",
+                "modify_fn": mdp.initial_final_interpolate_fn,
+                "modify_params": {
+                    "initial_value": cfg.curriculum.fingers_to_object_weight[0],
+                    "final_value": cfg.curriculum.fingers_to_object_weight[1],
+                    "difficulty_term_str": "adr",
+                },
+            },
+        )
+
     result = TrajectoryCurriculumCfg()
 
     # Student noise curriculum (Gaussian std) for student observation groups only.
