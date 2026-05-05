@@ -34,6 +34,7 @@ def build_curriculum_cfg(cfg: Y2RConfig):
                 "step_interval": cfg.curriculum.scheduler.step_interval,
                 "level_overrides": cfg.curriculum.scheduler.level_overrides,
                 "use_performance": cfg.curriculum.scheduler.use_performance,
+                "freeze": cfg.curriculum.scheduler.freeze,
             },
         )
 

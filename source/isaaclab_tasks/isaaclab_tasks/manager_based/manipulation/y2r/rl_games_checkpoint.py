@@ -126,6 +126,72 @@ def restore_curriculum_state(env, weights, *, force: bool = False) -> dict:
     return info
 
 
+def restore_adr_from_teacher(env, teacher_ckpt_path: str) -> dict:
+    """Seed the student env's DifficultyScheduler with the teacher checkpoint's ADR state.
+
+    Used by distillation: the standard rl_games restore path reads the STUDENT checkpoint,
+    not the teacher's, so teacher ADR has to be plumbed in separately. The teacher and
+    student typically have different num_envs, so we broadcast the teacher's mean per-env
+    difficulty (rounded) to all student envs and recompute difficulty_frac.
+
+    Note on student ``--continue``: distill.py calls this every launch, but rl_games' patched
+    ``set_full_state_weights`` runs ``restore_curriculum_state`` later in the load path. On
+    resume, the student checkpoint's saved ADR (which was already a frozen copy) overwrites
+    the teacher pin. By design — the student-checkpoint-wins-on-resume keeps long-running
+    distillations resumable without re-coupling to a possibly-moved teacher .pth.
+
+    Fails fast (raises) if:
+      - teacher .pth has no ``adr_difficulties`` (would otherwise pin frozen distillation at 0)
+      - the env has no ``y2r_cfg`` attached (we need ``curriculum.difficulty.max``)
+      - the curriculum manager has no DifficultyScheduler (no place to restore to)
+
+    Args:
+        env: ManagerBasedRLEnv (unwrapped). Must expose ``curriculum_manager`` and ``y2r_cfg``.
+        teacher_ckpt_path: Path to the teacher's .pth file.
+
+    Returns:
+        dict with keys: ``mean_difficulty`` (float), ``num_teacher_envs`` (int),
+        ``num_student_envs`` (int).
+    """
+    weights = torch.load(teacher_ckpt_path, map_location="cpu", weights_only=False)
+    adr_difficulties = weights.get("adr_difficulties")
+    if adr_difficulties is None:
+        raise RuntimeError(
+            f"Teacher checkpoint {teacher_ckpt_path} has no 'adr_difficulties' key. "
+            "Distillation with frozen ADR requires teacher state to pin to. "
+            "Re-train the teacher with the current checkpoint observer or pick a newer .pth."
+        )
+
+    scheduler = _find_difficulty_scheduler(env)
+    if scheduler is None:
+        raise RuntimeError(
+            "Curriculum manager has no DifficultyScheduler — cannot restore teacher ADR. "
+            "Verify the env was constructed with the y2r curriculum config."
+        )
+
+    y2r_cfg = _resolve_y2r_cfg(env)
+    if y2r_cfg is None:
+        raise RuntimeError(
+            "Env has no y2r_cfg attached — cannot resolve curriculum.difficulty.max. "
+            "This function must be called after the env config is fully attached."
+        )
+    max_difficulty = y2r_cfg.curriculum.difficulty.max
+
+    # Broadcast teacher's mean to every student env. Round to int because difficulty
+    # is treated as integer levels by downstream logic.
+    teacher_mean = float(adr_difficulties.float().mean().item())
+    pinned = round(teacher_mean)
+    scheduler.current_adr_difficulties[:] = pinned
+    scheduler._restored = True  # Skip first demotion after env reset (no-op while freeze=True)
+    scheduler.difficulty_frac = torch.mean(scheduler.current_adr_difficulties) / max(max_difficulty, 1)
+
+    return {
+        "mean_difficulty": teacher_mean,
+        "num_teacher_envs": int(adr_difficulties.shape[0]),
+        "num_student_envs": env.num_envs,
+    }
+
+
 class Y2RCheckpointObserver(AlgoObserver):
     """Observer that persists common_step_counter and ADR state in rl_games checkpoints."""
 

@@ -162,7 +162,15 @@ class DifficultyScheduler(ManagerTermBase):
         step_interval: int | None = None,  # Steps between floor increases (None = disabled)
         level_overrides: Sequence[Any] | None = None,  # Optional per-level interval overrides
         use_performance: bool = True,  # Whether to use performance-based advancement
+        freeze: bool = False,  # If True, skip step + performance updates entirely (used for distillation)
     ):
+        if freeze:
+            # Distillation mode: ADR is pinned to whatever it was set to (typically by
+            # restoring teacher's checkpoint state). Refresh the broadcast scalar from
+            # current per-env state and return without mutating anything.
+            self.difficulty_frac = torch.mean(self.current_adr_difficulties) / max(max_difficulty, 1)
+            return self.difficulty_frac
+
         # Compute step-based difficulty floor using Isaac Lab's global step counter
         self.step_based_floor = _compute_step_based_floor(
             common_step_counter=env.common_step_counter,

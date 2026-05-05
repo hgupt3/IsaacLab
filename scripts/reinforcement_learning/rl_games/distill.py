@@ -123,7 +123,7 @@ from isaaclab_tasks.utils import load_cfg_from_registry
 
 # Register custom networks for y2r tasks
 import isaaclab_tasks.manager_based.manipulation.y2r.networks  # noqa: F401
-from isaaclab_tasks.manager_based.manipulation.y2r.rl_games_checkpoint import Y2RCheckpointObserver
+from isaaclab_tasks.manager_based.manipulation.y2r.rl_games_checkpoint import Y2RCheckpointObserver, restore_adr_from_teacher
 
 # Import and register distillation agent
 from isaaclab_tasks.manager_based.manipulation.y2r.distillation import DistillAgent
@@ -321,7 +321,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     
     # ===== Create environment =====
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
-    
+
+    # Seed student's ADR scheduler with teacher's checkpoint state. With
+    # curriculum.scheduler.freeze=true (set in student.yaml), the value is pinned for the run.
+    # On student --continue, the student checkpoint's saved ADR (already a frozen copy)
+    # overwrites this pin via the standard rl_games restore — by design, see
+    # restore_adr_from_teacher's docstring.
+    adr_info = restore_adr_from_teacher(env.unwrapped, teacher_ckpt)
+    print(
+        f"[INFO] Pinned student ADR from teacher: mean_difficulty={adr_info['mean_difficulty']:.2f} "
+        f"(teacher_envs={adr_info['num_teacher_envs']}, student_envs={adr_info['num_student_envs']})"
+    )
+
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
     

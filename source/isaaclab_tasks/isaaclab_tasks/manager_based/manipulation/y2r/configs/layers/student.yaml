@@ -15,7 +15,8 @@ curriculum:
   difficulty:
     initial: 0                   # Gradual curriculum (same as teacher)
     min: 0
-  
+
   scheduler:
     step_interval: 30000
     level_overrides:
+    freeze: true                 # Pin ADR to teacher's checkpoint value; no further advancement during distillation

@@ -411,6 +411,7 @@ class SchedulerConfig:
     level_overrides: list[SchedulerLevelOverrideConfig]
     use_performance: bool                       # Whether performance can advance faster than floor
     resume_step: bool                           # Whether to restore step counter from checkpoint on --continue
+    freeze: bool                                # If True, skip step-based + performance updates (used for distillation)
 
 
 @dataclass
@@ -857,6 +858,8 @@ def get_config_file_paths(mode: str | None = None, task: str | None = None, robo
             config_dir / "layers" / "student_play.yaml",
             config_dir / "layers" / "dump.yaml",
         ])
+    elif mode == "train_no_eigen":
+        files.append(config_dir / "layers" / "no_eigen.yaml")
     # mode == "train" uses base only
 
     # Task layer (optional, applied last)
@@ -905,6 +908,8 @@ def get_config(mode: str | None = None, task: str | None = None, robot: str | No
         cfg = _deep_merge(cfg, _load_yaml("layers/play"))
         cfg = _deep_merge(cfg, _load_yaml("layers/student_play"))
         cfg = _deep_merge(cfg, _load_yaml("layers/dump"))
+    elif mode == "train_no_eigen":
+        cfg = _deep_merge(cfg, _load_yaml("layers/no_eigen"))
     # mode == "train" uses base only
 
     # Task layer (optional, applied last)
