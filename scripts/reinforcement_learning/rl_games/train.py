@@ -40,6 +40,8 @@ parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy 
 parser.add_argument("--wandb-project-name", type=str, default=None, help="the wandb's project name")
 parser.add_argument("--wandb-entity", type=str, default=None, help="the entity (team) of wandb's project")
 parser.add_argument("--wandb-name", type=str, default=None, help="the name of wandb's run")
+parser.add_argument("--wandb-group", type=str, default=None, help="wandb group (used to cluster related runs, e.g. an ablation sweep)")
+parser.add_argument("--wandb-tags", type=str, default=None, help="comma-separated wandb tags (e.g. 'ablation,pt,seed1')")
 parser.add_argument(
     "--track",
     type=lambda x: bool(strtobool(x)),
@@ -336,10 +338,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             raise ValueError("Weights and Biases entity must be specified for tracking.")
         import wandb
 
+        wandb_tags = (
+            [t.strip() for t in args_cli.wandb_tags.split(",") if t.strip()]
+            if args_cli.wandb_tags
+            else None
+        )
         wandb.init(
             project=wandb_project,
             entity=args_cli.wandb_entity,
             name=experiment_name,
+            group=args_cli.wandb_group,
+            tags=wandb_tags,
             sync_tensorboard=True,
             monitor_gym=True,
             save_code=True,

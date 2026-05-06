@@ -27,7 +27,7 @@ if [ "$NUM_GPUS" -gt 0 ]; then
     # GPU_OFFSET shifts LOCAL_RANK so e.g. --multi_gpu 2,3 uses physical GPUs 2,3
     # We use a wrapper script to apply the offset before the training script starts
     PYTHON_EXE=$(./isaaclab.sh -p -c "import sys; print(sys.executable)" 2>/dev/null | grep '^/')
-    Y2R_MODE=train Y2R_TASK=base Y2R_ROBOT=$ROBOT Y2R_GPU_OFFSET=$GPU_OFFSET \
+    Y2R_MODE=${Y2R_MODE:-train} Y2R_TASK=${Y2R_TASK:-base} Y2R_ROBOT=$ROBOT Y2R_GPU_OFFSET=$GPU_OFFSET \
         $PYTHON_EXE -m torch.distributed.run --nproc_per_node=$NUM_GPUS --master_port=$MASTER_PORT \
         scripts/reinforcement_learning/rl_games/train.py \
         --task "$TASK" \
@@ -41,7 +41,7 @@ if [ "$NUM_GPUS" -gt 0 ]; then
         "$@"
 else
     # Single GPU
-    Y2R_MODE=train Y2R_TASK=base Y2R_ROBOT=$ROBOT ./isaaclab.sh -p scripts/reinforcement_learning/rl_games/train.py \
+    Y2R_MODE=${Y2R_MODE:-train} Y2R_TASK=${Y2R_TASK:-base} Y2R_ROBOT=$ROBOT ./isaaclab.sh -p scripts/reinforcement_learning/rl_games/train.py \
         --task "$TASK" \
         --headless \
         --track \
