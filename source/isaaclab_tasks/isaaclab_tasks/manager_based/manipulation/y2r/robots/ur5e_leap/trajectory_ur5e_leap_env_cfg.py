@@ -207,8 +207,9 @@ class UR5eLeapTrajectoryMixinCfg:
         # Fingers to object reward (link_3 bodies with tip offsets applied internally)
         self.rewards.fingers_to_object.params["asset_cfg"] = SceneEntityCfg("robot", body_names=["ur5e_link_6", "(index|middle|ring|thumb)_link_3"])
 
-        # Add wrist camera in student mode
-        if cfg.mode.use_student_mode:
+        # Add wrist camera in student mode (gated on use_depth_camera so the
+        # no-depth ablation skips both the rendering cost and the depth obs).
+        if cfg.mode.use_student_mode and cfg.mode.use_depth_camera:
             from scipy.spatial.transform import Rotation
 
             rot_euler = cfg.wrist_camera.offset.rot

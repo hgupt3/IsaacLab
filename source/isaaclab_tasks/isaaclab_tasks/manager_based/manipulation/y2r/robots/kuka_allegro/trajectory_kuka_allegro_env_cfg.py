@@ -188,8 +188,9 @@ class KukaAllegroTrajectoryMixinCfg:
         # Fingers to object reward uses palm and fingertips
         self.rewards.fingers_to_object.params["asset_cfg"] = SceneEntityCfg("robot", body_names=["palm_link", ".*_tip"])
 
-        # Add wrist camera in student mode (using TiledCamera for efficiency)
-        if cfg.mode.use_student_mode:
+        # Add wrist camera in student mode (using TiledCamera for efficiency).
+        # Gated on use_depth_camera so the no-depth ablation skips it.
+        if cfg.mode.use_student_mode and cfg.mode.use_depth_camera:
             from scipy.spatial.transform import Rotation
 
             # Config has [rx, ry, rz], transform for opengl convention

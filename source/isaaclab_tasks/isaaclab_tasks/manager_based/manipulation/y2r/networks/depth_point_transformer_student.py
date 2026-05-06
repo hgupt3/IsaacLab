@@ -93,8 +93,9 @@ class DepthPointTransformerStudentBuilder(NetworkBuilder):
         params['student_pc_history'] = cfg.observations.history.student_pc
         params['student_targets_history'] = cfg.observations.history.student_targets
         params['window_size'] = cfg.trajectory.window_size
-        params['depth_height'] = cfg.wrist_camera.height
-        params['depth_width'] = cfg.wrist_camera.width
+        params['use_depth_camera'] = cfg.mode.use_depth_camera
+        params['depth_height'] = cfg.wrist_camera.height if cfg.mode.use_depth_camera else 0
+        params['depth_width'] = cfg.wrist_camera.width if cfg.mode.use_depth_camera else 0
 
     def load(self, params: Dict[str, Any]):
         """Load parameters (called by rl_games). Injects Y2R config params."""
@@ -144,7 +145,12 @@ class DepthPointTransformerStudentBuilder(NetworkBuilder):
 
             self.num_timesteps = student_pc_history + window_size * student_targets_history
             self.point_cloud_dim = self.num_points * self.num_timesteps * 3
-            self.depth_dim = depth_height * depth_width
+            # use_depth_camera=False zeroes depth_dim so the obs split / encoder / aug
+            # branches all collapse cleanly; saves the wrist depth camera too (handled
+            # in trajectory_*_env_cfg.py). Required key — _inject_params reads it from
+            # y2r_cfg, so a missing value means plumbing is broken; crash explicitly.
+            self.use_depth_camera = bool(params['use_depth_camera'])
+            self.depth_dim = depth_height * depth_width if self.use_depth_camera else 0
             self.depth_height = depth_height
             self.depth_width = depth_width
 
@@ -185,18 +191,27 @@ class DepthPointTransformerStudentBuilder(NetworkBuilder):
                 self.running_mean_std = RunningMeanStd(non_depth_dim)
 
             # =====================================================================
-            # Depth encoder (ResNet)
+            # Depth encoder (ResNet) — skipped entirely when use_depth_camera=False
             # =====================================================================
-            depth_cfg = params.get('depth_encoder', {})
-            self.depth_channels = depth_cfg.get('channels', [32, 64, 128])
-            self.depth_encoder = DepthResNet(in_channels=1, channels=self.depth_channels)
-            self.depth_features_dim = self.depth_encoder.out_features
+            if self.use_depth_camera:
+                depth_cfg = params.get('depth_encoder', {})
+                self.depth_channels = depth_cfg.get('channels', [32, 64, 128])
+                self.depth_encoder = DepthResNet(in_channels=1, channels=self.depth_channels)
+                self.depth_features_dim = self.depth_encoder.out_features
 
-            # Depth augmentation (GPU-accelerated, explicitly controlled)
-            self.use_depth_aug = params.get('depth_augmentation', False)
-            self.apply_depth_aug = bool(params.get("apply_depth_aug", False))
-            self.depth_aug_config = params.get('depth_aug_config', None)
-            self.depth_aug = None  # Lazy init on first forward
+                # Depth augmentation (GPU-accelerated, explicitly controlled)
+                self.use_depth_aug = params.get('depth_augmentation', False)
+                self.apply_depth_aug = bool(params.get("apply_depth_aug", False))
+                self.depth_aug_config = params.get('depth_aug_config', None)
+                self.depth_aug = None  # Lazy init on first forward
+            else:
+                self.depth_channels = []
+                self.depth_encoder = None
+                self.depth_features_dim = 0
+                self.use_depth_aug = False
+                self.apply_depth_aug = False
+                self.depth_aug_config = None
+                self.depth_aug = None
 
             # =====================================================================
             # Point cloud encoder
@@ -376,10 +391,15 @@ class DepthPointTransformerStudentBuilder(NetworkBuilder):
             B = full_obs.shape[0]
 
             # =================================================================
-            # Split observation: [proprio | point_clouds | depth]
+            # Split observation: [proprio | point_clouds | depth?]
+            # When use_depth_camera=False, depth_dim==0 and full_obs has no depth tail.
             # =================================================================
-            depth_flat = full_obs[:, -self.depth_dim:]
-            non_depth = full_obs[:, :-self.depth_dim]
+            if self.use_depth_camera:
+                depth_flat = full_obs[:, -self.depth_dim:]
+                non_depth = full_obs[:, :-self.depth_dim]
+            else:
+                depth_flat = None
+                non_depth = full_obs
 
             # Normalize non-depth (proprio + point clouds), matching teacher behavior.
             # Running stats update is explicitly controlled via apply_obs_rms_update.
@@ -407,18 +427,21 @@ class DepthPointTransformerStudentBuilder(NetworkBuilder):
                          .reshape(B, self.num_points, self.num_timesteps * 3))
 
             # =================================================================
-            # Depth encoder
+            # Depth encoder — only runs when use_depth_camera=True
             # =================================================================
-            depth_img = depth_flat.view(B, 1, self.depth_height, self.depth_width)
+            if self.use_depth_camera:
+                depth_img = depth_flat.view(B, 1, self.depth_height, self.depth_width)
 
-            # Apply depth augmentation when explicitly enabled.
-            if self.apply_depth_aug and self.use_depth_aug:
-                self._init_depth_aug(str(depth_img.device))
-                if self.depth_aug is not None:
-                    depth_img = self._apply_depth_aug_eager(depth_img)
+                # Apply depth augmentation when explicitly enabled.
+                if self.apply_depth_aug and self.use_depth_aug:
+                    self._init_depth_aug(str(depth_img.device))
+                    if self.depth_aug is not None:
+                        depth_img = self._apply_depth_aug_eager(depth_img)
 
-            self.last_depth_img = depth_img.detach()
-            depth_features = self.depth_encoder(depth_img)  # (B, depth_features_dim)
+                self.last_depth_img = depth_img.detach()
+                depth_features = self.depth_encoder(depth_img)  # (B, depth_features_dim)
+            else:
+                depth_features = full_obs.new_zeros((B, 0))  # zero-width feature; concats are no-ops
 
             # =================================================================
             # Point transformer

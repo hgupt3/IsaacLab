@@ -149,6 +149,7 @@ class ModeConfig:
     use_point_cloud: bool
     use_eigen_grasp: bool
     use_student_mode: bool
+    use_depth_camera: bool   # When false (with use_student_mode=true), skip wrist depth camera + encoder
 
 
 @dataclass
@@ -860,6 +861,11 @@ def get_config_file_paths(mode: str | None = None, task: str | None = None, robo
         ])
     elif mode == "train_no_eigen":
         files.append(config_dir / "layers" / "no_eigen.yaml")
+    elif mode == "distill_no_depth":
+        files.extend([
+            config_dir / "layers" / "student.yaml",
+            config_dir / "layers" / "no_depth.yaml",
+        ])
     # mode == "train" uses base only
 
     # Task layer (optional, applied last)
@@ -910,6 +916,9 @@ def get_config(mode: str | None = None, task: str | None = None, robot: str | No
         cfg = _deep_merge(cfg, _load_yaml("layers/dump"))
     elif mode == "train_no_eigen":
         cfg = _deep_merge(cfg, _load_yaml("layers/no_eigen"))
+    elif mode == "distill_no_depth":
+        cfg = _deep_merge(cfg, _load_yaml("layers/student"))
+        cfg = _deep_merge(cfg, _load_yaml("layers/no_depth"))
     # mode == "train" uses base only
 
     # Task layer (optional, applied last)

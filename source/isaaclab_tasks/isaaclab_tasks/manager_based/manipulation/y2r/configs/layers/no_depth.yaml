@@ -1,0 +1,20 @@
+# ==============================================================================
+# No-Depth Layer
+# ==============================================================================
+# Distillation ablation that removes the wrist depth camera entirely.
+# Applied on top of the student layer in mode "distill_no_depth".
+#
+# Effect:
+#   - mode.use_depth_camera: false  → robots/*_env_cfg.py skips scene.wrist_camera
+#                                      and trajectory_env_cfg.py skips student_camera
+#                                      observation term + reset_camera_offset event.
+#                                    → depth_point_transformer_student.py sets
+#                                      depth_dim=0, skips DepthResNet + augmentation,
+#                                      query/trunk concat zero-width depth tensors.
+#
+# Pair with student_pt_no_depth_ppo.yaml as the agent config so obs_groups also
+# drop "student_camera".
+# ==============================================================================
+
+mode:
+  use_depth_camera: false

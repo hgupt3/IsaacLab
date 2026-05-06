@@ -557,7 +557,9 @@ def _build_observations_cfg(cfg: Y2RConfig):
         obs_cfg.student_future_pc = StudentFuturePCObsCfg()
         obs_cfg.student_future_poses = FuturePosesStudentCfg()
 
-    if cfg.mode.use_student_mode:
+    # Wrist depth obs only when both student mode AND depth camera are enabled.
+    # The no-depth ablation drops this obs (and skips the wrist_camera in scene).
+    if cfg.mode.use_student_mode and cfg.mode.use_depth_camera:
         obs_cfg.student_camera = StudentCameraObsCfg()
 
     return obs_cfg
@@ -704,8 +706,9 @@ def _build_events_cfg(cfg: Y2RConfig):
             },
         )
 
-    # Camera offset randomization (student mode only)
-    if cfg.mode.use_student_mode:
+    # Camera offset randomization (student mode + depth camera only;
+    # the no-depth ablation skips the wrist_camera scene entity entirely).
+    if cfg.mode.use_student_mode and cfg.mode.use_depth_camera:
         EventCfg.reset_camera_offset = EventTerm(
             func=mdp.reset_camera_offset,
             mode="reset",

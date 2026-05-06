@@ -1,0 +1,194 @@
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# Copyright (c) 2024, Harsh Gupta
+# All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# =============================================================================
+# Student Policy Configuration: DAgger variant (50/50 BC, no PPO)
+# =============================================================================
+# Same architecture and PPO config as student_pt_ppo.yaml. Differences from
+# baseline (set further down in the distillation: block):
+#   distillation.mode:           dagger    (was "hybrid")
+#   distillation.learning_rate:  1e-4      (was 0.0; ignored under hybrid)
+#   distillation.distill_value:  false     (was true)
+#
+# Used by the distillation ablation script as the "dagger" condition.
+# =============================================================================
+
+params:
+  seed: 42
+
+  # Environment wrapper clipping
+  env:
+    clip_observations: 100.0
+    clip_actions: 100.0
+    
+    # Observation groups for student policy
+    obs_groups:
+      obs: ["policy", "student_proprio", "student_current_poses", "student_future_poses", "student_current_pc", "student_future_pc", "student_camera"]
+      states: ["policy", "proprio", "current_poses", "future_poses", "current_pc", "future_pc"]  
+    concate_obs_groups: True
+
+  algo:
+    name: a2c_continuous
+
+  model:
+    name: continuous_a2c_logstd
+
+  # ==========================================================================
+  # NETWORK ARCHITECTURE
+  # ==========================================================================
+  network:
+    name: depth_point_transformer_student
+    separate: False
+
+    # IMPORTANT:
+    # We pack depth into obs, so RL-Games' global RunningMeanStd (config.normalize_input)
+    # would incorrectly normalize depth. We therefore disable RL-Games normalize_input
+    # and do non-depth normalization inside the model instead.
+    normalize_base_obs: True
+
+    # --- Point Transformer ---
+    hidden_dim: 128                   # Token embedding dimension
+    num_heads: 8                     # head_dim = 128/8 = 16
+    self_attention: False            # AME-style: no self-attention on point tokens
+    use_global_feature: True         # AME-2: max-pool point tokens → concat into query
+    flash_attention: False           # Force MATH SDPA: at S_kv=32 EFFICIENT_ATTENTION reserves ~13 GB workspace; MATH uses ~500 MB
+    torch_compile: False             # Keep disabled in distillation by default
+    ffn_ratio: 2.0                   # FFN expansion ratio (unused when self_attention: False)
+    ffn_dropout: 0.0
+    attn_dropout: 0.0
+
+    # Point encoder: per-point MLP (num_timesteps*3 → hidden_dim)
+    point_encoder_layers: [128, 128]
+    point_encoder_norm: True         # LayerNorm after encoder
+
+    # Proprio encoder: MLP (proprio_dim → hidden_dim)
+    proprio_encoder_layers: [128, 128]
+    proprio_encoder_norm: True
+
+    # --- Depth Encoder ---
+    # ResNet: stem (1→c0, s=2) + N ResBlocks (each s=2) → GAP.
+    # Height/width are taken from active Y2R config (robot + mode layers).
+    depth_encoder:
+      channels: [32, 64, 128]
+    
+    # Depth augmentation (GPU-accelerated via NVIDIA Warp)
+    # Applied INSIDE the model when explicit apply_depth_aug=True (set by train/distill/play code).
+    depth_augmentation: True
+    depth_aug_config:
+      correlated_noise:
+        sigma_s: 0.075            # Spatial noise (quartered)
+        sigma_d: 0.025            # Depth noise (quartered)
+      pixel_dropout_and_randu:
+        p_dropout: 0.00075        # Dropout probability (quartered)
+        p_randu: 0.00075          # Random uniform probability (quartered)
+      sticks:
+        p_stick: 0.0000625        # Stick artifact probability (quartered)
+        max_stick_len: 12.0       # Max stick length (pixels)
+        max_stick_width: 2.0      # Max stick width (pixels)
+    
+    space:
+      continuous:
+        mu_activation: None
+        sigma_activation: None
+        mu_init:
+          name: default
+        sigma_init:
+          name: const_initializer
+          val: 0
+        fixed_sigma: 'fixed'
+    
+    mlp:
+      units: [1024, 512, 256, 128]
+      activation: elu
+      d2rl: False
+      initializer:
+        name: default
+      regularizer:
+        name: None
+
+  load_checkpoint: False
+  load_path: ''
+
+  # ==========================================================================
+  # RL-GAMES CONFIG (matches teacher config structure)
+  # ==========================================================================
+  config:
+    name: student_depth_pt_distillation_dagger
+    env_name: rlgpu
+    device: 'cuda:0'
+    device_name: 'cuda:0'
+    multi_gpu: False
+    ppo: True
+    mixed_precision: True
+    normalize_input: False
+    normalize_value: True
+    value_bootstrap: False
+    num_actors: -1
+    reward_shaper:
+      scale_value: 0.01
+    normalize_advantage: True
+    gamma: 0.998
+    tau: 0.95
+    learning_rate: 3e-4
+    lr_schedule: adaptive
+    schedule_type: legacy
+    kl_threshold: 0.016
+    score_to_win: 100000000
+    max_epochs: 750000
+    save_best_after: 100
+    save_frequency: 50
+    print_stats: True
+    grad_norm: 1.0
+    entropy_coef: 0.002
+    truncate_grads: True
+    e_clip: 0.2
+    horizon_length: 16
+    minibatch_size: 8192
+    mini_epochs: 4
+    critic_coef: 4
+    freeze_critic: False
+    clip_value: True
+    clip_actions: False
+    seq_len: 4
+    bounds_loss_coef: 0.0001
+
+    # SAPG (disabled by default - set expl_type to 'mixed_expl_learn_param' to enable)
+    use_others_experience: 'none'
+    off_policy_ratio: 1.0
+    expl_type: 'none'
+    expl_reward_coef_embd_size: 32
+    expl_reward_coef_scale: 0.005
+    expl_reward_type: entropy
+    expl_coef_block_size: 4096
+    good_reset_boundary: 0
+
+  # ==========================================================================
+  # DISTILLATION SETTINGS (used by DistillAgent)
+  # Note: seq_length from config: section is used for RNN truncated BPTT
+  # Note: Depth augmentation is handled INSIDE the model (see network.depth_augmentation)
+  # ==========================================================================
+  distillation:
+    mode: dagger # 'dagger' or 'hybrid'
+
+    # DAgger training (mode: dagger only)
+    loss_type: mse # 'weighted_l2' (sigma-weighted L2 + sigma loss) or 'mse' (plain MSE on means)
+    learning_rate: 1e-4          # Adam lr for DAgger optimizer
+    grad_norm: 1.0                # Gradient clipping for DAgger
+    max_iterations: 100000000     # Total training iterations
+    save_frequency: 5000          # Checkpoint save interval (iterations, not frames)
+    save_best_after: 10000        # Don't save "best" until this many epochs/iters (avoid early noise)
+    beta: 0.5                     # Fraction of envs using teacher (0.5 = 50%)
+    distill_value: False          # No value distillation in dagger ablation
+    distill_value_coef: 1.0       # Coefficient for value distillation loss (unused when distill_value=False)
+
+    # Hybrid (PHP) schedule — BC loss is auto-balanced to PPO scale via EMA,
+    # so lambda_d directly controls relative BC influence (1.0 = equal, 2.0 = 2x BC).
+    lambda_d_initial: 1.0
+    lambda_d_min: 0.1
+    lambda_d_anneal_epochs: 1000
+    adaptive_lr_gate_lambda_ppo: 0.1
+    # BC coefficient mode: "auto" (EMA-balanced to PPO scale) or "manual" (fixed multiplier)
+    bc_coef_mode: manual
+    bc_manual_coef: 10.0               # Used only when bc_coef_mode: manual

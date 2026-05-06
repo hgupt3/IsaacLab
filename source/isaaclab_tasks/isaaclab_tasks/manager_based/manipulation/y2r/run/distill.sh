@@ -26,6 +26,10 @@ TEACHER_LOG_DIR="trajectory"
 TEACHER_AGENT_ENTRY="rl_games_teacher_cfg_entry_point"
 STUDENT_AGENT="rl_games_student_cfg_entry_point"
 STUDENT_CONFIG_NAME="student_depth_distillation"
+# Which Y2R_MODE this student requires. "distill" for the depth-using students;
+# "distill_no_depth" only for the pt_no_depth variant. Validated after parsing
+# so caller can't pair an incompatible Y2R_MODE with the chosen student.
+STUDENT_REQUIRED_MODE="distill"
 DO_TEACHER_CONTINUE=false
 DO_STUDENT_CONTINUE=false
 FORWARD_ARGS=()
@@ -67,6 +71,26 @@ while [[ $# -gt 0 ]]; do
                     echo "Student: Point Transformer"
                     echo "========================================"
                     ;;
+                pt_dagger)
+                    STUDENT_AGENT="rl_games_student_pt_dagger_cfg_entry_point"
+                    STUDENT_CONFIG_NAME="student_depth_pt_distillation_dagger"
+                    echo "========================================"
+                    echo "Student: Point Transformer (DAgger variant)"
+                    echo "========================================"
+                    ;;
+                pt_no_depth)
+                    STUDENT_AGENT="rl_games_student_pt_no_depth_cfg_entry_point"
+                    STUDENT_CONFIG_NAME="student_pt_no_depth_distillation"
+                    STUDENT_REQUIRED_MODE="distill_no_depth"
+                    # Auto-set Y2R_MODE if unset; explicit caller value is
+                    # checked against STUDENT_REQUIRED_MODE below.
+                    : "${Y2R_MODE:=distill_no_depth}"
+                    export Y2R_MODE
+                    echo "========================================"
+                    echo "Student: Point Transformer (no depth camera)"
+                    echo "Y2R_MODE: $Y2R_MODE"
+                    echo "========================================"
+                    ;;
                 mlp)
                     STUDENT_AGENT="rl_games_student_cfg_entry_point"
                     STUDENT_CONFIG_NAME="student_depth_distillation"
@@ -76,7 +100,7 @@ while [[ $# -gt 0 ]]; do
                     ;;
                 *)
                     echo "Error: Unknown student type '$2'"
-                    echo "Available: mlp (default), pt"
+                    echo "Available: mlp (default), pt, pt_dagger, pt_no_depth"
                     exit 1
                     ;;
             esac
@@ -145,12 +169,27 @@ if [ -z "$TEACHER_CHECKPOINT" ]; then
     exit 1
 fi
 
+# Validate Y2R_MODE matches the selected student. Catches both stale invalid
+# values (e.g. Y2R_MODE=train_no_eigen leaked from a prior shell session) and
+# valid-but-incompatible pairings (pt_no_depth + distill drops student_camera
+# from obs_groups while env keeps depth → silent obs split mismatch; pt +
+# distill_no_depth keeps student_camera in obs_groups while env drops depth →
+# also broken).
+EFFECTIVE_Y2R_MODE="${Y2R_MODE:-distill}"
+if [ "$EFFECTIVE_Y2R_MODE" != "$STUDENT_REQUIRED_MODE" ]; then
+    echo "Error: Y2R_MODE='$EFFECTIVE_Y2R_MODE' is incompatible with the selected student."
+    echo "       Selected student agent requires Y2R_MODE='$STUDENT_REQUIRED_MODE'."
+    echo "       (Tip: --student pt_no_depth needs Y2R_MODE=distill_no_depth; everything"
+    echo "        else needs Y2R_MODE=distill.)"
+    exit 1
+fi
+
 cd "$ISAACLAB_DIR"
 
 if [ "$NUM_GPUS" -gt 0 ]; then
     # Multi-GPU: use torchrun with --distributed flag
     PYTHON_EXE=$(./isaaclab.sh -p -c "import sys; print(sys.executable)" 2>/dev/null | grep '^/')
-    Y2R_MODE=distill Y2R_TASK=base Y2R_ROBOT=$ROBOT Y2R_GPU_OFFSET=$GPU_OFFSET \
+    Y2R_MODE=${Y2R_MODE:-distill} Y2R_TASK=${Y2R_TASK:-base} Y2R_ROBOT=$ROBOT Y2R_GPU_OFFSET=$GPU_OFFSET \
         $PYTHON_EXE -m torch.distributed.run --nproc_per_node=$NUM_GPUS --master_port=$MASTER_PORT \
         scripts/reinforcement_learning/rl_games/distill.py \
         --task "$TASK" \
@@ -167,7 +206,7 @@ if [ "$NUM_GPUS" -gt 0 ]; then
         "${FORWARD_ARGS[@]}"
 else
     # Single GPU
-    Y2R_MODE=distill Y2R_TASK=base Y2R_ROBOT=$ROBOT ./isaaclab.sh -p scripts/reinforcement_learning/rl_games/distill.py \
+    Y2R_MODE=${Y2R_MODE:-distill} Y2R_TASK=${Y2R_TASK:-base} Y2R_ROBOT=$ROBOT ./isaaclab.sh -p scripts/reinforcement_learning/rl_games/distill.py \
         --task "$TASK" \
         --teacher-checkpoint "$TEACHER_CHECKPOINT" \
         --teacher-agent "$TEACHER_AGENT_ENTRY" \
