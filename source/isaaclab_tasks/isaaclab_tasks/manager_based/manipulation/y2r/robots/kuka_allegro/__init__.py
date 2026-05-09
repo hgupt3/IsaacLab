@@ -41,8 +41,12 @@ gym.register(
         # PT student variants for distillation ablation:
         #   dagger:   pure 50/50 BC (no PPO), lr 1e-4, no value distillation
         #   no_depth: drops the wrist depth camera + encoder (use Y2R_MODE=distill_no_depth)
+        #   patch:    AME/ViT-style patch tokenizer for depth (joins PC tokens in K/V)
         "rl_games_student_pt_dagger_cfg_entry_point": f"{shared_agents.__name__}:student_pt_dagger_ppo.yaml",
         "rl_games_student_pt_no_depth_cfg_entry_point": f"{shared_agents.__name__}:student_pt_no_depth_ppo.yaml",
+        "rl_games_student_pt_patch_cfg_entry_point": f"{shared_agents.__name__}:student_pt_patch_ppo.yaml",
+        "rl_games_student_pt_patch_dagger_cfg_entry_point": f"{shared_agents.__name__}:student_pt_patch_dagger_ppo.yaml",
+        "rl_games_student_pt_patch_no_depth_cfg_entry_point": f"{shared_agents.__name__}:student_pt_patch_no_depth_ppo.yaml",
         # Teacher config for distillation (used by distill.py --teacher-agent)
         "rl_games_teacher_cfg_entry_point": f"{shared_agents.__name__}:teacher_ppo.yaml",
         # Other frameworks

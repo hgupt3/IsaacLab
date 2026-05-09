@@ -4,18 +4,13 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 # =============================================================================
-# Student Policy Configuration: Depth ResNet + Point Transformer
+# Student Policy Configuration: Patch-Tokenized Depth (DAgger BC variant)
 # =============================================================================
-# Hybrid student policy that combines:
-#   - SmallResNet depth encoder for wrist camera images
-#   - Point Transformer (self+cross attention) for visible point clouds
-#   - MLP trunk for action/value outputs
-#
-# Observation layout (packed flat):
-#   [proprio | student_current_pc | student_future_pc | depth]
-#
-# All point cloud and depth dimensions are read from Y2R config (base.yaml)
-# at builder load time via _inject_params(). No hardcoded dimensions.
+# Same architecture as student_pt_patch_ppo.yaml. Differences (in distillation:
+# block):
+#   distillation.mode:           dagger    (was "hybrid")
+#   distillation.learning_rate:  1e-4      (was 0.0; ignored under hybrid)
+#   distillation.distill_value:  false     (was true)
 # =============================================================================
 
 params:
@@ -42,7 +37,7 @@ params:
   # NETWORK ARCHITECTURE
   # ==========================================================================
   network:
-    name: depth_point_transformer_student
+    name: depth_patch_transformer_student
     separate: False
 
     # IMPORTANT:
@@ -54,9 +49,9 @@ params:
     # --- Point Transformer ---
     hidden_dim: 128                   # Token embedding dimension
     num_heads: 8                     # head_dim = 128/8 = 16
-    self_attention: True             # Self-attend over PC tokens before cross-attn
-    use_global_feature: False        # No global pool side-channel (depth stays in K/V via attention only)
-    flash_attention: False           # Force MATH SDPA: at small S_kv EFFICIENT_ATTENTION reserves ~10+ GB workspace; MATH uses ~500 MB
+    self_attention: True             # Self-attend over combined PC + depth tokens before cross-attn
+    use_global_feature: False        # No global pool side-channel — depth stays in K/V via attention only
+    flash_attention: False           # Force MATH SDPA: at small S_kv (16 PC + ~20 depth tokens) EFFICIENT_ATTENTION reserves ~10+ GB workspace; MATH uses ~500 MB
     torch_compile: False             # Keep disabled in distillation by default
     ffn_ratio: 2.0                   # FFN expansion ratio (used by self-attention block)
     ffn_dropout: 0.0
@@ -70,12 +65,20 @@ params:
     proprio_encoder_layers: [128, 128]
     proprio_encoder_norm: True
 
-    # --- Depth Encoder ---
-    # ResNet: stem (1→c0, s=2) + N ResBlocks (each s=2) → GAP.
-    # Height/width are taken from active Y2R config (robot + mode layers).
-    depth_encoder:
-      channels: [32, 64, 128]
-    
+    # --- Depth Tokenizer (ViT-style ConvStem patches) ---
+    # Stack of stride-2 conv layers (Conv3x3 + GroupNorm + GELU) on the depth
+    # image. NO global average pool — instead the resulting (H', W') grid is
+    # flattened into num_tokens = H' * W' tokens of dimension hidden_dim.
+    # A learnable 2D positional embedding is added to each token.
+    # The tokens then JOIN the point cloud tokens in the cross-attention K/V set,
+    # so depth participates in the attention mechanism rather than being a
+    # single GAP'd vector dumped into the trunk concat.
+    # Height/width are taken from the active Y2R config (robot + mode layers).
+    depth_tokenizer:
+      channels: [32, 64, 128, 128]   # 4 stride-2 stages; last channel = hidden_dim
+      pe_init_std: 0.02              # init std for the learnable 2D PE
+      modality_embedding: True       # learnable PC vs depth modality embedding
+
     # Depth augmentation (GPU-accelerated via NVIDIA Warp)
     # Applied INSIDE the model when explicit apply_depth_aug=True (set by train/distill/play code).
     depth_augmentation: True
@@ -118,7 +121,7 @@ params:
   # RL-GAMES CONFIG (matches teacher config structure)
   # ==========================================================================
   config:
-    name: student_depth_pt_distillation
+    name: student_depth_pt_patch_dagger_distillation
     env_name: rlgpu
     device: 'cuda:0'
     device_name: 'cuda:0'
@@ -173,18 +176,32 @@ params:
   # Note: Depth augmentation is handled INSIDE the model (see network.depth_augmentation)
   # ==========================================================================
   distillation:
-    mode: hybrid # 'dagger' or 'hybrid'
+    mode: dagger # 'dagger' or 'hybrid'
 
     # DAgger training (mode: dagger only)
     loss_type: mse # 'weighted_l2' (sigma-weighted L2 + sigma loss) or 'mse' (plain MSE on means)
-    learning_rate: 0.0           # Adam lr for DAgger optimizer
+    learning_rate: 1e-4          # Adam lr for DAgger optimizer (initial — decayed by lr_schedule)
     grad_norm: 1.0                # Gradient clipping for DAgger
     max_iterations: 100000000     # Total training iterations
     save_frequency: 5000          # Checkpoint save interval (iterations, not frames)
     save_best_after: 10000        # Don't save "best" until this many epochs/iters (avoid early noise)
     beta: 0.5                     # Fraction of envs using teacher (0.5 = 50%)
-    distill_value: True           # Distill teacher's value function (warm critic for RL fine-tuning)
-    distill_value_coef: 1.0       # Coefficient for value distillation loss
+    distill_value: False          # No value distillation in dagger ablation
+    distill_value_coef: 1.0       # Coefficient for value distillation loss (unused when distill_value=False)
+
+    # ----- LR scheduler (mode: dagger only) -----
+    # 'fixed' keeps learning_rate constant. 'plateau' wraps the optimizer in
+    # ReduceLROnPlateau driven by an EMA of (mu_loss + sigma_loss): when the
+    # smoothed BC loss stops improving by `lr_plateau_threshold` for
+    # `lr_plateau_patience` iters, lr is multiplied by `lr_plateau_factor`,
+    # floored at `lr_min`. Suited for open-ended dagger runs (max_iterations=∞).
+    lr_schedule: plateau          # 'fixed' or 'plateau'
+    lr_min: 1e-6
+    lr_plateau_patience: 5000     # iters without improvement before cutting lr
+    lr_plateau_factor: 0.5        # lr ← lr * factor on each cut
+    lr_plateau_threshold: 1.0e-4  # min relative improvement to count as progress
+    lr_plateau_cooldown: 1000     # iters to wait after a cut before resuming patience
+    lr_loss_ema_momentum: 0.999   # EMA momentum on raw BC loss; ~1k-iter half-life
 
     # Hybrid (PHP) schedule — BC loss is auto-balanced to PPO scale via EMA,
     # so lambda_d directly controls relative BC influence (1.0 = equal, 2.0 = 2x BC).

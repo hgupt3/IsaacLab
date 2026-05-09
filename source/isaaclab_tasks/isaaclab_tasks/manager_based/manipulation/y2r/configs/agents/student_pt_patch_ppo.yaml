@@ -4,14 +4,18 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 # =============================================================================
-# Student Policy Configuration: Depth ResNet + Point Transformer
+# Student Policy Configuration: Patch-Tokenized Depth + Point Transformer
 # =============================================================================
-# Hybrid student policy that combines:
-#   - SmallResNet depth encoder for wrist camera images
-#   - Point Transformer (self+cross attention) for visible point clouds
+# Variant of student_pt_ppo.yaml that swaps the depth pathway for an
+# AME/ViT-style patch tokenizer:
+#   - ConvStem (4 stride-2 conv stages) on the wrist depth → patch tokens
+#     (UR5e 60×80 → 4×5=20 tokens; Kuka 64×64 → 4×4=16 tokens)
+#   - Learnable 2D positional embedding + optional modality embedding
+#   - Tokens JOIN the point cloud tokens in the cross-attention K/V set
+#   - Cross-attention from proprio query → combined PC+depth K/V
 #   - MLP trunk for action/value outputs
 #
-# Observation layout (packed flat):
+# Observation layout (packed flat) is unchanged:
 #   [proprio | student_current_pc | student_future_pc | depth]
 #
 # All point cloud and depth dimensions are read from Y2R config (base.yaml)
@@ -42,7 +46,7 @@ params:
   # NETWORK ARCHITECTURE
   # ==========================================================================
   network:
-    name: depth_point_transformer_student
+    name: depth_patch_transformer_student
     separate: False
 
     # IMPORTANT:
@@ -54,9 +58,9 @@ params:
     # --- Point Transformer ---
     hidden_dim: 128                   # Token embedding dimension
     num_heads: 8                     # head_dim = 128/8 = 16
-    self_attention: True             # Self-attend over PC tokens before cross-attn
-    use_global_feature: False        # No global pool side-channel (depth stays in K/V via attention only)
-    flash_attention: False           # Force MATH SDPA: at small S_kv EFFICIENT_ATTENTION reserves ~10+ GB workspace; MATH uses ~500 MB
+    self_attention: True             # Self-attend over combined PC + depth tokens before cross-attn
+    use_global_feature: False        # No global pool side-channel — depth stays in K/V via attention only
+    flash_attention: False           # Force MATH SDPA: at small S_kv (16 PC + ~20 depth tokens) EFFICIENT_ATTENTION reserves ~10+ GB workspace; MATH uses ~500 MB
     torch_compile: False             # Keep disabled in distillation by default
     ffn_ratio: 2.0                   # FFN expansion ratio (used by self-attention block)
     ffn_dropout: 0.0
@@ -70,12 +74,20 @@ params:
     proprio_encoder_layers: [128, 128]
     proprio_encoder_norm: True
 
-    # --- Depth Encoder ---
-    # ResNet: stem (1→c0, s=2) + N ResBlocks (each s=2) → GAP.
-    # Height/width are taken from active Y2R config (robot + mode layers).
-    depth_encoder:
-      channels: [32, 64, 128]
-    
+    # --- Depth Tokenizer (ViT-style ConvStem patches) ---
+    # Stack of stride-2 conv layers (Conv3x3 + GroupNorm + GELU) on the depth
+    # image. NO global average pool — instead the resulting (H', W') grid is
+    # flattened into num_tokens = H' * W' tokens of dimension hidden_dim.
+    # A learnable 2D positional embedding is added to each token.
+    # The tokens then JOIN the point cloud tokens in the cross-attention K/V set,
+    # so depth participates in the attention mechanism rather than being a
+    # single GAP'd vector dumped into the trunk concat.
+    # Height/width are taken from the active Y2R config (robot + mode layers).
+    depth_tokenizer:
+      channels: [32, 64, 128, 128]   # 4 stride-2 stages; last channel = hidden_dim
+      pe_init_std: 0.02              # init std for the learnable 2D PE
+      modality_embedding: True       # learnable PC vs depth modality embedding
+
     # Depth augmentation (GPU-accelerated via NVIDIA Warp)
     # Applied INSIDE the model when explicit apply_depth_aug=True (set by train/distill/play code).
     depth_augmentation: True
@@ -118,7 +130,7 @@ params:
   # RL-GAMES CONFIG (matches teacher config structure)
   # ==========================================================================
   config:
-    name: student_depth_pt_distillation
+    name: student_depth_pt_patch_distillation
     env_name: rlgpu
     device: 'cuda:0'
     device_name: 'cuda:0'

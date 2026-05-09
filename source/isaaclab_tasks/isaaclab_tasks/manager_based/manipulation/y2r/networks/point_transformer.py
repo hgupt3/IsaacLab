@@ -83,24 +83,38 @@ class CrossAttentionBlock(nn.Module):
         self.v_proj = nn.Linear(dim, dim, bias=False)
         self.out_proj = nn.Linear(dim, dim, bias=False)
     
-    def forward(self, query: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        """Cross-attention: query (B, Q, dim) attends to context (B, C, dim)"""
+    def forward(self, query: torch.Tensor, context: torch.Tensor, return_attn: bool = False):
+        """Cross-attention: query (B, Q, dim) attends to context (B, C, dim).
+
+        When return_attn=True, returns (output, attn_weights) where attn_weights
+        has shape (B, num_heads, Q, C). The fast SDPA path doesn't expose the
+        weights, so return_attn=True takes a manual softmax(QK^T/√d) path.
+        Use only for visualization — never on the training hot path.
+        """
         B, Q, _ = query.shape
         _, C, _ = context.shape
-        
+
         q = self.q_proj(self.norm_q(query))
         kv = self.norm_kv(context)
         k = self.k_proj(kv)
         v = self.v_proj(kv)
-        
+
         q = q.view(B, Q, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, C, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, C, self.num_heads, self.head_dim).transpose(1, 2)
-        
+
+        if return_attn:
+            scale = self.head_dim ** -0.5
+            scores = (q @ k.transpose(-2, -1)) * scale          # (B, heads, Q, C)
+            attn_weights = scores.softmax(dim=-1)
+            attn_out = attn_weights @ v                         # (B, heads, Q, head_dim)
+            attn_out = attn_out.transpose(1, 2).contiguous().view(B, Q, self.dim)
+            return query + self.out_proj(attn_out), attn_weights
+
         dropout_p = self.dropout if self.training else 0.0
         attn_out = torch.nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, Q, self.dim)
-        
+
         return query + self.out_proj(attn_out)
 
 

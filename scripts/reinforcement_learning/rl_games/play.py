@@ -38,6 +38,14 @@ parser.add_argument(
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
 parser.add_argument("--record", type=str, default=None, help="Record obs/actions/joint_pos to npz file for 1 episode.")
+parser.add_argument(
+    "--attn_video",
+    type=str,
+    default=None,
+    help="Path (.mp4) to write per-step depth + cross-attention overlay video. "
+         "Only meaningful for the patch-tokenized depth student; ignored if the "
+         "network exposes no capture_attn hook.",
+)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -239,6 +247,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if rms is not None:
             rms.eval()
 
+    # Attention-video setup: enable capture path if requested AND supported.
+    _attn_hooks = ("capture_attn", "get_depth_attention_grid", "get_attention_mass_split")
+    attn_video = False
+    attn_frames = []
+    attn_pc_depth_mass = []
+    if args_cli.attn_video is not None:
+        if a2c_network is None or not all(hasattr(a2c_network, h) for h in _attn_hooks):
+            print("[WARN] --attn_video set but the active network has no capture_attn hooks; skipping.")
+        elif not getattr(a2c_network, "use_depth_camera", True):
+            print("[WARN] --attn_video set but use_depth_camera=False on this network; skipping.")
+        else:
+            attn_video = True
+            a2c_network.capture_attn = True
+            print(f"[INFO] Attention video capture enabled → {args_cli.attn_video}")
+
     dt = env.unwrapped.step_dt
 
     # ── Recording setup ──────────────────────────────────────────────────
@@ -349,6 +372,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     env.unwrapped.scene["robot"].data.joint_pos[0].cpu().numpy().copy()
                 )
 
+            # Capture per-step depth + attention overlay BEFORE env.step (the
+            # forward inside get_action just ran on the current obs).
+            if attn_video:
+                depth_img = getattr(a2c_network, "last_depth_img", None)
+                attn_grid = a2c_network.get_depth_attention_grid(reduce="mean")
+                pc_mass, depth_mass = a2c_network.get_attention_mass_split()
+                if depth_img is not None and attn_grid is not None:
+                    attn_frames.append((
+                        depth_img[0, 0].cpu().numpy().copy(),
+                        attn_grid[0].cpu().numpy().copy(),
+                    ))
+                    if pc_mass is not None and depth_mass is not None:
+                        attn_pc_depth_mass.append((
+                            float(pc_mass[0].cpu()), float(depth_mass[0].cpu())
+                        ))
+
             # env stepping
             obs, _, dones, _ = env.step(actions)
 
@@ -389,8 +428,91 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # close the simulator (also flushes RecordVideo's ffmpeg writer)
     env.close()
 
+    if attn_video and len(attn_frames) > 0:
+        _write_attn_video(args_cli.attn_video, attn_frames, attn_pc_depth_mass, fps=int(round(1.0 / dt)))
+
     if args_cli.video:
         _publish_recording(log_dir)
+
+
+def _write_attn_video(out_path, frames, pc_depth_mass, fps):
+    """Write a side-by-side depth + cross-attention overlay video.
+
+    Each frame contains three panels left→right: raw depth (grayscale),
+    attention heatmap (jet, upsampled bilinearly to depth resolution), and an
+    alpha-blended overlay. Optional bottom strip prints PC vs depth attention
+    mass (sums to 1.0 across S_kv) so the user can see at a glance whether
+    depth tokens are being attended to at all.
+    """
+    import cv2
+
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+
+    # Determine output resolution from the first frame's depth image.
+    depth0, attn0 = frames[0]
+    H, W = depth0.shape
+    # Each panel rendered at 3× upscale for visibility.
+    scale = max(1, int(round(360 / max(H, W))))
+    panel_h, panel_w = H * scale, W * scale
+    text_h = 28
+    out_h = panel_h + text_h
+    out_w = panel_w * 3
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(out_path), fourcc, fps, (out_w, out_h))
+    if not writer.isOpened():
+        print(f"[WARN] cv2.VideoWriter failed to open {out_path}; skipping attn video")
+        return
+
+    # Stable depth normalization across the run: clip to a sensible range.
+    depth_stack = np.stack([f[0] for f in frames], axis=0)
+    depth_lo = float(np.percentile(depth_stack, 2.0))
+    depth_hi = float(np.percentile(depth_stack, 98.0))
+    depth_rng = max(depth_hi - depth_lo, 1e-6)
+
+    for i, (depth, attn_grid) in enumerate(frames):
+        # Depth → grayscale
+        d_norm = np.clip((depth - depth_lo) / depth_rng, 0.0, 1.0)
+        d_u8 = (d_norm * 255).astype(np.uint8)
+        d_panel = cv2.cvtColor(d_u8, cv2.COLOR_GRAY2BGR)
+        d_panel = cv2.resize(d_panel, (panel_w, panel_h), interpolation=cv2.INTER_NEAREST)
+
+        # Attention → upsampled heatmap
+        a = attn_grid.astype(np.float32)
+        a_max = max(float(a.max()), 1e-6)
+        a_norm = a / a_max
+        a_u8 = (a_norm * 255).astype(np.uint8)
+        a_full = cv2.resize(a_u8, (W, H), interpolation=cv2.INTER_LINEAR)
+        a_full = cv2.resize(a_full, (panel_w, panel_h), interpolation=cv2.INTER_LINEAR)
+        a_panel = cv2.applyColorMap(a_full, cv2.COLORMAP_JET)
+
+        # Overlay
+        overlay = cv2.addWeighted(d_panel, 0.5, a_panel, 0.5, 0.0)
+
+        row = np.concatenate([d_panel, a_panel, overlay], axis=1)
+
+        # Text strip
+        strip = np.zeros((text_h, out_w, 3), dtype=np.uint8)
+        if i < len(pc_depth_mass):
+            pc, dep = pc_depth_mass[i]
+            label = f"step {i:4d}  PC mass {pc*100:5.1f}%   depth mass {dep*100:5.1f}%   max-attn cell {a_max:.3f}"
+        else:
+            label = f"step {i:4d}   max-attn cell {a_max:.3f}"
+        cv2.putText(strip, label, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+
+        frame = np.concatenate([row, strip], axis=0)
+        writer.write(frame)
+
+    writer.release()
+    if pc_depth_mass:
+        pcs = np.array([m[0] for m in pc_depth_mass])
+        deps = np.array([m[1] for m in pc_depth_mass])
+        print(
+            f"[ATTN] wrote {len(frames)} frames → {out_path}\n"
+            f"[ATTN] cross-attn mass over run — PC: mean {pcs.mean()*100:.1f}% / depth: mean {deps.mean()*100:.1f}%"
+        )
+    else:
+        print(f"[ATTN] wrote {len(frames)} frames → {out_path}")
 
 
 def _publish_recording(log_dir):

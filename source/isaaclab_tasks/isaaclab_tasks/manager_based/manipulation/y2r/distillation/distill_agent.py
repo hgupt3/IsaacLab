@@ -163,6 +163,37 @@ class DistillAgent(A2CAgent):
                 param_group["lr"] = self.distill_lr
             self.last_lr = self.distill_lr
             self.scaler = torch.amp.GradScaler("cuda", enabled=self.mixed_precision)
+
+            # ===== LR scheduler (dagger only) =====
+            # Open-ended dagger BC benefits from cutting LR when the teacher-imitation
+            # loss plateaus. The scheduler tracks an EMA of mu_loss + sigma_loss
+            # (value_loss is excluded — it has a different scale/dynamics) and steps
+            # at every train iteration.
+            self.lr_schedule = self.distill_config["lr_schedule"]
+            if self.lr_schedule == "fixed":
+                self.lr_scheduler = None
+            elif self.lr_schedule == "plateau":
+                self.lr_min = float(self.distill_config["lr_min"])
+                self.lr_plateau_patience = int(self.distill_config["lr_plateau_patience"])
+                self.lr_plateau_factor = float(self.distill_config["lr_plateau_factor"])
+                self.lr_plateau_threshold = float(self.distill_config["lr_plateau_threshold"])
+                self.lr_plateau_cooldown = int(self.distill_config["lr_plateau_cooldown"])
+                self.lr_loss_ema_momentum = float(self.distill_config["lr_loss_ema_momentum"])
+                self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    self.optimizer,
+                    mode="min",
+                    factor=self.lr_plateau_factor,
+                    patience=self.lr_plateau_patience,
+                    threshold=self.lr_plateau_threshold,
+                    cooldown=self.lr_plateau_cooldown,
+                    min_lr=self.lr_min,
+                )
+                self._bc_loss_ema = None
+            else:
+                raise ValueError(
+                    f"Unsupported distillation.lr_schedule='{self.lr_schedule}', "
+                    "expected 'fixed' or 'plateau'."
+                )
         
         # Build and load teacher model
         self.teacher_model = self._build_and_load_teacher(teacher_cfg, teacher_ckpt_path)
@@ -558,7 +589,21 @@ class DistillAgent(A2CAgent):
                         param.grad = None
                 self.scaler.scale(total_loss).backward()
                 self.trancate_gradients_and_step()
-            
+
+            # ===== LR scheduler (dagger only) =====
+            # Track an EMA of the BC mu+sigma loss and step the plateau scheduler.
+            # value_loss is excluded — it has a different scale and is governed by
+            # distill_value_coef separately. Done every iter (cheap, ~µs).
+            if self.lr_scheduler is not None:
+                bc_loss_val = float((mu_loss + sigma_loss).detach().item())
+                if self._bc_loss_ema is None:
+                    self._bc_loss_ema = bc_loss_val
+                else:
+                    m = self.lr_loss_ema_momentum
+                    self._bc_loss_ema = m * self._bc_loss_ema + (1.0 - m) * bc_loss_val
+                self.lr_scheduler.step(self._bc_loss_ema)
+                self.last_lr = self.optimizer.param_groups[0]["lr"]
+
             # ===== Choose actions based on fixed env assignment =====
             # teacher_env_mask: True = use teacher, False = use student
             stepping_actions = torch.where(
@@ -826,6 +871,8 @@ class DistillAgent(A2CAgent):
                 self.writer.add_scalar('info/last_lr', self.last_lr, frame)
                 self.writer.add_scalar('info/beta', self.beta, frame)
                 self.writer.add_scalar('info/epochs', log_counter, frame)
+                if self.lr_scheduler is not None and self._bc_loss_ema is not None:
+                    self.writer.add_scalar('info/bc_loss_ema', self._bc_loss_ema, frame)
                 
                 # Call algo_observer (logs Episode/* metrics)
                 self.algo_observer.after_print_stats(frame, log_counter, total_time)

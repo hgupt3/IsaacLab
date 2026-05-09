@@ -55,11 +55,11 @@ params:
     # --- Point Transformer ---
     hidden_dim: 128                   # Token embedding dimension
     num_heads: 8                     # head_dim = 128/8 = 16
-    self_attention: False            # AME-style: no self-attention on point tokens
-    use_global_feature: True         # AME-2: max-pool point tokens → concat into query
-    flash_attention: False           # Force MATH SDPA: at S_kv=32 EFFICIENT_ATTENTION reserves ~13 GB workspace; MATH uses ~500 MB
+    self_attention: True             # Self-attend over PC tokens before cross-attn
+    use_global_feature: False        # No global pool side-channel (depth stays in K/V via attention only)
+    flash_attention: False           # Force MATH SDPA: at small S_kv EFFICIENT_ATTENTION reserves ~10+ GB workspace; MATH uses ~500 MB
     torch_compile: False             # Keep disabled in distillation by default
-    ffn_ratio: 2.0                   # FFN expansion ratio (unused when self_attention: False)
+    ffn_ratio: 2.0                   # FFN expansion ratio (used by self-attention block)
     ffn_dropout: 0.0
     attn_dropout: 0.0
 
@@ -82,13 +82,13 @@ params:
     depth_augmentation: True
     depth_aug_config:
       correlated_noise:
-        sigma_s: 0.075            # Spatial noise (quartered)
-        sigma_d: 0.025            # Depth noise (quartered)
+        sigma_s: 0.0375           # Spatial noise (1/8 of pre-quarter original)
+        sigma_d: 0.0125           # Depth noise (1/8 of pre-quarter original)
       pixel_dropout_and_randu:
-        p_dropout: 0.00075        # Dropout probability (quartered)
-        p_randu: 0.00075          # Random uniform probability (quartered)
+        p_dropout: 0.000375       # Dropout probability (1/8 of pre-quarter original)
+        p_randu: 0.000375         # Random uniform probability (1/8 of pre-quarter original)
       sticks:
-        p_stick: 0.0000625        # Stick artifact probability (quartered)
+        p_stick: 0.00003125       # Stick artifact probability (1/8 of pre-quarter original)
         max_stick_len: 12.0       # Max stick length (pixels)
         max_stick_width: 2.0      # Max stick width (pixels)
     

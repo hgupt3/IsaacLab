@@ -41,8 +41,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 source "$SCRIPT_DIR/sweep_lib.sh"
 
-# Defaults
-MAX_ITERATIONS=10000           # Distillation iterations per run (~13 hr/run on RTX 5090)
+# Defaults — per-condition iter budgets (hybrid does 16× more env work per
+# iter than dagger because hybrid uses horizon_length=16 rollouts and dagger
+# uses 1-step rollouts; matched-frames default uses 16:1 ratio).
+HYBRID_ITERS=3000              # baseline + no_depth (PPO + BC, 16-step rollouts)
+DAGGER_ITERS=48000             # dagger (1-step rollouts; 48k × 1 ≈ 3k × 16)
 WANDB_PROJECT="distillation_ablations"
 CONDITIONS=("baseline" "dagger" "no_depth")
 SEEDS=(1 2 3)
@@ -50,12 +53,16 @@ FORCE=0
 TEACHER_CHECKPOINT=""
 
 # Parse args
+# --max_iterations N rescales BOTH (hybrid=N, dagger=16N) so the matched-frames
+# invariant is preserved. Use --hybrid-iters / --dagger-iters to override one.
 while [[ $# -gt 0 ]]; do
     case $1 in
         --t_checkpoint)   TEACHER_CHECKPOINT="$2"; shift 2 ;;
         --condition)      CONDITIONS=("$2"); shift 2 ;;
         --seeds)          IFS=',' read -ra SEEDS <<< "$2"; shift 2 ;;
-        --max_iterations) MAX_ITERATIONS="$2"; shift 2 ;;
+        --max_iterations) HYBRID_ITERS="$2"; DAGGER_ITERS=$(( $2 * 16 )); shift 2 ;;
+        --hybrid-iters)   HYBRID_ITERS="$2"; shift 2 ;;
+        --dagger-iters)   DAGGER_ITERS="$2"; shift 2 ;;
         --project)        WANDB_PROJECT="$2"; shift 2 ;;
         --force)          FORCE=1; shift ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
@@ -76,11 +83,13 @@ sweep_init "ablations_student"
 
 run_one() {
     local condition="$1" seed="$2"
-    local student y2r_mode
+    local student y2r_mode iters
+    # Patch-tokenized depth is now the default architecture; legacy `pt`
+    # variants kept in distill.sh for back-reference but not used here.
     case "$condition" in
-        baseline) student="pt";          y2r_mode="distill" ;;
-        dagger)   student="pt_dagger";   y2r_mode="distill" ;;
-        no_depth) student="pt_no_depth"; y2r_mode="distill_no_depth" ;;
+        baseline) student="pt_patch";          y2r_mode="distill";          iters=$HYBRID_ITERS ;;
+        dagger)   student="pt_patch_dagger";   y2r_mode="distill";          iters=$DAGGER_ITERS ;;
+        no_depth) student="pt_patch_no_depth"; y2r_mode="distill_no_depth"; iters=$HYBRID_ITERS ;;
         *) echo "Unknown condition: $condition"; return 1 ;;
     esac
 
@@ -96,18 +105,23 @@ run_one() {
     echo "=================================================================="
     echo "  ABLATION: $run_name  (mode=$y2r_mode, student=$student, seed=$seed)"
     echo "  teacher: $TEACHER_CHECKPOINT"
-    echo "  max_iterations=$MAX_ITERATIONS  project=$WANDB_PROJECT"
+    echo "  max_iterations=$iters  project=$WANDB_PROJECT"
     echo "  log: $log_file"
     echo "=================================================================="
     echo ""
     sweep_set_status "$run_name" "running" ""
 
     # Run, tee output, capture exit code from the actual command (not tee).
+    # --t_agent pt is REQUIRED so distill.sh resolves the Point Transformer
+    # teacher entry point (rl_games_point_transformer_cfg_entry_point) instead
+    # of the default MLP teacher_ppo.yaml — otherwise teacher state_dict load
+    # fails with "Missing/Unexpected key(s)" since checkpoint is PT.
     Y2R_MODE="$y2r_mode" "$SCRIPT_DIR/distill.sh" \
+        --t_agent pt \
         --student "$student" \
         --t_checkpoint "$TEACHER_CHECKPOINT" \
         --seed "$seed" \
-        --max_iterations "$MAX_ITERATIONS" \
+        --max_iterations "$iters" \
         --wandb-project-name "$WANDB_PROJECT" \
         --wandb-group "$condition" \
         --wandb-name "$run_name" \
@@ -125,7 +139,7 @@ run_one() {
     return 0
 }
 
-sweep_print_header "Y2R Student Distillation Ablation Sweep"
+sweep_print_header "Y2R Student Distillation Ablation Sweep" "hybrid=$HYBRID_ITERS, dagger=$DAGGER_ITERS"
 echo "  Teacher:    $TEACHER_CHECKPOINT"
 echo "=================================================================="
 

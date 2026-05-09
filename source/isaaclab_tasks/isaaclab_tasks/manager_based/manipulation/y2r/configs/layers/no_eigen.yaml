@@ -1,0 +1,10 @@
+# ==============================================================================
+# Ablation Layer: Disable Eigen Grasp
+# ==============================================================================
+# Switches hand control from PCA eigen-grasp synergies (5 dims) to direct
+# relative joint position control on all 16 hand joints. Action space goes from
+# (arm + 5 eigen + 16 raw) -> (arm + 16 joints).
+# ==============================================================================
+
+mode:
+  use_eigen_grasp: false

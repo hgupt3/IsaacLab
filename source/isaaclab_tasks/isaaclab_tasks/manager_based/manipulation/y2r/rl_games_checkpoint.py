@@ -110,6 +110,15 @@ def restore_curriculum_state(env, weights, *, force: bool = False) -> dict:
             if adr_difficulties is not None and adr_difficulties.shape[0] == env.num_envs:
                 scheduler.set_state(adr_difficulties)
                 num_envs_match = True
+            elif adr_difficulties is not None:
+                # Shape mismatch (e.g. play with --num_envs 1 vs trained at 2048).
+                # The saved tensor IS the ground truth — broadcast its rounded mean
+                # to all current envs so play matches the curriculum the trainer
+                # left off at, instead of dropping to the step-based floor.
+                pinned = round(float(adr_difficulties.float().mean().item()))
+                scheduler.current_adr_difficulties[:] = pinned
+                scheduler._restored = True  # Skip first demotion
+                num_envs_match = False
             else:
                 scheduler.current_adr_difficulties[:] = floor
                 scheduler._restored = True  # Skip first demotion

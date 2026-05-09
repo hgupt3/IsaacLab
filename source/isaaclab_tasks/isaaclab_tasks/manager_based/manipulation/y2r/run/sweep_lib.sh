@@ -51,13 +51,17 @@ sweep_is_done() {
 }
 
 sweep_print_header() {
-    # sweep_print_header <title>  — relies on caller having CONDITIONS, SEEDS, MAX_ITERATIONS in scope
+    # sweep_print_header <title> [iter_label]
+    # Caller must have CONDITIONS and SEEDS in scope. iter_label defaults to
+    # $MAX_ITERATIONS when unset (teacher sweep). Student sweep passes a
+    # per-condition label (e.g. "hybrid=3000, dagger=48000").
     local title="$1"
+    local iter_label="${2:-$MAX_ITERATIONS}"
     echo "=================================================================="
     echo "  $title"
     echo "  Conditions: ${CONDITIONS[*]}"
     echo "  Seeds:      ${SEEDS[*]}"
-    echo "  Iterations: $MAX_ITERATIONS"
+    echo "  Iterations: $iter_label"
     echo "  Status:     $STATUS_FILE"
     echo "=================================================================="
 }

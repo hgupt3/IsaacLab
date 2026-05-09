@@ -14,6 +14,7 @@ from .point_transformer import PointTransformerBuilder
 from .pointnet_tnet import PointNetTNetBuilder
 from .depth_resnet_student import DepthResNetStudentBuilder
 from .depth_point_transformer_student import DepthPointTransformerStudentBuilder
+from .depth_patch_transformer_student import DepthPatchTransformerStudentBuilder
 
 # Register Point-Transformer network with rl_games
 # This allows YAML config to use: network.name: point_transformer
@@ -28,5 +29,15 @@ register_network('depth_resnet_student', DepthResNetStudentBuilder)
 # This allows YAML config to use: network.name: depth_point_transformer_student
 register_network('depth_point_transformer_student', DepthPointTransformerStudentBuilder)
 
-__all__ = ["PointTransformerBuilder", "PointNetTNetBuilder", "DepthResNetStudentBuilder", "DepthPointTransformerStudentBuilder"]
+# Register Patch-tokenized Depth + Point Transformer Student variant
+# YAML: network.name: depth_patch_transformer_student
+register_network('depth_patch_transformer_student', DepthPatchTransformerStudentBuilder)
+
+__all__ = [
+    "PointTransformerBuilder",
+    "PointNetTNetBuilder",
+    "DepthResNetStudentBuilder",
+    "DepthPointTransformerStudentBuilder",
+    "DepthPatchTransformerStudentBuilder",
+]
 

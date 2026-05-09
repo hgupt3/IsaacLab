@@ -91,6 +91,31 @@ while [[ $# -gt 0 ]]; do
                     echo "Y2R_MODE: $Y2R_MODE"
                     echo "========================================"
                     ;;
+                pt_patch)
+                    STUDENT_AGENT="rl_games_student_pt_patch_cfg_entry_point"
+                    STUDENT_CONFIG_NAME="student_depth_pt_patch_distillation"
+                    echo "========================================"
+                    echo "Student: Point Transformer (ViT-style patch depth)"
+                    echo "========================================"
+                    ;;
+                pt_patch_dagger)
+                    STUDENT_AGENT="rl_games_student_pt_patch_dagger_cfg_entry_point"
+                    STUDENT_CONFIG_NAME="student_depth_pt_patch_dagger_distillation"
+                    echo "========================================"
+                    echo "Student: Point Transformer (ViT-style patch depth, DAgger BC)"
+                    echo "========================================"
+                    ;;
+                pt_patch_no_depth)
+                    STUDENT_AGENT="rl_games_student_pt_patch_no_depth_cfg_entry_point"
+                    STUDENT_CONFIG_NAME="student_pt_patch_no_depth_distillation"
+                    STUDENT_REQUIRED_MODE="distill_no_depth"
+                    : "${Y2R_MODE:=distill_no_depth}"
+                    export Y2R_MODE
+                    echo "========================================"
+                    echo "Student: Point Transformer (ViT patch, no depth camera)"
+                    echo "Y2R_MODE: $Y2R_MODE"
+                    echo "========================================"
+                    ;;
                 mlp)
                     STUDENT_AGENT="rl_games_student_cfg_entry_point"
                     STUDENT_CONFIG_NAME="student_depth_distillation"
@@ -100,7 +125,7 @@ while [[ $# -gt 0 ]]; do
                     ;;
                 *)
                     echo "Error: Unknown student type '$2'"
-                    echo "Available: mlp (default), pt, pt_dagger, pt_no_depth"
+                    echo "Available: mlp (default), pt, pt_dagger, pt_no_depth, pt_patch, pt_patch_dagger, pt_patch_no_depth"
                     exit 1
                     ;;
             esac
