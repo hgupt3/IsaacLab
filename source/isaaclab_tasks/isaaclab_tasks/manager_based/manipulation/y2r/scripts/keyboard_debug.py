@@ -454,6 +454,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Timing for periodic prints
     last_print_time = time.time()
     print_interval = 2.0  # Print every 2 seconds (more time for debug output)
+
+    camera_viewer_groups = []
+    if unwrapped_env.cfg.y2r_cfg.visualization.camera_viewer.enabled:
+        for group_name in ("student_camera", "student_current_pc"):
+            if group_name in obs_mgr.group_obs_term_dim:
+                camera_viewer_groups.append(group_name)
+
+    def _refresh_camera_viewer():
+        """Refresh camera-backed observation side effects for keyboard mode."""
+        if not camera_viewer_groups:
+            return
+        unwrapped_env.common_step_counter = step_count
+        for group_name in camera_viewer_groups:
+            obs_mgr.compute_group(group_name, update_history=False)
     
     print("\n" + "=" * 60)
     print("KEYBOARD DEBUG MODE ACTIVE")
@@ -590,6 +604,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if hasattr(unwrapped_env, 'render_debug'):
             unwrapped_env.render_debug()
         step_count += 1
+        _refresh_camera_viewer()
 
         # Save wrist depth on P keypress (after sim step so camera has fresh data)
         if wrist_camera_enabled and save_depth_state["requested"]:

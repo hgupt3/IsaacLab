@@ -24,6 +24,8 @@ visualization:
   goal_region: true
   env_ids: null
   debug_print_rewards: false
+  camera_viewer:
+    enabled: true 
 
 mode:
   use_student_mode: true
