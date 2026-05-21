@@ -1,0 +1,178 @@
+# UR5e + WSG50 soft gripper + Gemini 305 robot configuration
+robot:
+  action_scale: 0.1
+  gripper_action_scale: 0.01
+  control_mode: parallel_jaw
+  arm_joint_count: 6
+  hand_joint_count: 2
+  eigen_dim: 0
+  use_target_tracking: true
+  ema_alpha_arm: 0.10
+  ema_alpha_hand: 0.35
+  arm_joint_names: ["ur5e_joint_1", "ur5e_joint_2", "ur5e_joint_3", "ur5e_joint_4", "ur5e_joint_5", "ur5e_joint_6"]
+  hand_joint_names: ["wsg_left_finger_joint", "wsg_right_finger_joint"]
+  tip_state_body_names: ["ur5e_link_6", "wsg_left_slider_link", "wsg_right_slider_link"]
+  tip_state_offsets:
+    ur5e_link_6: [0.0, 0.0, 0.0]
+    wsg_left_slider_link: [0.0, 0.0, 0.0]
+    wsg_right_slider_link: [0.0, 0.0, 0.0]
+  tip_state_rot_euler:
+    ur5e_link_6: [0.0, 0.0, 0.0]
+    wsg_left_slider_link: [0.0, 0.0, 0.0]
+    wsg_right_slider_link: [0.0, 0.0, 0.0]
+  palm_body_name: "ur5e_link_6"
+  wrist_joint_name: "ur5e_joint_6"
+  arm_joint_regex: "ur5e_joint_.*"
+  hand_body_regex: "(ur5e_link_6|wsg_base_link|wsg_(left|right)_slider_link)"
+  calibration_path: "assets/ur5e_gemini_wsg50/calibration.yaml"
+  palm_frame_offset: null
+  tip_offsets: null
+
+  contact_layout:
+    sensor_prim_prefix: ""
+    contact_model: parallel_jaw
+    thumb_bodies: []
+    finger_bodies: []
+    parallel_jaw_bodies:
+      - ["wsg_left_slider_link"]
+      - ["wsg_right_slider_link"]
+    palm_proximal_bodies: []
+    self_contact_bodies: []
+    pad_normals: {}
+
+wrist_camera:
+  width: 80
+  height: 60
+  focal_length: 3.69
+  horizontal_aperture: 6.17
+  clipping_range: [0.04, 0.5]
+  offset:
+    pos: [0.0, 0.0, 0.0]
+    rot: [0.0, 0.0, 0.0]
+
+trajectory:
+  segments:
+    - name: "grasp"
+      type: "waypoint"
+      pose: null
+      duration: 2.5
+      hand_coupling_weights:
+        full: 1.0
+
+    - name: "explore"
+      type: "random_waypoint"
+      count_weights: [0.4, 0.3, 0.3]
+      movement_duration: 3.5
+      pause_duration: 0.25
+      position_range:
+        x: null
+        y: null
+        z: null
+      vary_orientation: true
+      max_rotation: 1.047
+      hand_coupling_weights:
+        full: 1.0
+
+    - name: "goal"
+      type: "waypoint"
+      pose: null
+      duration: 3.0
+      hand_coupling_weights:
+        full: 1.0
+
+    - name: "release"
+      type: "waypoint"
+      pose: null
+      duration: 2.5
+      hand_coupling_weights:
+        none: 1.0
+
+hand_trajectory:
+  keypoints:
+    count_weights: [1.0]
+    max_surface_perturbation: 0.04
+    roll_perturbation: 0.0
+    normal_similarity_threshold: -0.05
+
+rewards:
+  contact_factor:
+    nail_gate: -0.4
+    nail_gate_min: 0.0
+    finger_weights: [2.0, 2.0]
+    threshold: 0.5
+    ramp: 1.5
+    min_factor: 0.0
+    thumb_gate_floor: 0.0
+    palm_weight: 0.0
+    palm_threshold: 0.5
+    palm_ramp: 1.5
+
+  action_l2:
+    params:
+      finger_scale: 0.2
+
+  action_rate_l2:
+    params:
+      finger_scale: 0.4
+
+  fingers_to_object:
+    params:
+      finger_weights: [1.0, 1.0]
+
+  good_finger_contact:
+    weight: 3.0
+    params:
+      phases: [grasp, release]
+      use_hand_pose_gate: true
+      invert_in_release: true
+
+  finger_manipulation:
+    weight: 0.0
+
+  distal_joint3_penalty:
+    weight: 0.0
+
+  finger_release:
+    weight: 0.0
+    params:
+      phases: [release]
+      scale: 4.0
+
+  finger_regularizer:
+    weight: 0.0
+    params:
+      phases: [grasp, release]
+      default_joints: [-0.055, 0.055]
+      std: 0.03
+
+  finger_self_contact_penalty:
+    weight: 0.0
+
+# Re-applied after task layers so WSG runs cannot inherit dexterous-only
+# in-hand manipulation or hand decoupling behavior from task YAML.
+late_segment_hand_coupling:
+  default:
+    full: 1.0
+  release:
+    none: 1.0
+
+late_overrides:
+  hand_trajectory:
+    keypoints:
+      count_weights: [1.0]
+      roll_perturbation: 0.0
+
+  rewards:
+    contact_factor:
+      finger_weights: [2.0, 2.0]
+    fingers_to_object:
+      params:
+        finger_weights: [1.0, 1.0]
+    finger_manipulation:
+      weight: 0.0
+    distal_joint3_penalty:
+      weight: 0.0
+    finger_regularizer:
+      weight: 0.0
+    finger_self_contact_penalty:
+      weight: 0.0

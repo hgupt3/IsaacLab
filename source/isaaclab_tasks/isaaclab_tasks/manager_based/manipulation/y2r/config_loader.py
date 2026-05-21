@@ -21,6 +21,8 @@ Usage:
 from __future__ import annotations
 
 import types
+import math
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, is_dataclass
 from enum import Enum
 from pathlib import Path
@@ -92,6 +94,202 @@ def _normalize_curriculum_keys(data: Any) -> Any:
     if isinstance(data, list):
         return [_normalize_curriculum_keys(item) for item in data]
     return data
+
+
+# ==============================================================================
+# CALIBRATION-DERIVED ROBOT OFFSETS
+# ==============================================================================
+
+Transform = tuple[tuple[float, float, float], tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]]
+
+
+def _identity_transform() -> Transform:
+    return (
+        (0.0, 0.0, 0.0),
+        ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+    )
+
+
+def _rpy_to_matrix(rpy_rad: tuple[float, float, float]) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]:
+    roll, pitch, yaw = rpy_rad
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    return (
+        (cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr),
+        (sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr),
+        (-sp, cp * sr, cp * cr),
+    )
+
+
+def _matrix_to_rpy_deg(matrix: tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]) -> list[float]:
+    r20 = matrix[2][0]
+    if abs(r20) < 1.0 - 1e-9:
+        pitch = -math.asin(r20)
+        roll = math.atan2(matrix[2][1], matrix[2][2])
+        yaw = math.atan2(matrix[1][0], matrix[0][0])
+    else:
+        pitch = math.pi / 2.0 if r20 <= -1.0 else -math.pi / 2.0
+        roll = math.atan2(-matrix[0][1], matrix[1][1])
+        yaw = 0.0
+    return [math.degrees(roll), math.degrees(pitch), math.degrees(yaw)]
+
+
+def _mat_vec(
+    matrix: tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]],
+    vec: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    return (
+        matrix[0][0] * vec[0] + matrix[0][1] * vec[1] + matrix[0][2] * vec[2],
+        matrix[1][0] * vec[0] + matrix[1][1] * vec[1] + matrix[1][2] * vec[2],
+        matrix[2][0] * vec[0] + matrix[2][1] * vec[1] + matrix[2][2] * vec[2],
+    )
+
+
+def _mat_mul(
+    a: tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]],
+    b: tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]],
+) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]:
+    return tuple(
+        tuple(a[row][0] * b[0][col] + a[row][1] * b[1][col] + a[row][2] * b[2][col] for col in range(3))
+        for row in range(3)
+    )
+
+
+def _compose_transform(parent_to_mid: Transform, mid_to_child: Transform) -> Transform:
+    p_a, r_a = parent_to_mid
+    p_b, r_b = mid_to_child
+    p_b_parent = _mat_vec(r_a, p_b)
+    return (
+        (p_a[0] + p_b_parent[0], p_a[1] + p_b_parent[1], p_a[2] + p_b_parent[2]),
+        _mat_mul(r_a, r_b),
+    )
+
+
+def _yaml_transform(transform: dict) -> Transform:
+    xyz = tuple(float(value) for value in transform["xyz"])
+    rpy = tuple(math.radians(float(value)) for value in transform["rpy_deg"])
+    return (xyz, _rpy_to_matrix(rpy))
+
+
+def _fixed_urdf_joint_transform(urdf_path: Path, joint_name: str) -> Transform:
+    root = ET.parse(urdf_path).getroot()
+    joint = root.find(f"joint[@name='{joint_name}']")
+    if joint is None:
+        raise ValueError(f"Missing required URDF joint '{joint_name}' in {urdf_path}")
+    origin = joint.find("origin")
+    if origin is None:
+        return _identity_transform()
+    xyz = tuple(float(value) for value in origin.attrib["xyz"].split())
+    rpy = tuple(float(value) for value in origin.attrib["rpy"].split())
+    return (xyz, _rpy_to_matrix(rpy))
+
+
+def _as_float_list(values: tuple[float, float, float] | list[float]) -> list[float]:
+    return [float(value) for value in values]
+
+
+def _normalize_vec(values: tuple[float, float, float]) -> tuple[float, float, float]:
+    norm = math.sqrt(values[0] * values[0] + values[1] * values[1] + values[2] * values[2])
+    if norm <= 1e-12:
+        raise ValueError(f"Cannot normalize zero-length vector: {values}")
+    return (values[0] / norm, values[1] / norm, values[2] / norm)
+
+
+def _compose_named_transforms(transforms: dict[str, Transform], names: list[str]) -> Transform:
+    out = _identity_transform()
+    for name in names:
+        out = _compose_transform(out, transforms[name])
+    return out
+
+
+def _apply_calibration_overrides(config: dict, robot_name: str) -> dict:
+    """Fill runtime offsets from robot calibration YAML before dataclass parsing."""
+    robot_cfg = config["robot"]
+    calibration_path = robot_cfg["calibration_path"]
+    if calibration_path is None:
+        return config
+
+    config_dir = Path(__file__).parent
+    path = (config_dir / calibration_path).resolve()
+    with path.open("r") as f:
+        calibration = yaml.safe_load(f)
+
+    asset_dir = path.parent
+    generated_urdf = asset_dir / calibration["model"]["generated_urdf"]
+    if not generated_urdf.exists():
+        raise FileNotFoundError(f"Missing generated URDF for {robot_name}: {generated_urdf}")
+
+    yaml_transforms = {name: _yaml_transform(value) for name, value in calibration["transforms"].items()}
+    yaml_transforms["ur5e_link_6_to_ee"] = _fixed_urdf_joint_transform(generated_urdf, "ur5e_flange_joint")
+    yaml_transforms["gemini_305_left_camera"] = ((0.009, 0.0, 0.0126), _rpy_to_matrix((0.0, 0.0, 0.0)))
+    yaml_transforms["gemini_305_left_optical"] = ((0.0, 0.0, 0.0), _rpy_to_matrix((0.0, 0.0, math.pi)))
+
+    parent_to_wsg_base = _compose_named_transforms(
+        yaml_transforms,
+        ["ur5e_link_6_to_ee", "ee_to_wsg_mount", "wsg_mount_to_wsg_base"],
+    )
+    parent_to_palm = _compose_transform(parent_to_wsg_base, yaml_transforms["wsg_base_to_palm_frame"])
+    robot_cfg["palm_frame_offset"] = {
+        "pos": _as_float_list(parent_to_palm[0]),
+        "rot_euler": _matrix_to_rpy_deg(parent_to_palm[1]),
+    }
+
+    left_slider_to_tip = _compose_named_transforms(
+        yaml_transforms,
+        ["left_slider_to_soft_finger", "left_soft_finger_to_tip"],
+    )
+    right_slider_to_tip = _compose_named_transforms(
+        yaml_transforms,
+        ["right_slider_to_soft_finger", "right_soft_finger_to_tip"],
+    )
+    robot_cfg["tip_state_offsets"] = {
+        "ur5e_link_6": [0.0, 0.0, 0.0],
+        "wsg_left_slider_link": _as_float_list(left_slider_to_tip[0]),
+        "wsg_right_slider_link": _as_float_list(right_slider_to_tip[0]),
+    }
+    robot_cfg["tip_state_rot_euler"] = {
+        "ur5e_link_6": [0.0, 0.0, 0.0],
+        "wsg_left_slider_link": _matrix_to_rpy_deg(left_slider_to_tip[1]),
+        "wsg_right_slider_link": _matrix_to_rpy_deg(right_slider_to_tip[1]),
+    }
+
+    parent_to_camera = _compose_named_transforms(
+        yaml_transforms,
+        [
+            "ur5e_link_6_to_ee",
+            "ee_to_wsg_mount",
+            "wsg_mount_to_wsg_base",
+            "wsg_base_to_camera_mount",
+            "camera_mount_to_gemini",
+            "gemini_305_left_camera",
+            "gemini_305_left_optical",
+        ],
+    )
+    # URDF optical frame is +Z-forward, +X-right, +Y-down. Isaac camera
+    # offsets with convention="opengl" are -Z-forward, +X-right, +Y-up.
+    parent_to_opengl_camera = _compose_transform(
+        parent_to_camera,
+        ((0.0, 0.0, 0.0), _rpy_to_matrix((math.pi, 0.0, 0.0))),
+    )
+    swapped_rpy = _matrix_to_rpy_deg(parent_to_opengl_camera[1])
+    config["wrist_camera"]["offset"] = {
+        "pos": _as_float_list(parent_to_opengl_camera[0]),
+        "rot": [swapped_rpy[0], -swapped_rpy[2], swapped_rpy[1]],
+    }
+
+    pad_normals = calibration["contact_markers"]["pad_normals"]
+    left_soft_normal = tuple(float(value) for value in pad_normals["soft_finger_left_link"]["normal"])
+    right_soft_normal = tuple(float(value) for value in pad_normals["soft_finger_right_link"]["normal"])
+    robot_cfg["contact_layout"]["pad_normals"] = {
+        "wsg_left_slider_link": _as_float_list(
+            _normalize_vec(_mat_vec(yaml_transforms["left_slider_to_soft_finger"][1], left_soft_normal))
+        ),
+        "wsg_right_slider_link": _as_float_list(
+            _normalize_vec(_mat_vec(yaml_transforms["right_slider_to_soft_finger"][1], right_soft_normal))
+        ),
+    }
+    return config
 
 
 # ==============================================================================
@@ -574,10 +772,12 @@ class ContactLayoutConfig:
     # Prefix between "{ENV_REGEX_NS}/Robot/" and the body name (e.g. "" for LEAP,
     # "ee_link/" for kuka_allegro where hand bodies live under the end-effector).
     sensor_prim_prefix: str
+    contact_model: str
     # Tier 1 sensors (per-finger contact): body names for thumb gate + non-thumb finger groups.
     # Each finger group takes max force across its listed bodies (usually link_2 + link_3).
     thumb_bodies: list[str]
     finger_bodies: list[list[str]]   # outer: per finger (index/middle/ring); inner: bodies per finger
+    parallel_jaw_bodies: list[list[str]]
     # Tier 2 sensors (palm + proximal flat bonus). Empty list → Tier 2 disabled for this robot.
     palm_proximal_bodies: list[str]
     # Sensors used for finger_self_contact_penalty residual (net_forces − object_filter).
@@ -591,17 +791,25 @@ class ContactLayoutConfig:
 @dataclass
 class RobotConfig:
     action_scale: float
+    gripper_action_scale: float | None
+    control_mode: str
     arm_joint_count: int
     hand_joint_count: int
     eigen_dim: int
     use_target_tracking: bool
     ema_alpha_arm: float
     ema_alpha_hand: float
+    arm_joint_names: list[str]
+    hand_joint_names: list[str]
+    tip_state_body_names: list[str]
+    tip_state_offsets: dict[str, list[float]]
+    tip_state_rot_euler: dict[str, list[float]]
     palm_body_name: str
     wrist_joint_name: str
     arm_joint_regex: str
     hand_body_regex: str
     contact_layout: ContactLayoutConfig
+    calibration_path: str | None
     palm_frame_offset: PalmFrameOffsetConfig | None = None
     tip_offsets: dict[str, list[float]] | None = None
 
@@ -822,9 +1030,11 @@ def get_config_file_paths(mode: str | None = None, task: str | None = None, robo
     a single source of truth for which files are loaded.
 
     Args:
-        mode: One of "train", "distill", "play", "play_student", "keyboard" (None = Y2R_MODE env var)
+        mode: One of "train", "train_loose_hand_pose", "distill",
+            "distill_loose_hand_pose", "play", "play_student", "keyboard" (None = Y2R_MODE env var)
         task: Task name - "base" or any YAML file in configs/layers/tasks/ (None = Y2R_TASK env var)
-        robot: Robot name - "ur5e_leap" or "kuka_allegro" (None = Y2R_ROBOT env var)
+        robot: Robot name - "ur5e_leap", "kuka_allegro", or "ur5e_gemini_wsg50"
+            (None = Y2R_ROBOT env var)
 
     Returns:
         List of Path objects for YAML files that will be loaded
@@ -838,8 +1048,15 @@ def get_config_file_paths(mode: str | None = None, task: str | None = None, robo
     files.append(config_dir / "robots" / f"{robot}.yaml")
 
     # Mode layers (mirrors get_config() logic exactly)
-    if mode == "distill":
+    if mode == "train_loose_hand_pose":
+        files.append(config_dir / "layers" / "loose_hand_pose.yaml")
+    elif mode == "distill":
         files.append(config_dir / "layers" / "student.yaml")
+    elif mode == "distill_loose_hand_pose":
+        files.extend([
+            config_dir / "layers" / "student.yaml",
+            config_dir / "layers" / "loose_hand_pose.yaml",
+        ])
     elif mode == "play":
         files.append(config_dir / "layers" / "play.yaml")
     elif mode == "play_student":
@@ -866,6 +1083,12 @@ def get_config_file_paths(mode: str | None = None, task: str | None = None, robo
             config_dir / "layers" / "student.yaml",
             config_dir / "layers" / "no_depth.yaml",
         ])
+    elif mode == "distill_no_depth_loose_hand_pose":
+        files.extend([
+            config_dir / "layers" / "student.yaml",
+            config_dir / "layers" / "no_depth.yaml",
+            config_dir / "layers" / "loose_hand_pose.yaml",
+        ])
     # mode == "train" uses base only
 
     # Task layer (optional, applied last)
@@ -878,13 +1101,15 @@ def get_config_file_paths(mode: str | None = None, task: str | None = None, robo
 def get_config(mode: str | None = None, task: str | None = None, robot: str | None = None) -> Y2RConfig:
     """Load Y2R config with layer-based composition.
 
-    Layer order: base → robot → mode → task
+    Layer order: base → robot → mode → task → robot late_overrides
     All parameters default to their respective env vars (Y2R_MODE, Y2R_TASK, Y2R_ROBOT).
 
     Args:
-        mode: One of "train", "distill", "play", "play_student" (None = Y2R_MODE env var)
+        mode: One of "train", "train_loose_hand_pose", "distill",
+            "distill_loose_hand_pose", "play", "play_student" (None = Y2R_MODE env var)
         task: Task name - "base" or tasks YAML name (None = Y2R_TASK env var)
-        robot: Robot name - "ur5e_leap" or "kuka_allegro" (None = Y2R_ROBOT env var)
+        robot: Robot name - "ur5e_leap", "kuka_allegro", or "ur5e_gemini_wsg50"
+            (None = Y2R_ROBOT env var)
 
     Returns:
         Y2RConfig instance with layers composed
@@ -893,12 +1118,24 @@ def get_config(mode: str | None = None, task: str | None = None, robot: str | No
 
     cfg = _load_yaml("env")
 
-    # Robot config (required — crash if missing)
-    cfg = _deep_merge(cfg, _load_yaml(f"robots/{robot}"))
+    # Robot config (required — crash if missing). Robot YAML may include a
+    # top-level late_overrides block that is intentionally re-applied after task
+    # layers, so robot-incompatible task behavior cannot leak back in.
+    robot_layer = _load_yaml(f"robots/{robot}")
+    late_robot_overrides = robot_layer["late_overrides"] if "late_overrides" in robot_layer else None
+    late_segment_hand_coupling = (
+        robot_layer["late_segment_hand_coupling"] if "late_segment_hand_coupling" in robot_layer else None
+    )
+    cfg = _deep_merge(cfg, robot_layer)
 
     # Mode layers (mutually exclusive paths)
-    if mode == "distill":
+    if mode == "train_loose_hand_pose":
+        cfg = _deep_merge(cfg, _load_yaml("layers/loose_hand_pose"))
+    elif mode == "distill":
         cfg = _deep_merge(cfg, _load_yaml("layers/student"))
+    elif mode == "distill_loose_hand_pose":
+        cfg = _deep_merge(cfg, _load_yaml("layers/student"))
+        cfg = _deep_merge(cfg, _load_yaml("layers/loose_hand_pose"))
     elif mode == "play":
         cfg = _deep_merge(cfg, _load_yaml("layers/play"))
     elif mode == "play_student":
@@ -919,12 +1156,28 @@ def get_config(mode: str | None = None, task: str | None = None, robot: str | No
     elif mode == "distill_no_depth":
         cfg = _deep_merge(cfg, _load_yaml("layers/student"))
         cfg = _deep_merge(cfg, _load_yaml("layers/no_depth"))
+    elif mode == "distill_no_depth_loose_hand_pose":
+        cfg = _deep_merge(cfg, _load_yaml("layers/student"))
+        cfg = _deep_merge(cfg, _load_yaml("layers/no_depth"))
+        cfg = _deep_merge(cfg, _load_yaml("layers/loose_hand_pose"))
     # mode == "train" uses base only
 
     # Task layer (optional, applied last)
     if task != "base":
         cfg = _deep_merge(cfg, _load_yaml(f"layers/tasks/{task}"))
 
+    if late_segment_hand_coupling is not None:
+        for segment in cfg["trajectory"]["segments"]:
+            key = segment["name"] if segment["name"] in late_segment_hand_coupling else "default"
+            if key in late_segment_hand_coupling:
+                segment["hand_coupling_weights"] = late_segment_hand_coupling[key]
+
+    if late_robot_overrides is not None:
+        cfg = _deep_merge(cfg, late_robot_overrides)
+    cfg.pop("late_overrides", None)
+    cfg.pop("late_segment_hand_coupling", None)
+
+    cfg = _apply_calibration_overrides(cfg, robot)
     cfg = _normalize_curriculum_keys(cfg)
 
     # Parse segments from YAML dict to segment config objects

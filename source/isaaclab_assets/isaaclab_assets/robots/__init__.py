@@ -31,3 +31,4 @@ from .spot import *
 from .unitree import *
 from .universal_robots import *
 from .ur5e_leap import *
+from .ur5e_gemini_wsg50 import *

@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>UR5e LEAP Frame Check</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      overflow: hidden;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #1f2933;
+      background: #e3e9ef;
+    }
+    #app {
+      display: grid;
+      grid-template-columns: 360px 1fr;
+      height: 100vh;
+      width: 100vw;
+    }
+    #panel {
+      padding: 16px;
+      overflow: auto;
+      background: #fbfcfd;
+      border-right: 1px solid #cfd6df;
+    }
+    #viewport {
+      position: relative;
+      min-width: 0;
+      background: #dfe5eb;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+    h1 {
+      margin: 0 0 12px;
+      font-size: 18px;
+      letter-spacing: 0;
+    }
+    h2 {
+      margin: 18px 0 8px;
+      font-size: 13px;
+      color: #374151;
+      letter-spacing: 0;
+    }
+    button {
+      height: 34px;
+      width: 100%;
+      border: 1px solid #9ba9b7;
+      border-radius: 6px;
+      background: #ffffff;
+      color: #18212f;
+      font-weight: 650;
+      cursor: pointer;
+      margin-bottom: 8px;
+    }
+    button:hover { filter: brightness(0.97); }
+    #status {
+      min-height: 34px;
+      border: 1px solid #cfd6df;
+      border-radius: 6px;
+      padding: 8px;
+      font-size: 12px;
+      background: #ffffff;
+      color: #334155;
+      margin-bottom: 12px;
+      word-break: break-word;
+    }
+    .legend {
+      display: grid;
+      grid-template-columns: 18px 1fr;
+      gap: 8px;
+      align-items: center;
+      font-size: 12px;
+      color: #475569;
+      margin: 6px 0;
+    }
+    .swatch {
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      border: 1px solid rgba(15, 23, 42, 0.22);
+    }
+    .metric {
+      display: grid;
+      grid-template-columns: 84px 1fr 1fr;
+      gap: 8px;
+      padding: 6px 0;
+      border-bottom: 1px solid #e2e8f0;
+      font-size: 12px;
+    }
+    .metric strong { color: #334155; }
+    .joint-row {
+      display: grid;
+      grid-template-columns: 1fr 66px 66px;
+      gap: 8px;
+      padding: 5px 0;
+      border-bottom: 1px solid #e2e8f0;
+      font-size: 12px;
+    }
+    .joint-row strong { color: #334155; }
+    #overlay {
+      position: absolute;
+      left: 12px;
+      bottom: 12px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.9);
+      border: 1px solid rgba(148, 163, 184, 0.55);
+      color: #334155;
+      font-size: 12px;
+      pointer-events: none;
+    }
+    @media (max-width: 900px) {
+      #app { grid-template-columns: 1fr; grid-template-rows: 48vh 52vh; }
+      #panel { order: 2; border-right: 0; border-top: 1px solid #cfd6df; }
+      #viewport { order: 1; }
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <aside id="panel">
+      <h1>UR5e LEAP Frame Check</h1>
+      <button id="resetViewButton">Reset View</button>
+      <button id="toggleGhostButton">Toggle Computed Frames</button>
+      <button id="toggleContactButton">Toggle Contact Normals</button>
+      <div id="status">Loading...</div>
+      <h2>Legend</h2>
+      <div class="legend"><span class="swatch" style="background:#00f5ff"></span><span>URDF virtual frame axes</span></div>
+      <div class="legend"><span class="swatch" style="background:#ffcc00"></span><span>YAML computed offset frames</span></div>
+      <div class="legend"><span class="swatch" style="background:#ff4d4d"></span><span>Position mismatch line</span></div>
+      <div class="legend"><span class="swatch" style="background:#f59e0b"></span><span>Configured pad normal</span></div>
+      <div class="legend"><span class="swatch" style="background:#8b5cf6"></span><span>Contact sensor body origin</span></div>
+      <h2>Frame Error</h2>
+      <div class="metric"><strong>frame</strong><strong>pos</strong><strong>rot</strong></div>
+      <div id="metrics"></div>
+      <h2>Default Joint Angles</h2>
+      <div class="joint-row"><strong>joint</strong><strong>deg</strong><strong>rad</strong></div>
+      <div id="jointAngles"></div>
+    </aside>
+    <main id="viewport">
+      <div id="overlay">Axes use RGB: X red, Y green, Z blue</div>
+    </main>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/controls/OrbitControls.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/loaders/STLLoader.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/loaders/OBJLoader.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/loaders/MTLLoader.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/urdf-loader@0.10.4/umd/URDFLoader.js"></script>
+
+  <script>
+    const DEFAULT_JOINTS = {
+      ur5e_joint_1: 1.5708,
+      ur5e_joint_2: -1.2217,
+      ur5e_joint_3: 1.3963,
+      ur5e_joint_4: -0.1745,
+      ur5e_joint_5: 1.5708,
+      ur5e_joint_6: 0.0,
+      index_joint_0: 0.0,
+      index_joint_1: 0.3,
+      index_joint_2: 0.3,
+      index_joint_3: 0.3,
+      middle_joint_0: 0.0,
+      middle_joint_1: 0.3,
+      middle_joint_2: 0.3,
+      middle_joint_3: 0.3,
+      ring_joint_0: 0.0,
+      ring_joint_1: 0.3,
+      ring_joint_2: 0.3,
+      ring_joint_3: 0.3,
+      thumb_joint_0: 1.5,
+      thumb_joint_1: 0.60147215,
+      thumb_joint_2: 0.33795027,
+      thumb_joint_3: 0.60845138,
+    };
+
+    let frameConfig = null;
+    let scene = null;
+    let camera = null;
+    let renderer = null;
+    let controls = null;
+    let robot = null;
+    let urdfAxesGroup = null;
+    let computedAxesGroup = null;
+    let mismatchGroup = null;
+    let contactGroup = null;
+    let showComputed = true;
+    let showContacts = true;
+
+    const viewportEl = document.getElementById("viewport");
+    const statusEl = document.getElementById("status");
+    const metricsEl = document.getElementById("metrics");
+    const jointAnglesEl = document.getElementById("jointAngles");
+
+    init();
+
+    async function init() {
+      initScene();
+      const response = await fetch("/api/frame_config");
+      frameConfig = await response.json();
+      await loadRobot();
+      renderDefaultJointAngles();
+      animate();
+      document.getElementById("resetViewButton").addEventListener("click", resetView);
+      document.getElementById("toggleGhostButton").addEventListener("click", () => {
+        showComputed = !showComputed;
+        computedAxesGroup.visible = showComputed;
+        mismatchGroup.visible = showComputed;
+      });
+      document.getElementById("toggleContactButton").addEventListener("click", () => {
+        showContacts = !showContacts;
+        contactGroup.visible = showContacts;
+      });
+    }
+
+    function initScene() {
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0xdfe5eb);
+
+      camera = new THREE.PerspectiveCamera(50, viewportEl.clientWidth / viewportEl.clientHeight, 0.01, 10);
+      camera.up.set(0, 0, 1);
+      camera.position.set(0.55, -0.78, 0.48);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setPixelRatio(window.devicePixelRatio);
+      renderer.setSize(viewportEl.clientWidth, viewportEl.clientHeight);
+      viewportEl.appendChild(renderer.domElement);
+
+      controls = new THREE.OrbitControls(camera, renderer.domElement);
+      controls.target.set(0.03, -0.03, 0.06);
+      controls.update();
+
+      scene.add(new THREE.AmbientLight(0xffffff, 0.72));
+      const key = new THREE.DirectionalLight(0xffffff, 0.55);
+      key.position.set(0.8, -0.7, 1.2);
+      scene.add(key);
+      const fill = new THREE.DirectionalLight(0xffffff, 0.25);
+      fill.position.set(-0.7, 0.8, 0.6);
+      scene.add(fill);
+
+      const grid = new THREE.GridHelper(1.0, 20, 0x6b7280, 0xb8c4d0);
+      grid.rotation.x = Math.PI / 2;
+      scene.add(grid);
+
+      urdfAxesGroup = new THREE.Group();
+      computedAxesGroup = new THREE.Group();
+      mismatchGroup = new THREE.Group();
+      contactGroup = new THREE.Group();
+      scene.add(urdfAxesGroup);
+      scene.add(computedAxesGroup);
+      scene.add(mismatchGroup);
+      scene.add(contactGroup);
+
+      window.addEventListener("resize", resize);
+    }
+
+    function makeMeshLoader(manager) {
+      return (path, _manager, onComplete) => {
+        const finish = (obj) => {
+          obj.traverse((child) => {
+            if (!child.isMesh) return;
+            child.material = new THREE.MeshPhongMaterial({
+              color: 0x7b8794,
+              transparent: true,
+              opacity: 0.38,
+              depthWrite: false,
+              side: THREE.DoubleSide,
+            });
+            child.castShadow = true;
+            child.receiveShadow = true;
+          });
+          onComplete(obj);
+        };
+
+        if (path.toLowerCase().endsWith(".stl")) {
+          const loader = new THREE.STLLoader(manager);
+          loader.load(path, (geometry) => finish(new THREE.Mesh(geometry, new THREE.MeshPhongMaterial())));
+          return;
+        }
+
+        const loadObj = () => {
+          const objLoader = new THREE.OBJLoader(manager);
+          objLoader.load(path, finish, undefined, (error) => console.error("OBJ load failed", path, error));
+        };
+        const mtlPath = path.replace(/\.obj$/i, ".mtl");
+        if (mtlPath === path || /\/meshes\/base_plate\.obj$/i.test(path)) {
+          loadObj();
+          return;
+        }
+        const mtlLoader = new THREE.MTLLoader(manager);
+        mtlLoader.load(mtlPath, (materials) => {
+          materials.preload();
+          const objLoader = new THREE.OBJLoader(manager);
+          objLoader.setMaterials(materials);
+          objLoader.load(path, finish, undefined, loadObj);
+        }, undefined, loadObj);
+      };
+    }
+
+    async function loadRobot() {
+      setStatus("Loading LEAP URDF...");
+      const manager = new THREE.LoadingManager();
+      const loader = new URDFLoader(manager);
+      loader.loadMeshCb = makeMeshLoader(manager);
+      loader.load(`/asset/${frameConfig.urdf}?t=${Date.now()}`, (loadedRobot) => {
+        robot = loadedRobot;
+        robot.setJointValues(DEFAULT_JOINTS);
+        scene.add(robot);
+        robot.updateMatrixWorld(true);
+        addFrameVisuals();
+        updateFrameVisuals();
+        focusOnFrames();
+        setStatus("URDF loaded. Cyan should sit on top of yellow.");
+      }, undefined, (error) => {
+        setStatus(`URDF load failed: ${error}`);
+      });
+    }
+
+    function addFrameVisuals() {
+      urdfAxesGroup.clear();
+      computedAxesGroup.clear();
+      mismatchGroup.clear();
+      contactGroup.clear();
+      const frames = allFrames();
+      for (const frame of frames) {
+        const urdfAxes = makeTintedAxes(0.06, 0x00f5ff);
+        urdfAxes.userData.frame = frame;
+        urdfAxesGroup.add(urdfAxes);
+
+        const computedAxes = makeTintedAxes(0.045, 0xffcc00);
+        computedAxes.userData.frame = frame;
+        computedAxesGroup.add(computedAxes);
+
+        const material = new THREE.LineBasicMaterial({ color: 0xff4d4d, linewidth: 2 });
+        const geometry = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
+        const line = new THREE.Line(geometry, material);
+        line.userData.frame = frame;
+        mismatchGroup.add(line);
+      }
+      updateContactVisuals();
+    }
+
+    function renderDefaultJointAngles() {
+      jointAnglesEl.innerHTML = Object.entries(DEFAULT_JOINTS).map(([name, radians]) => {
+        const degrees = THREE.MathUtils.radToDeg(radians);
+        return `<div class="joint-row"><strong>${name}</strong><span>${degrees.toFixed(2)}</span><span>${radians.toFixed(4)}</span></div>`;
+      }).join("");
+    }
+
+    function allFrames() {
+      const frames = [
+        {
+          name: "palm",
+          urdfLink: frameConfig.palm.urdf_link,
+          parentLink: frameConfig.palm.parent_link,
+          offset: frameConfig.palm.offset.pos,
+          rotEulerDeg: frameConfig.palm.offset.rot_euler,
+        },
+      ];
+      for (const [name, tip] of Object.entries(frameConfig.tips)) {
+        frames.push({
+          name,
+          urdfLink: tip.urdf_link,
+          parentLink: tip.parent_link,
+          offset: tip.offset,
+          rotEulerDeg: [0, 0, 0],
+        });
+      }
+      return frames;
+    }
+
+    function makeTintedAxes(size, tintColor) {
+      const group = new THREE.Group();
+      group.add(new THREE.AxesHelper(size));
+      const sphere = new THREE.Mesh(
+        new THREE.SphereGeometry(size * 0.12, 12, 12),
+        new THREE.MeshBasicMaterial({ color: tintColor })
+      );
+      group.add(sphere);
+      return group;
+    }
+
+    function updateFrameVisuals() {
+      if (!robot || !robot.links) return;
+      const metrics = [];
+      for (const axes of urdfAxesGroup.children) {
+        const frame = axes.userData.frame;
+        const urdfLink = robot.links[frame.urdfLink];
+        if (!urdfLink) continue;
+        axes.matrix.copy(urdfLink.matrixWorld);
+        axes.matrixAutoUpdate = false;
+      }
+
+      for (const axes of computedAxesGroup.children) {
+        const frame = axes.userData.frame;
+        const matrix = computedFrameMatrix(frame);
+        if (!matrix) continue;
+        axes.matrix.copy(matrix);
+        axes.matrixAutoUpdate = false;
+      }
+
+      for (const line of mismatchGroup.children) {
+        const frame = line.userData.frame;
+        const urdfLink = robot.links[frame.urdfLink];
+        const computed = computedFrameMatrix(frame);
+        if (!urdfLink || !computed) continue;
+        const urdfPos = new THREE.Vector3().setFromMatrixPosition(urdfLink.matrixWorld);
+        const computedPos = new THREE.Vector3().setFromMatrixPosition(computed);
+        const errorMm = urdfPos.distanceTo(computedPos) * 1000.0;
+        const errorDeg = rotationErrorDeg(urdfLink.matrixWorld, computed);
+        line.geometry.setFromPoints([urdfPos, computedPos]);
+        line.geometry.attributes.position.needsUpdate = true;
+        metrics.push([frame.name, errorMm, errorDeg]);
+      }
+      metricsEl.innerHTML = metrics.map(([name, errorMm, errorDeg]) => {
+        return `<div class="metric"><strong>${name}</strong><span>${errorMm.toFixed(2)} mm</span><span>${errorDeg.toFixed(3)}°</span></div>`;
+      }).join("");
+      updateContactVisuals();
+    }
+
+    function updateContactVisuals() {
+      if (!robot || !robot.links || !frameConfig) return;
+      contactGroup.clear();
+      contactGroup.visible = showContacts;
+      for (const [bodyLinkName, normal] of Object.entries(frameConfig.contact_layout.pad_normals)) {
+        const bodyLink = robot.links[bodyLinkName];
+        if (!bodyLink) continue;
+        const origin = new THREE.Vector3().setFromMatrixPosition(bodyLink.matrixWorld);
+        const direction = new THREE.Vector3(normal[0], normal[1], normal[2]);
+        if (direction.lengthSq() <= 1e-12) continue;
+        direction.normalize();
+        const bodyQuat = new THREE.Quaternion().setFromRotationMatrix(bodyLink.matrixWorld);
+        direction.applyQuaternion(bodyQuat).normalize();
+
+        const arrow = new THREE.ArrowHelper(direction, origin, 0.045, 0xf59e0b, 0.014, 0.008);
+        const sphere = new THREE.Mesh(
+          new THREE.SphereGeometry(0.005, 12, 12),
+          new THREE.MeshBasicMaterial({ color: 0x8b5cf6 })
+        );
+        sphere.position.copy(origin);
+        contactGroup.add(arrow);
+        contactGroup.add(sphere);
+      }
+    }
+
+    function computedFrameMatrix(frame) {
+      const parent = robot.links[frame.parentLink];
+      if (!parent) return null;
+      const offset = new THREE.Matrix4();
+      const pos = new THREE.Vector3(frame.offset[0], frame.offset[1], frame.offset[2]);
+      const quat = quaternionFromRpyDeg(frame.rotEulerDeg);
+      offset.compose(pos, quat, new THREE.Vector3(1, 1, 1));
+      return parent.matrixWorld.clone().multiply(offset);
+    }
+
+    function quaternionFromRpyDeg(rpyDeg) {
+      return new THREE.Quaternion().setFromEuler(new THREE.Euler(
+        THREE.MathUtils.degToRad(rpyDeg[0]),
+        THREE.MathUtils.degToRad(rpyDeg[1]),
+        THREE.MathUtils.degToRad(rpyDeg[2]),
+        "ZYX"
+      ));
+    }
+
+    function rotationErrorDeg(a, b) {
+      const qa = new THREE.Quaternion().setFromRotationMatrix(a);
+      const qb = new THREE.Quaternion().setFromRotationMatrix(b);
+      const dot = Math.min(1, Math.abs(qa.dot(qb)));
+      return THREE.MathUtils.radToDeg(2 * Math.acos(dot));
+    }
+
+    function resetView() {
+      focusOnFrames();
+    }
+
+    function focusOnFrames() {
+      if (!robot || !robot.links) {
+        camera.position.set(0.55, -0.78, 0.48);
+        controls.target.set(0.03, -0.03, 0.06);
+        controls.update();
+        return;
+      }
+      const positions = allFrames()
+        .map((frame) => robot.links[frame.urdfLink])
+        .filter((link) => Boolean(link))
+        .map((link) => new THREE.Vector3().setFromMatrixPosition(link.matrixWorld));
+      if (!positions.length) return;
+
+      const center = positions.reduce((acc, pos) => acc.add(pos), new THREE.Vector3()).multiplyScalar(1.0 / positions.length);
+      camera.position.copy(center).add(new THREE.Vector3(0.18, -0.34, 0.18));
+      controls.target.copy(center);
+      controls.update();
+    }
+
+    function resize() {
+      camera.aspect = viewportEl.clientWidth / viewportEl.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(viewportEl.clientWidth, viewportEl.clientHeight);
+    }
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+      if (robot) {
+        robot.updateMatrixWorld(true);
+        updateFrameVisuals();
+      }
+      controls.update();
+      renderer.render(scene, camera);
+    }
+  </script>
+</body>
+</html>

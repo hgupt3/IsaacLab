@@ -1,10 +1,10 @@
 #!/bin/bash
 # ==============================================================================
-# Test URDF → USD conversion for UR5e + LEAP Hand
+# Test URDF → USD conversion for Y2R robots
 # ==============================================================================
 # Usage:
-#   ./y2r_sim/run/generate_usd.sh            # Headless report only
-#   ./y2r_sim/run/generate_usd.sh --view     # Open browser viewer at localhost:8211
+#   ./y2r_sim/run/generate_usd.sh                                  # Headless report only
+#   ./y2r_sim/run/generate_usd.sh --robot ur5e_gemini_wsg50 --view  # Browser viewer
 # ==============================================================================
 
 source "$(dirname "$0")/common.sh"

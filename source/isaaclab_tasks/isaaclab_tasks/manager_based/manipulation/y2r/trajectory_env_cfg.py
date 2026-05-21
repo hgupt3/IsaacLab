@@ -286,7 +286,7 @@ def _build_observations_cfg(cfg: Y2RConfig):
         joint_pos_hand = ObsTerm(
             func=mdp.joint_pos,
             noise=Gnoise(mean=0.0, std=0.0),
-            params={"asset_cfg": SceneEntityCfg("robot", joint_names=mdp.ALLEGRO_HAND_JOINT_NAMES)},
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=cfg.robot.hand_joint_names)},
         )
         joint_vel_arm = ObsTerm(
             func=mdp.joint_vel,
@@ -296,19 +296,20 @@ def _build_observations_cfg(cfg: Y2RConfig):
         joint_vel_hand = ObsTerm(
             func=mdp.joint_vel,
             noise=Gnoise(mean=0.0, std=0.0),
-            params={"asset_cfg": SceneEntityCfg("robot", joint_names=mdp.ALLEGRO_HAND_JOINT_NAMES)},
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=cfg.robot.hand_joint_names)},
         )
         joint_pos_targets = ObsTerm(func=mdp.joint_pos_targets, noise=Gnoise(mean=0.0, std=0.0))
-        hand_eigen = ObsTerm(
-            func=mdp.allegro_hand_eigen_b,
-            noise=Gnoise(mean=0.0, std=0.0),
-            params={
-                "arm_joint_count": cfg.robot.arm_joint_count,
-                "hand_joint_count": cfg.robot.hand_joint_count,
-                "eigen_dim": cfg.robot.eigen_dim,
-                "use_default_delta": True,
-            },
-        )
+        if cfg.robot.control_mode == "dexterous":
+            hand_eigen = ObsTerm(
+                func=mdp.allegro_hand_eigen_b,
+                noise=Gnoise(mean=0.0, std=0.0),
+                params={
+                    "arm_joint_count": cfg.robot.arm_joint_count,
+                    "hand_joint_count": cfg.robot.hand_joint_count,
+                    "eigen_dim": cfg.robot.eigen_dim,
+                    "use_default_delta": True,
+                },
+            )
         hand_tips_state_b = ObsTerm(
             func=mdp.body_state_b,
             noise=Gnoise(mean=0.0, std=0.0),
@@ -447,7 +448,7 @@ def _build_observations_cfg(cfg: Y2RConfig):
 
     @configclass
     class StudentProprioObsCfg(ObsGroup):
-        """Student proprioception: joint_pos (arm+hand split), hand_eigen only.
+        """Student proprioception: joint targets plus optional dexterous hand_eigen.
 
         No joint_vel, hand_tips_state, contacts, or object_pose_palm (all privileged).
         """
@@ -459,19 +460,20 @@ def _build_observations_cfg(cfg: Y2RConfig):
         joint_pos_hand = ObsTerm(
             func=mdp.joint_pos,
             noise=Gnoise(mean=0.0, std=0.0),
-            params={"asset_cfg": SceneEntityCfg("robot", joint_names=mdp.ALLEGRO_HAND_JOINT_NAMES)},
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=cfg.robot.hand_joint_names)},
         )
         joint_pos_targets = ObsTerm(func=mdp.joint_pos_targets, noise=Gnoise(mean=0.0, std=0.0))
-        hand_eigen = ObsTerm(
-            func=mdp.allegro_hand_eigen_b,
-            noise=Gnoise(mean=0.0, std=0.0),
-            params={
-                "arm_joint_count": cfg.robot.arm_joint_count,
-                "hand_joint_count": cfg.robot.hand_joint_count,
-                "eigen_dim": cfg.robot.eigen_dim,
-                "use_default_delta": True,
-            },
-        )
+        if cfg.robot.control_mode == "dexterous":
+            hand_eigen = ObsTerm(
+                func=mdp.allegro_hand_eigen_b,
+                noise=Gnoise(mean=0.0, std=0.0),
+                params={
+                    "arm_joint_count": cfg.robot.arm_joint_count,
+                    "hand_joint_count": cfg.robot.hand_joint_count,
+                    "eigen_dim": cfg.robot.eigen_dim,
+                    "use_default_delta": True,
+                },
+            )
 
         def __post_init__(self):
             self.enable_corruption = True

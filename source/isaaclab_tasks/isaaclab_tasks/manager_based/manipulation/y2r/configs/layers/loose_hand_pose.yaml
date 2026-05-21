@@ -1,0 +1,11 @@
+# ==============================================================================
+# Loose Hand Pose Termination Layer
+# ==============================================================================
+# Used for the first teacher/distillation phase before strict pose finetuning.
+# Matches the pre-finetune thresholds from 2f7cd4e3a3b.
+# ==============================================================================
+
+terminations:
+  hand_pose_deviation:
+    position_threshold: [0.15, 0.15]
+    rotation_threshold: [1.5, 1.5]

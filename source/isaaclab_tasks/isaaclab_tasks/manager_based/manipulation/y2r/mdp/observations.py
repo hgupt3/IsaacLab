@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn.functional as F
 from typing import TYPE_CHECKING
@@ -96,27 +97,30 @@ def _quat_conjugate(quat: torch.Tensor) -> torch.Tensor:
 # ==============================================================================
 # PALM FRAME OFFSET HELPER
 # ==============================================================================
-# Cached tensors for palm frame offset (initialized on first call)
-_PALM_OFFSET_POS: torch.Tensor | None = None
-_PALM_OFFSET_QUAT: torch.Tensor | None = None
+# Cached tensors for palm frame offset, keyed by config identity and device.
+_PALM_OFFSET_CACHE: dict[tuple[int, str], tuple[torch.Tensor | None, torch.Tensor | None]] = {}
 
 
-def _ensure_palm_offset_cache(y2r_cfg: Y2RConfig, device: torch.device) -> None:
-    """Initialize cached palm frame offset tensors (once per process)."""
-    global _PALM_OFFSET_POS, _PALM_OFFSET_QUAT
-    if _PALM_OFFSET_POS is not None:
-        return
+def _ensure_palm_offset_cache(y2r_cfg: Y2RConfig, device: torch.device) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Return cached palm frame offset tensors for the active config/device."""
+    cache_key = (id(y2r_cfg), str(device))
+    cached = _PALM_OFFSET_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     off = y2r_cfg.robot.palm_frame_offset
     if off is None:
-        return
-    _PALM_OFFSET_POS = torch.tensor(off.pos, dtype=torch.float32, device=device).unsqueeze(0)  # (1, 3)
+        _PALM_OFFSET_CACHE[cache_key] = (None, None)
+        return _PALM_OFFSET_CACHE[cache_key]
+    palm_offset_pos = torch.tensor(off.pos, dtype=torch.float32, device=device).unsqueeze(0)  # (1, 3)
     # Convert euler XYZ (degrees) to quaternion
     r, p, y = [x * 3.14159265358979 / 180.0 for x in off.rot_euler]
-    _PALM_OFFSET_QUAT = quat_from_euler_xyz(
+    palm_offset_quat = quat_from_euler_xyz(
         torch.tensor([r], device=device),
         torch.tensor([p], device=device),
         torch.tensor([y], device=device),
     )  # (1, 4)
+    _PALM_OFFSET_CACHE[cache_key] = (palm_offset_pos, palm_offset_quat)
+    return _PALM_OFFSET_CACHE[cache_key]
 
 
 def get_palm_frame_pose_w(
@@ -133,8 +137,7 @@ def get_palm_frame_pose_w(
         Tuple of (pos_w, quat_w, palm_body_idx) where pos_w and quat_w
         are the palm frame pose in world coordinates.
     """
-    global _PALM_OFFSET_POS, _PALM_OFFSET_QUAT
-    _ensure_palm_offset_cache(y2r_cfg, robot.device)
+    palm_offset_pos, palm_offset_quat = _ensure_palm_offset_cache(y2r_cfg, robot.device)
 
     # Cache string-based body lookup on the articulation to avoid per-step find_bodies.
     palm_name = y2r_cfg.robot.palm_body_name
@@ -148,12 +151,12 @@ def get_palm_frame_pose_w(
     pos_w = robot.data.body_pos_w[:, palm_idx]
     quat_w = robot.data.body_quat_w[:, palm_idx]
 
-    if y2r_cfg.robot.palm_frame_offset is not None:
+    if palm_offset_pos is not None and palm_offset_quat is not None:
         N = pos_w.shape[0]
         pos_w, quat_w = combine_frame_transforms(
             pos_w, quat_w,
-            _PALM_OFFSET_POS.expand(N, 3),
-            _PALM_OFFSET_QUAT.expand(N, 4),
+            palm_offset_pos.expand(N, 3),
+            palm_offset_quat.expand(N, 4),
         )
     return pos_w, quat_w, palm_idx
 
@@ -468,8 +471,10 @@ def body_state_b(
     return out.view(env.num_envs, -1)
 
 
-# Cached tip offset tensor (initialized on first call)
+# Cached tip offset tensors (initialized on first call)
 _TIP_OFFSETS_TENSOR: torch.Tensor | None = None
+_BODY_STATE_OFFSETS_CACHE: dict[tuple[int, tuple[str, ...]], torch.Tensor] = {}
+_BODY_STATE_ROT_OFFSETS_CACHE: dict[tuple[int, tuple[str, ...]], torch.Tensor] = {}
 
 
 def _ensure_tip_offsets_cache(y2r_cfg: Y2RConfig, device: torch.device) -> None:
@@ -488,6 +493,71 @@ def _ensure_tip_offsets_cache(y2r_cfg: Y2RConfig, device: torch.device) -> None:
     )  # (4, 3)
 
 
+def _get_body_state_offsets_tensor(
+    y2r_cfg: Y2RConfig,
+    body_names: list[str],
+    device: torch.device,
+) -> torch.Tensor:
+    """Return per-body local position offsets in the same order as body_names."""
+    cache_key = (id(y2r_cfg), tuple(body_names))
+    cached = _BODY_STATE_OFFSETS_CACHE.get(cache_key)
+    if cached is not None and cached.device == device:
+        return cached
+    offsets = y2r_cfg.robot.tip_state_offsets
+    missing = [name for name in body_names if name not in offsets]
+    if missing:
+        raise KeyError(f"Missing robot.tip_state_offsets entries for bodies: {missing}")
+    tensor = torch.tensor([offsets[name] for name in body_names], dtype=torch.float32, device=device)
+    _BODY_STATE_OFFSETS_CACHE[cache_key] = tensor
+    return tensor
+
+
+def _get_body_state_rot_offsets_tensor(
+    y2r_cfg: Y2RConfig,
+    body_names: list[str],
+    device: torch.device,
+) -> torch.Tensor:
+    """Return per-body local rotation offsets as quaternions in body_names order."""
+    cache_key = (id(y2r_cfg), tuple(body_names))
+    cached = _BODY_STATE_ROT_OFFSETS_CACHE.get(cache_key)
+    if cached is not None and cached.device == device:
+        return cached
+    offsets = y2r_cfg.robot.tip_state_rot_euler
+    missing = [name for name in body_names if name not in offsets]
+    if missing:
+        raise KeyError(f"Missing robot.tip_state_rot_euler entries for bodies: {missing}")
+    rpy = torch.tensor([offsets[name] for name in body_names], dtype=torch.float32, device=device)
+    rpy = rpy * (math.pi / 180.0)
+    tensor = quat_from_euler_xyz(rpy[:, 0], rpy[:, 1], rpy[:, 2])
+    _BODY_STATE_ROT_OFFSETS_CACHE[cache_key] = tensor
+    return tensor
+
+
+def body_state_with_offsets_b(
+    env: ManagerBasedRLEnv,
+    body_asset_cfg: SceneEntityCfg,
+    base_asset_cfg: SceneEntityCfg,
+    body_names: list[str],
+) -> torch.Tensor:
+    """Body state in base frame with configured local position/rotation offsets applied."""
+    out = body_state_b(env, body_asset_cfg, base_asset_cfg)
+    offsets = _get_body_state_offsets_tensor(env.cfg.y2r_cfg, body_names, env.device)
+    rot_offsets = _get_body_state_rot_offsets_tensor(env.cfg.y2r_cfg, body_names, env.device)
+    if offsets.numel() == 0:
+        return out
+
+    num_bodies = len(body_names)
+    N = env.num_envs
+    out_reshaped = out.view(N, num_bodies, 13)
+    for body_idx in range(num_bodies):
+        body_quat_b = out_reshaped[:, body_idx, 3:7]
+        offset_b = quat_apply(body_quat_b, offsets[body_idx].unsqueeze(0).expand(N, 3))
+        out_reshaped[:, body_idx, 0:3] = out_reshaped[:, body_idx, 0:3] + offset_b
+        rot_offset = rot_offsets[body_idx].unsqueeze(0).expand(N, 4)
+        out_reshaped[:, body_idx, 3:7] = quat_mul(body_quat_b, rot_offset)
+    return out_reshaped.view(N, -1)
+
+
 def hand_tips_state_with_offsets_b(
     env: ManagerBasedRLEnv,
     body_asset_cfg: SceneEntityCfg,
@@ -502,25 +572,12 @@ def hand_tips_state_with_offsets_b(
     Returns:
         Tensor of shape ``(num_envs, 5 * 13)`` with per-body states in base root frame.
     """
-    y2r_cfg = env.cfg.y2r_cfg
-    _ensure_tip_offsets_cache(y2r_cfg, env.device)
-
-    # Get base body states
-    out = body_state_b(env, body_asset_cfg, base_asset_cfg)  # (N, 5*13)
-
-    # Apply tip offsets if configured
-    global _TIP_OFFSETS_TENSOR
-    if _TIP_OFFSETS_TENSOR is not None:
-        N = env.num_envs
-        out_reshaped = out.view(N, 5, 13)  # (N, 5, 13)
-        # Bodies 1-4 are link_3 bodies; apply offset in each body's local frame
-        for i in range(4):
-            body_quat_b = out_reshaped[:, 1 + i, 3:7]  # (N, 4) quaternion in base frame
-            offset_b = quat_apply(body_quat_b, _TIP_OFFSETS_TENSOR[i].unsqueeze(0).expand(N, 3))
-            out_reshaped[:, 1 + i, 0:3] = out_reshaped[:, 1 + i, 0:3] + offset_b
-        out = out_reshaped.view(N, -1)
-
-    return out
+    return body_state_with_offsets_b(
+        env,
+        body_asset_cfg=body_asset_cfg,
+        base_asset_cfg=base_asset_cfg,
+        body_names=env.cfg.y2r_cfg.robot.tip_state_body_names,
+    )
 
 
 class object_point_cloud_b(ManagerTermBase):

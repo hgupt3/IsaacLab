@@ -8,12 +8,12 @@ This module provides functions to reshape the flat concatenated observation
 vector from the environment into structured point-centric format suitable
 for transformer processing.
 
-Observation Structure (from base.yaml):
-    policy:       last_action (28) × 5 history = 140
-    proprio:      joint_pos (23) + joint_vel (23) + hand_tips (65) + contact (~10) × 5 = ~605
-    current_pc:   object_point_cloud (32×3) × 3 history = 288
-    current_poses: object_pose (7) + hand_pose (7) × 5 history = 70
-    targets:      target_point_clouds (5×32×3) + target_poses (5×7) × 1 = 515
+Observation Structure is derived from the active Y2R robot config:
+    policy:        last_action × policy history
+    proprio:       joint_pos + joint_vel + targets + optional eigen + tip states + contact + palm pose
+    current_pc:    object_point_cloud × point-cloud history
+    current_poses: object_pose + hand_pose × pose history
+    targets:       target point clouds + target poses
 
 Note: object_pc and poses can have different history lengths.
 
@@ -48,11 +48,37 @@ class ObsConfig:
     action_history: int
     joint_pos_dim: int
     joint_vel_dim: int
+    joint_pos_targets_dim: int
+    hand_eigen_dim: int
     hand_tips_dim: int
     contact_dim: int
+    object_pose_palm_dim: int
     proprio_history: int
     pose_dim: int
     window_size: int
+
+
+def _policy_action_dim(cfg) -> int:
+    if cfg.robot.control_mode == "parallel_jaw":
+        return cfg.robot.arm_joint_count + 1
+    if cfg.robot.control_mode == "dexterous":
+        if cfg.mode.use_eigen_grasp:
+            return cfg.robot.arm_joint_count + cfg.robot.eigen_dim + cfg.robot.hand_joint_count
+        return cfg.robot.arm_joint_count + cfg.robot.hand_joint_count
+    raise ValueError(f"Unsupported robot.control_mode: {cfg.robot.control_mode}")
+
+
+def _contact_observation_dim(cfg) -> int:
+    layout = cfg.robot.contact_layout
+    if layout.contact_model == "parallel_jaw":
+        return 3 * len(layout.parallel_jaw_bodies)
+    if layout.contact_model == "dexterous":
+        fingertip_count = len(layout.thumb_bodies) + len(layout.finger_bodies)
+        link_2_count = sum(1 for bodies in layout.finger_bodies if len(bodies) > 1)
+        if cfg.robot.control_mode == "dexterous" and link_2_count == 0:
+            link_2_count = len(layout.finger_bodies)
+        return 3 * (fingertip_count + link_2_count)
+    raise ValueError(f"Unsupported contact_model: {layout.contact_model}")
 
 
 def obs_config_from_y2r() -> ObsConfig:
@@ -65,18 +91,22 @@ def obs_config_from_y2r() -> ObsConfig:
     object_pc_history = cfg.observations.history.object_pc
     window_size = cfg.trajectory.window_size
 
+    controlled_joint_dim = cfg.robot.arm_joint_count + cfg.robot.hand_joint_count
     return ObsConfig(
         num_points=cfg.observations.num_points,
         point_dim=(object_pc_history + window_size) * 3,
         object_pc_history=object_pc_history,
         poses_history=cfg.observations.history.poses,
         targets_history=cfg.observations.history.targets,
-        action_dim=cfg.robot.arm_joint_count + cfg.robot.hand_joint_count,  # 7 + 16 or eigen
+        action_dim=_policy_action_dim(cfg),
         action_history=cfg.observations.history.policy,
-        joint_pos_dim=cfg.robot.arm_joint_count + cfg.robot.hand_joint_count,
-        joint_vel_dim=cfg.robot.arm_joint_count + cfg.robot.hand_joint_count,
-        hand_tips_dim=65,  # 5 tips × 13 (pos+quat+linvel+angvel) - fixed
-        contact_dim=10,  # Approximate - fixed
+        joint_pos_dim=controlled_joint_dim,
+        joint_vel_dim=controlled_joint_dim,
+        joint_pos_targets_dim=controlled_joint_dim,
+        hand_eigen_dim=cfg.robot.eigen_dim if cfg.robot.control_mode == "dexterous" else 0,
+        hand_tips_dim=len(cfg.robot.tip_state_body_names) * 13,
+        contact_dim=_contact_observation_dim(cfg),
+        object_pose_palm_dim=7,
         proprio_history=cfg.observations.history.proprio,
         pose_dim=7,  # pos(3) + quat(4) - fixed
         window_size=window_size,
@@ -99,7 +129,15 @@ def compute_obs_layout(cfg: ObsConfig | None = None) -> dict:
     policy_size = cfg.action_dim * cfg.action_history
 
     # Proprio group (joint state, hand tips, contact) × history
-    proprio_per_step = cfg.joint_pos_dim + cfg.joint_vel_dim + cfg.hand_tips_dim + cfg.contact_dim
+    proprio_per_step = (
+        cfg.joint_pos_dim
+        + cfg.joint_vel_dim
+        + cfg.joint_pos_targets_dim
+        + cfg.hand_eigen_dim
+        + cfg.hand_tips_dim
+        + cfg.contact_dim
+        + cfg.object_pose_palm_dim
+    )
     proprio_size = proprio_per_step * cfg.proprio_history
 
     # Current PC group (object point cloud) × object_pc_history
@@ -252,4 +290,3 @@ def split_point_and_proprio_detailed(
     proprio_obs = torch.cat([policy, proprio, current_poses, target_poses, target_timing], dim=1)
 
     return point_obs, proprio_obs
-

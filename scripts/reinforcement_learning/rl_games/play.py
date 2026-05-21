@@ -278,11 +278,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         # Action term metadata
         action_term = unwrapped.action_manager._terms["action"]
-        rec_pca_matrix = action_term._pca_matrix.cpu().numpy()
-        rec_action_scale = float(action_term._scale) if isinstance(action_term._scale, float) else action_term._scale.cpu().numpy()
+        rec_control_mode = y2r_cfg.robot.control_mode
         rec_arm_dim = action_term._arm_dim
-        rec_eigen_dim = action_term._eigen_dim
-        rec_hand_dim = action_term._hand_dim
+        if rec_control_mode == "dexterous":
+            rec_pca_matrix = action_term._pca_matrix.cpu().numpy()
+            rec_action_scale = (
+                float(action_term._scale) if isinstance(action_term._scale, float) else action_term._scale.cpu().numpy()
+            )
+            rec_eigen_dim = action_term._eigen_dim
+            rec_hand_dim = action_term._hand_dim
+        elif rec_control_mode == "parallel_jaw":
+            rec_pca_matrix = np.empty((0, 1), dtype=np.float32)
+            rec_action_scale = np.array([action_term._arm_scale, action_term._gripper_scale], dtype=np.float32)
+            rec_eigen_dim = 0
+            rec_hand_dim = 1
+        else:
+            raise ValueError(f"Unsupported robot.control_mode for recording: {rec_control_mode}")
+        rec_action_dim = action_term.action_dim
 
         # Default joint positions
         rec_default_joint_pos = robot.data.default_joint_pos[0].cpu().numpy()
@@ -302,7 +314,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         print(f"[INFO] Recording enabled → {args_cli.record}")
         print(f"[INFO]   obs groups: {list(zip(obs_group_names, obs_group_sizes))}")
-        print(f"[INFO]   action_dim: {rec_arm_dim + rec_eigen_dim + rec_hand_dim}, action_scale: {rec_action_scale}")
+        print(f"[INFO]   action_dim: {rec_action_dim}, action_scale: {rec_action_scale}")
         print(f"[INFO]   control_hz: {rec_control_hz:.1f}")
 
     # reset environment (use enable_grad to allow tensor modifications)
@@ -399,7 +411,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     recorded_obs, recorded_actions, recorded_joint_pos,
                     rec_pca_matrix, rec_action_scale, rec_arm_dim, rec_eigen_dim, rec_hand_dim,
                     rec_default_joint_pos, rec_joint_names,
-                    obs_group_names, obs_group_sizes, rec_control_hz,
+                    obs_group_names, obs_group_sizes, rec_control_hz, rec_control_mode,
                     clip_actions,
                 )
                 break
@@ -550,7 +562,7 @@ def _save_recording(
     out_path, obs_list, actions_list, joint_pos_list,
     pca_matrix, action_scale, arm_dim, eigen_dim, hand_dim,
     default_joint_pos, joint_names,
-    obs_group_names, obs_group_sizes, control_hz,
+    obs_group_names, obs_group_sizes, control_hz, control_mode,
     clip_actions,
 ):
     """Save recorded episode data to npz."""
@@ -570,6 +582,7 @@ def _save_recording(
         "obs_group_names": np.array(obs_group_names),
         "obs_group_sizes": np.array(obs_group_sizes),
         "control_hz": np.array([control_hz]),
+        "control_mode": np.array([control_mode]),
         "clip_actions": np.array([clip_actions]),
     }
 

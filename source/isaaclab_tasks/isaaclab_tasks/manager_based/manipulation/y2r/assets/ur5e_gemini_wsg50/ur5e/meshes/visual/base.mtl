@@ -1,0 +1,14 @@
+# UR5e base materials (from official Universal Robots DAE)
+newmtl JointGrey.021
+Ka 0.25 0.25 0.25
+Kd 0.2784314 0.2784314 0.2784314
+Ks 0.03150501 0.03150501 0.03150501
+Ns 0
+d 1.0
+
+newmtl Black.023
+Ka 0.25 0.25 0.25
+Kd 0.03310248 0.03310248 0.03310248
+Ks 0.03150501 0.03150501 0.03150501
+Ns 0
+d 1.0

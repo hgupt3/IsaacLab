@@ -31,7 +31,7 @@ fi
 # Robot Selection
 # ==============================================================================
 # Default robot. Override per-invocation with --robot <alias>.
-# Available: ur5e_leap, kuka_allegro
+# Available: ur5e_leap, kuka_allegro, ur5e_gemini_wsg50
 # ==============================================================================
 ROBOT="${ROBOT:-ur5e_leap}"
 
@@ -78,20 +78,30 @@ parse_multi_gpu() {
 
 resolve_robot_task() {
     case "$1" in
-        ur5e_leap)    echo "Isaac-Trajectory-UR5e-Leap-v0" ;;
-        kuka_allegro) echo "Isaac-Trajectory-Kuka-Allegro-v0" ;;
+        ur5e_leap)          echo "Isaac-Trajectory-UR5e-Leap-v0" ;;
+        kuka_allegro)       echo "Isaac-Trajectory-Kuka-Allegro-v0" ;;
+        ur5e_gemini_wsg50)  echo "Isaac-Trajectory-UR5e-Gemini-WSG50-v0" ;;
         *)
             echo "Error: Unknown robot '$1'" >&2
-            echo "Available robots: ur5e_leap, kuka_allegro" >&2
+            echo "Available robots: ur5e_leap, kuka_allegro, ur5e_gemini_wsg50" >&2
             exit 1
             ;;
     esac
 }
 
+resolve_robot_log_suffix() {
+    case "$1" in
+        ur5e_gemini_wsg50) echo "_wsg50" ;;
+        *)                 echo "" ;;
+    esac
+}
+
 TASK=$(resolve_robot_task "$ROBOT")
+Y2R_LOG_SUFFIX=$(resolve_robot_log_suffix "$ROBOT")
 
 # Export robot selection for Python config loader
 export Y2R_ROBOT="$ROBOT"
+export Y2R_LOG_SUFFIX="$Y2R_LOG_SUFFIX"
 
 # ==============================================================================
 # Agent Configuration
@@ -125,7 +135,11 @@ resolve_agent_entry() {
 resolve_agent_log() {
     local alias="$1"
     local var="AGENT_${alias}_LOG"
-    echo "${!var}"
+    echo "${!var}${Y2R_LOG_SUFFIX}"
+}
+
+with_robot_log_suffix() {
+    echo "$1${Y2R_LOG_SUFFIX}"
 }
 
 # Find the latest checkpoint in a given log directory
@@ -152,10 +166,11 @@ require_file() {
 parse_agent_args() {
     CHECKPOINT=""
     AGENT_ENTRY=""
-    AGENT_LOG="trajectory"  # Default log directory
+    AGENT_LOG=$(with_robot_log_suffix "trajectory")  # Default log directory
     AGENT_ARGS=""
     PARSED_ARGS=0
     local do_continue=false
+    local selected_agent_alias=""
 
     # First pass: extract --agent, --robot, --multi_gpu
     local args=("$@")
@@ -163,10 +178,14 @@ parse_agent_args() {
         if [[ "${args[$i]}" == "--robot" ]]; then
             ROBOT="${args[$((i+1))]}"
             TASK=$(resolve_robot_task "$ROBOT")
+            Y2R_LOG_SUFFIX=$(resolve_robot_log_suffix "$ROBOT")
+            export Y2R_ROBOT="$ROBOT"
+            export Y2R_LOG_SUFFIX="$Y2R_LOG_SUFFIX"
         elif [[ "${args[$i]}" == "--multi_gpu" ]]; then
             parse_multi_gpu "${args[$((i+1))]}"
         elif [[ "${args[$i]}" == "--agent" ]]; then
             local alias="${args[$((i+1))]}"
+            selected_agent_alias="$alias"
             AGENT_ENTRY=$(resolve_agent_entry "$alias")
             AGENT_LOG=$(resolve_agent_log "$alias")
             if [ -z "$AGENT_ENTRY" ]; then
@@ -175,13 +194,19 @@ parse_agent_args() {
                 exit 1
             fi
             AGENT_ARGS="--agent $AGENT_ENTRY"
-            echo "========================================"
-            echo "Agent: $alias"
-            echo "  Entry point: $AGENT_ENTRY"
-            echo "  Log directory: $AGENT_LOG"
-            echo "========================================"
         fi
     done
+
+    if [ -n "$selected_agent_alias" ]; then
+        AGENT_LOG=$(resolve_agent_log "$selected_agent_alias")
+        echo "========================================"
+        echo "Agent: $selected_agent_alias"
+        echo "  Entry point: $AGENT_ENTRY"
+        echo "  Log directory: $AGENT_LOG"
+        echo "========================================"
+    else
+        AGENT_LOG=$(with_robot_log_suffix "trajectory")
+    fi
 
     # Second pass: parse arguments
     while [[ $# -gt 0 ]]; do

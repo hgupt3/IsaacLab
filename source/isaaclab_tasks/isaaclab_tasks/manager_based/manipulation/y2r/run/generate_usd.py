@@ -1,25 +1,16 @@
-"""Test URDF → USD conversion and inspect the UR5e + LEAP Hand robot.
+"""Generate/inspect a Y2R robot USD conversion with computed runtime frames."""
 
-Usage:
-    # Headless: print joint/body info only
-    python y2r_sim/run/generate_usd.py
+from __future__ import annotations
 
-    # Visual: open livestream viewer with debug axes
-    python y2r_sim/run/generate_usd.py --view
-
-Viewer legend (--view mode):
-    ur5e_link_6     — dim RGB axes (R=X, G=Y, B=Z)
-    palm_frame      — bright RGB axes (COMPUTED from ur5e_link_6 + offset)
-    camera_frame    — bright RGB axes, 8cm (COMPUTED from ur5e_link_6 + camera offset)
-    fingertips (4×) — small bright axes (COMPUTED from link_3 + offset)
-    pad normals     — yellow arrows on link_3 + link_2 (direction finger pad faces)
-"""
 import argparse
+import math
+import os
 
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser(description="Test UR5e + LEAP Hand URDF conversion.")
-parser.add_argument("--view", action="store_true", help="Open livestream viewer to visually inspect.")
+parser = argparse.ArgumentParser(description="Inspect Y2R robot URDF/USD conversion.")
+parser.add_argument("--robot", default=os.environ.get("Y2R_ROBOT", "ur5e_leap"), help="Robot config name.")
+parser.add_argument("--view", action="store_true", help="Open livestream viewer with debug axes.")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 
@@ -30,65 +21,76 @@ app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
 
 import torch
-import math
+
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
-from isaaclab.utils.math import combine_frame_transforms, quat_apply, quat_from_euler_xyz
-from isaaclab_assets.robots import UR5E_LEAP_CFG
+from isaaclab.utils.math import combine_frame_transforms, quat_apply, quat_from_euler_xyz, quat_mul
+from isaaclab_assets.robots import KUKA_ALLEGRO_CFG, UR5E_GEMINI_WSG50_CFG, UR5E_LEAP_CFG
 
-# =============================================================================
-# Offsets from URDF joint origins (virtual frames merged away by merge_fixed_joints)
-# All offsets are relative to ur5e_link_6 (palm_link is merged into it).
-# =============================================================================
+from isaaclab_tasks.manager_based.manipulation.y2r.config_loader import get_config
 
-# palm_frame offset: ur5e_link_6 → virtual palm frame
-# Computed: R_flange × old_palm_offset + p_palm_in_link6
-PALM_FRAME_OFFSET_POS = torch.tensor([-0.008, -0.0345, 0.11])
-PALM_FRAME_OFFSET_QUAT = quat_from_euler_xyz(
-    torch.tensor([0.0]),
-    torch.tensor([-math.pi / 2]),
-    torch.tensor([math.pi / 2]),
-).squeeze(0)  # (4,)
 
-# Camera offset: ur5e_link_6 → camera optical frame
-# Computed: R_flange × old_camera_offset + p_palm_in_link6
-# Rotation is Ry(180°): camera -Z (look) → +Z in link_6, +Y (up) → +Y in link_6
-CAMERA_OFFSET_POS = torch.tensor([0.009, -0.0705, -0.0274])
-CAMERA_OFFSET_QUAT = quat_from_euler_xyz(
-    torch.tensor([0.0]),
-    torch.tensor([math.pi]),
-    torch.tensor([0.0]),
-).squeeze(0)  # (4,)
-
-TIP_OFFSETS = {
-    "index_tip":  ("index_link_3",  torch.tensor([0.0, -0.048, 0.015])),
-    "middle_tip": ("middle_link_3", torch.tensor([0.0, -0.048, 0.015])),
-    "ring_tip":   ("ring_link_3",   torch.tensor([0.0, -0.048, 0.015])),
-    "thumb_tip":  ("thumb_link_3",  torch.tensor([0.0, -0.06, -0.015])),
+ROBOT_ASSETS = {
+    "ur5e_leap": UR5E_LEAP_CFG,
+    "kuka_allegro": KUKA_ALLEGRO_CFG,
+    "ur5e_gemini_wsg50": UR5E_GEMINI_WSG50_CFG,
 }
 
-# Body used for palm/camera frame computation (palm_link merged into this)
-PALM_BODY_NAME = "ur5e_link_6"
 
-# Create simulation
+def _quat_from_rpy_deg(rpy_deg) -> torch.Tensor:
+    roll, pitch, yaw = [math.radians(float(value)) for value in rpy_deg]
+    return quat_from_euler_xyz(torch.tensor([roll]), torch.tensor([pitch]), torch.tensor([yaw])).squeeze(0)
+
+
+def _camera_quat_from_config_rpy(rpy_deg) -> torch.Tensor:
+    swapped = (float(rpy_deg[0]), float(rpy_deg[2]), -float(rpy_deg[1]))
+    return _quat_from_rpy_deg(swapped)
+
+
+def _quat_apply_single(quat: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
+    return quat_apply(quat.unsqueeze(0), vec.unsqueeze(0)).squeeze(0)
+
+
+def _find_body(robot: Articulation, name: str):
+    ids = robot.find_bodies(name)[0]
+    return ids[0] if len(ids) > 0 else None
+
+
+def _draw_axes(draw, starts, ends, colors, sizes, pos, quat, axis_len, line_width, dim=False):
+    brightness = 0.45 if dim else 1.0
+    alpha = 0.65 if dim else 1.0
+    axes = [
+        (torch.tensor([1.0, 0.0, 0.0]), (brightness, 0.0, 0.0, alpha)),
+        (torch.tensor([0.0, 1.0, 0.0]), (0.0, brightness, 0.0, alpha)),
+        (torch.tensor([0.0, 0.0, 1.0]), (0.0, 0.0, brightness, alpha)),
+    ]
+    for axis, color in axes:
+        end = pos + _quat_apply_single(quat, axis.to(pos.device)) * axis_len
+        starts.append(pos.tolist())
+        ends.append(end.tolist())
+        colors.append(color)
+        sizes.append(line_width)
+
+
+if args.robot not in ROBOT_ASSETS:
+    raise ValueError(f"Unknown robot '{args.robot}'. Available: {sorted(ROBOT_ASSETS)}")
+
+y2r_cfg = get_config(mode="play", task="base", robot=args.robot)
+
 sim_cfg = sim_utils.SimulationCfg(dt=1 / 120.0, device="cpu")
 sim = sim_utils.SimulationContext(sim_cfg)
 sim.set_camera_view(eye=(1.5, 1.5, 1.0), target=(0.0, 0.0, 0.3))
 
-# Spawn the robot
-robot_cfg = UR5E_LEAP_CFG.replace(prim_path="/World/Robot")
+robot_cfg = ROBOT_ASSETS[args.robot].replace(prim_path="/World/Robot")
 robot = Articulation(robot_cfg)
 
-# Initialize physics
 sim.reset()
-
-# Apply initial joint positions
 robot.reset()
+robot.update(sim.cfg.dt)
 
-print("\n" + "=" * 60)
-print("UR5e + LEAP Hand — URDF Conversion Report")
-print("=" * 60)
-
+print("\n" + "=" * 72)
+print(f"{args.robot} USD Conversion Report")
+print("=" * 72)
 print(f"\nNumber of joints:  {robot.num_joints}")
 print(f"Number of bodies:  {robot.num_bodies}")
 
@@ -100,162 +102,94 @@ print("\n--- Body names ---")
 for i, name in enumerate(robot.body_names):
     print(f"  [{i:2d}] {name}")
 
-print("\n--- Joint limits (degrees) ---")
+print("\n--- Joint limits ---")
 limits = robot.root_physx_view.get_dof_limits().squeeze(0)
 for i, name in enumerate(robot.joint_names):
-    lo = torch.rad2deg(limits[i, 0]).item()
-    hi = torch.rad2deg(limits[i, 1]).item()
-    print(f"  {name:25s}  [{lo:8.2f}, {hi:8.2f}]")
+    lo = limits[i, 0].item()
+    hi = limits[i, 1].item()
+    print(f"  {name:28s} [{lo:+.5f}, {hi:+.5f}]")
 
-print("\n--- Initial joint positions (degrees) ---")
-pos = robot.data.joint_pos.squeeze(0)
-for i, name in enumerate(robot.joint_names):
-    deg = torch.rad2deg(pos[i]).item()
-    print(f"  {name:25s}  {deg:8.2f}")
+palm_body_idx = _find_body(robot, y2r_cfg.robot.palm_body_name)
+if palm_body_idx is None:
+    raise RuntimeError(f"Palm body not found: {y2r_cfg.robot.palm_body_name}")
 
-print("\n--- USD Prim Hierarchy ---")
-stage = sim.stage
-root_prim = stage.GetPrimAtPath("/World/Robot")
-def print_tree(prim, indent=0):
-    typ = prim.GetTypeName()
-    if typ in ("Xform", ""):
-        print(f"  {'  ' * indent}{prim.GetName()}  -> {prim.GetPath()}")
-        for child in prim.GetChildren():
-            print_tree(child, indent + 1)
-print_tree(root_prim)
-
-# =============================================================================
-# Frame poses — print world poses for key frames
-# =============================================================================
-
-# Helper: look up a body by name, returns (index, found) — safe for optional bodies
-def find_body(name):
-    ids = robot.find_bodies(name)[0]
-    if len(ids) == 0:
-        return None
-    return ids[0]
-
-robot.update(sim.cfg.dt)
-
-# Unit vectors for axis computation
-X_AXIS = torch.tensor([1.0, 0.0, 0.0])
-Y_AXIS = torch.tensor([0.0, 1.0, 0.0])
-Z_AXIS = torch.tensor([0.0, 0.0, 1.0])
-
-def quat_apply_single(quat, vec):
-    """Apply quaternion rotation to a single vector."""
-    return quat_apply(quat.unsqueeze(0), vec.unsqueeze(0)).squeeze(0)
-
-
-# --- Real body: ur5e_link_6 (palm_link merged into this) ---
-palm_body_idx = find_body(PALM_BODY_NAME)
-
-print("\n--- Frame poses (world) ---")
-
-if palm_body_idx is not None:
-    palm_pos = robot.data.body_pos_w[0, palm_body_idx]
-    palm_quat = robot.data.body_quat_w[0, palm_body_idx]
-    print(f"\n  {PALM_BODY_NAME} (real body — palm_link merged here):")
-    print(f"    pos:  ({palm_pos[0]:.5f}, {palm_pos[1]:.5f}, {palm_pos[2]:.5f})")
-    print(f"    quat: ({palm_quat[0]:.5f}, {palm_quat[1]:.5f}, {palm_quat[2]:.5f}, {palm_quat[3]:.5f})  [wxyz]")
-
-    # Compute palm_frame from offset
-    pf_pos, pf_quat = combine_frame_transforms(
-        palm_pos.unsqueeze(0), palm_quat.unsqueeze(0),
-        PALM_FRAME_OFFSET_POS.unsqueeze(0), PALM_FRAME_OFFSET_QUAT.unsqueeze(0),
-    )
-    pf_pos = pf_pos.squeeze(0)
-    pf_quat = pf_quat.squeeze(0)
-    print(f"\n  palm_frame (COMPUTED from {PALM_BODY_NAME} + palm offset):")
-    print(f"    pos:  ({pf_pos[0]:.5f}, {pf_pos[1]:.5f}, {pf_pos[2]:.5f})")
-    print(f"    quat: ({pf_quat[0]:.5f}, {pf_quat[1]:.5f}, {pf_quat[2]:.5f}, {pf_quat[3]:.5f})  [wxyz]")
-
-    # Compute camera_frame from offset
-    cf_pos, cf_quat = combine_frame_transforms(
-        palm_pos.unsqueeze(0), palm_quat.unsqueeze(0),
-        CAMERA_OFFSET_POS.unsqueeze(0), CAMERA_OFFSET_QUAT.unsqueeze(0),
-    )
-    cf_pos = cf_pos.squeeze(0)
-    cf_quat = cf_quat.squeeze(0)
-    print(f"\n  camera_frame (COMPUTED from {PALM_BODY_NAME} + camera offset):")
-    print(f"    pos:  ({cf_pos[0]:.5f}, {cf_pos[1]:.5f}, {cf_pos[2]:.5f})")
-    print(f"    quat: ({cf_quat[0]:.5f}, {cf_quat[1]:.5f}, {cf_quat[2]:.5f}, {cf_quat[3]:.5f})  [wxyz]")
+palm_body_pos = robot.data.body_pos_w[0, palm_body_idx]
+palm_body_quat = robot.data.body_quat_w[0, palm_body_idx]
+palm_offset = y2r_cfg.robot.palm_frame_offset
+if palm_offset is None:
+    palm_frame_pos = palm_body_pos
+    palm_frame_quat = palm_body_quat
 else:
-    pf_pos = pf_quat = cf_pos = cf_quat = None
-    print(f"\n  {PALM_BODY_NAME}: NOT FOUND")
+    palm_frame_pos, palm_frame_quat = combine_frame_transforms(
+        palm_body_pos.unsqueeze(0),
+        palm_body_quat.unsqueeze(0),
+        torch.tensor(palm_offset.pos, dtype=torch.float32).unsqueeze(0),
+        _quat_from_rpy_deg(palm_offset.rot_euler).unsqueeze(0),
+    )
+    palm_frame_pos = palm_frame_pos.squeeze(0)
+    palm_frame_quat = palm_frame_quat.squeeze(0)
 
-# --- Computed tip positions ---
-tip_poses = {}
-for tip_name, (parent_name, offset) in TIP_OFFSETS.items():
-    parent_idx = find_body(parent_name)
-    if parent_idx is not None:
-        parent_pos = robot.data.body_pos_w[0, parent_idx]
-        parent_quat = robot.data.body_quat_w[0, parent_idx]
-        tip_pos = parent_pos + quat_apply_single(parent_quat, offset)
-        tip_poses[tip_name] = (tip_pos, parent_quat, parent_idx)
-        print(f"\n  {tip_name} (COMPUTED from {parent_name} + offset):")
-        print(f"    pos:  ({tip_pos[0]:.5f}, {tip_pos[1]:.5f}, {tip_pos[2]:.5f})")
-    else:
-        print(f"\n  {tip_name}: parent {parent_name} NOT FOUND")
+camera_offset = y2r_cfg.wrist_camera.offset
+camera_pos, camera_quat = combine_frame_transforms(
+    palm_body_pos.unsqueeze(0),
+    palm_body_quat.unsqueeze(0),
+    torch.tensor(camera_offset.pos, dtype=torch.float32).unsqueeze(0),
+    _camera_quat_from_config_rpy(camera_offset.rot).unsqueeze(0),
+)
+camera_pos = camera_pos.squeeze(0)
+camera_quat = camera_quat.squeeze(0)
 
-print("\n" + "=" * 60)
-print("Conversion successful!")
-print("=" * 60)
+print("\n--- Computed runtime frames ---")
+print(f"  palm parent body: {y2r_cfg.robot.palm_body_name}")
+print(f"  palm_frame pos:   ({palm_frame_pos[0]:+.5f}, {palm_frame_pos[1]:+.5f}, {palm_frame_pos[2]:+.5f})")
+print(f"  palm_frame quat:  ({palm_frame_quat[0]:+.5f}, {palm_frame_quat[1]:+.5f}, {palm_frame_quat[2]:+.5f}, {palm_frame_quat[3]:+.5f})")
+print(f"  camera pos:       ({camera_pos[0]:+.5f}, {camera_pos[1]:+.5f}, {camera_pos[2]:+.5f})")
+print(f"  camera quat:      ({camera_quat[0]:+.5f}, {camera_quat[1]:+.5f}, {camera_quat[2]:+.5f}, {camera_quat[3]:+.5f})")
 
-# =============================================================================
-# Visual debug draw (--view mode)
-# =============================================================================
+tip_poses = []
+print("\n--- Tip/contact frames ---")
+for body_name in y2r_cfg.robot.tip_state_body_names:
+    body_idx = _find_body(robot, body_name)
+    if body_idx is None:
+        print(f"  {body_name}: NOT FOUND")
+        continue
+    body_pos = robot.data.body_pos_w[0, body_idx]
+    body_quat = robot.data.body_quat_w[0, body_idx]
+    offset = torch.tensor(y2r_cfg.robot.tip_state_offsets[body_name], dtype=torch.float32)
+    rot_offset = _quat_from_rpy_deg(y2r_cfg.robot.tip_state_rot_euler[body_name])
+    tip_pos = body_pos + _quat_apply_single(body_quat, offset)
+    tip_quat = quat_mul(body_quat.unsqueeze(0), rot_offset.unsqueeze(0)).squeeze(0)
+    tip_poses.append((body_name, body_idx, tip_pos, tip_quat))
+    print(f"  {body_name:26s} offset=({offset[0]:+.5f}, {offset[1]:+.5f}, {offset[2]:+.5f}) "
+          f"rot=({y2r_cfg.robot.tip_state_rot_euler[body_name][0]:+.2f}, "
+          f"{y2r_cfg.robot.tip_state_rot_euler[body_name][1]:+.2f}, "
+          f"{y2r_cfg.robot.tip_state_rot_euler[body_name][2]:+.2f}) "
+          f"tip=({tip_pos[0]:+.5f}, {tip_pos[1]:+.5f}, {tip_pos[2]:+.5f})")
+
+print("\n--- Contact pad normals ---")
+for body_name, normal in y2r_cfg.robot.contact_layout.pad_normals.items():
+    print(f"  {body_name:26s} normal=({normal[0]:+.4f}, {normal[1]:+.4f}, {normal[2]:+.4f})")
+
+print("\n" + "=" * 72)
+print("Conversion report complete.")
+print("=" * 72)
 
 if args.view:
-    # Initialize debug draw
     debug_draw = None
     try:
         import isaacsim.util.debug_draw._debug_draw as omni_debug_draw
+        debug_draw = omni_debug_draw.acquire_debug_draw_interface()
     except ModuleNotFoundError:
         try:
             from omni.isaac.debug_draw import _debug_draw as omni_debug_draw
+            debug_draw = omni_debug_draw.acquire_debug_draw_interface()
         except ModuleNotFoundError:
             from omni.debugdraw import get_debug_draw_interface
             debug_draw = get_debug_draw_interface()
-            omni_debug_draw = None
-    if omni_debug_draw is not None:
-        debug_draw = omni_debug_draw.acquire_debug_draw_interface()
-
-    # -- Drawing config --
-    FRAME_AXIS_LEN = 0.12  # 12cm
-    TIP_AXIS_LEN = 0.04    # 4cm for fingertips
-    CAM_AXIS_LEN = 0.08    # 8cm for camera
 
     print("\nViewer running at http://localhost:8211")
-    print("Frame axes:")
-    print(f"  {PALM_BODY_NAME:15s} = dim   RGB  (R=X, G=Y, B=Z)")
-    print("  palm_frame      = bright RGB  (COMPUTED from ur5e_link_6 + palm offset)")
-    print("  camera_frame    = bright RGB  (COMPUTED from ur5e_link_6 + camera offset, 8cm axes)")
-    print("  fingertips (4×) = small bright axes (COMPUTED from link_3 + offset)")
-    print("  pad normals     = YELLOW arrows on link_3 + link_2 (direction finger pad faces)")
+    print("RGB axes: dim parent body, bright palm/camera/tips. Yellow lines are pad normals.")
     print("Press Ctrl+C to exit.\n")
-
-    def draw_axes_at(pos, quat, axis_len, line_width, dim=False, color_override=None):
-        """Append RGB axis lines at a given pose to the draw lists."""
-        brightness = 0.5 if dim else 1.0
-        alpha = 0.7 if dim else 1.0
-        if color_override is not None:
-            # Use same color for all 3 axes
-            for axis in [X_AXIS, Y_AXIS, Z_AXIS]:
-                end = pos + quat_apply_single(quat, axis) * axis_len
-                starts.append(pos.tolist())
-                ends.append(end.tolist())
-                colors.append((*color_override, alpha))
-                sizes.append(line_width)
-        else:
-            for axis, rgb in [(X_AXIS, (brightness, 0.0, 0.0)),
-                              (Y_AXIS, (0.0, brightness, 0.0)),
-                              (Z_AXIS, (0.0, 0.0, brightness))]:
-                end = pos + quat_apply_single(quat, axis) * axis_len
-                starts.append(pos.tolist())
-                ends.append(end.tolist())
-                colors.append((*rgb, alpha))
-                sizes.append(line_width)
 
     while simulation_app.is_running():
         sim.step()
@@ -263,65 +197,61 @@ if args.view:
 
         if debug_draw is not None:
             debug_draw.clear_lines()
-            starts = []
-            ends = []
-            colors = []
-            sizes = []
+            starts, ends, colors, sizes = [], [], [], []
 
-            # ur5e_link_6 (dim RGB axes)
-            if palm_body_idx is not None:
-                pl_pos = robot.data.body_pos_w[0, palm_body_idx]
-                pl_quat = robot.data.body_quat_w[0, palm_body_idx]
-                draw_axes_at(pl_pos, pl_quat, FRAME_AXIS_LEN, 3.0, dim=True)
+            palm_body_pos = robot.data.body_pos_w[0, palm_body_idx]
+            palm_body_quat = robot.data.body_quat_w[0, palm_body_idx]
+            _draw_axes(debug_draw, starts, ends, colors, sizes, palm_body_pos, palm_body_quat, 0.12, 3.0, dim=True)
 
-                # palm_frame (bright RGB axes, computed from ur5e_link_6 + palm offset)
-                pf_p, pf_q = combine_frame_transforms(
-                    pl_pos.unsqueeze(0), pl_quat.unsqueeze(0),
-                    PALM_FRAME_OFFSET_POS.unsqueeze(0), PALM_FRAME_OFFSET_QUAT.unsqueeze(0),
+            if palm_offset is None:
+                pf_pos, pf_quat = palm_body_pos, palm_body_quat
+            else:
+                pf_pos, pf_quat = combine_frame_transforms(
+                    palm_body_pos.unsqueeze(0),
+                    palm_body_quat.unsqueeze(0),
+                    torch.tensor(palm_offset.pos, dtype=torch.float32).unsqueeze(0),
+                    _quat_from_rpy_deg(palm_offset.rot_euler).unsqueeze(0),
                 )
-                draw_axes_at(pf_p.squeeze(0), pf_q.squeeze(0), FRAME_AXIS_LEN, 5.0, dim=False)
+                pf_pos, pf_quat = pf_pos.squeeze(0), pf_quat.squeeze(0)
+            _draw_axes(debug_draw, starts, ends, colors, sizes, pf_pos, pf_quat, 0.12, 5.0)
 
-                # camera_frame (RGB axes, computed from ur5e_link_6 + camera offset)
-                cf_p, cf_q = combine_frame_transforms(
-                    pl_pos.unsqueeze(0), pl_quat.unsqueeze(0),
-                    CAMERA_OFFSET_POS.unsqueeze(0), CAMERA_OFFSET_QUAT.unsqueeze(0),
-                )
-                draw_axes_at(cf_p.squeeze(0), cf_q.squeeze(0), CAM_AXIS_LEN, 4.0, dim=False)
+            cf_pos, cf_quat = combine_frame_transforms(
+                palm_body_pos.unsqueeze(0),
+                palm_body_quat.unsqueeze(0),
+                torch.tensor(camera_offset.pos, dtype=torch.float32).unsqueeze(0),
+                _camera_quat_from_config_rpy(camera_offset.rot).unsqueeze(0),
+            )
+            _draw_axes(debug_draw, starts, ends, colors, sizes, cf_pos.squeeze(0), cf_quat.squeeze(0), 0.08, 4.0)
 
-            # Fingertips (small bright axes, computed from link_3 + offset)
-            for tip_name, (parent_name, offset) in TIP_OFFSETS.items():
-                parent_idx = find_body(parent_name)
-                if parent_idx is not None:
-                    p_pos = robot.data.body_pos_w[0, parent_idx]
-                    p_quat = robot.data.body_quat_w[0, parent_idx]
-                    t_pos = p_pos + quat_apply_single(p_quat, offset)
-                    draw_axes_at(t_pos, p_quat, TIP_AXIS_LEN, 3.0, dim=False)
+            for body_name in y2r_cfg.robot.tip_state_body_names:
+                body_idx = _find_body(robot, body_name)
+                if body_idx is None:
+                    continue
+                body_pos = robot.data.body_pos_w[0, body_idx]
+                body_quat = robot.data.body_quat_w[0, body_idx]
+                offset = torch.tensor(y2r_cfg.robot.tip_state_offsets[body_name], dtype=torch.float32)
+                rot_offset = _quat_from_rpy_deg(y2r_cfg.robot.tip_state_rot_euler[body_name])
+                tip_pos = body_pos + _quat_apply_single(body_quat, offset)
+                tip_quat = quat_mul(body_quat.unsqueeze(0), rot_offset.unsqueeze(0)).squeeze(0)
+                _draw_axes(debug_draw, starts, ends, colors, sizes, tip_pos, tip_quat, 0.04, 3.0)
 
-            # Pad-normal arrows on link_3 and link_2 bodies
-            # From URDF analysis: pad faces local -X for all links,
-            # EXCEPT thumb_link_2 where 180° yaw in thumb_joint_3 flips it to +X.
-            PAD_NORMAL_LINKS = {
-                "index_link_3":  torch.tensor([-1.0, 0.0, 0.0]),
-                "index_link_2":  torch.tensor([-1.0, 0.0, 0.0]),
-                "middle_link_3": torch.tensor([-1.0, 0.0, 0.0]),
-                "middle_link_2": torch.tensor([-1.0, 0.0, 0.0]),
-                "ring_link_3":   torch.tensor([-1.0, 0.0, 0.0]),
-                "ring_link_2":   torch.tensor([-1.0, 0.0, 0.0]),
-                "thumb_link_3":  torch.tensor([-1.0, 0.0, 0.0]),
-                "thumb_link_2":  torch.tensor([1.0, 0.0, 0.0]),
-            }
-            PAD_ARROW_LEN = 0.04  # 4cm
-            for link_name, pad_dir_local in PAD_NORMAL_LINKS.items():
-                link_idx = find_body(link_name)
-                if link_idx is not None:
-                    l_pos = robot.data.body_pos_w[0, link_idx]
-                    l_quat = robot.data.body_quat_w[0, link_idx]
-                    pad_dir_w = quat_apply_single(l_quat, pad_dir_local)
-                    end = l_pos + pad_dir_w * PAD_ARROW_LEN
-                    starts.append(l_pos.tolist())
-                    ends.append(end.tolist())
-                    colors.append((1.0, 1.0, 0.0, 1.0))  # Yellow arrow = pad normal
-                    sizes.append(5.0)
+            for body_name, normal in y2r_cfg.robot.contact_layout.pad_normals.items():
+                body_idx = _find_body(robot, body_name)
+                if body_idx is None:
+                    continue
+                body_pos = robot.data.body_pos_w[0, body_idx]
+                body_quat = robot.data.body_quat_w[0, body_idx]
+                if body_name in y2r_cfg.robot.tip_state_offsets:
+                    offset = torch.tensor(y2r_cfg.robot.tip_state_offsets[body_name], dtype=torch.float32)
+                    origin = body_pos + _quat_apply_single(body_quat, offset)
+                else:
+                    origin = body_pos
+                normal_w = _quat_apply_single(body_quat, torch.tensor(normal, dtype=torch.float32))
+                end = origin + normal_w * 0.05
+                starts.append(origin.tolist())
+                ends.append(end.tolist())
+                colors.append((1.0, 1.0, 0.0, 1.0))
+                sizes.append(5.0)
 
             debug_draw.draw_lines(starts, ends, colors, sizes)
 else:

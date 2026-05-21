@@ -2,16 +2,38 @@
 # All robot-specific parameters: kinematics, cameras, hand defaults
 robot:
   action_scale: 0.1
+  gripper_action_scale: null
+  control_mode: dexterous
   arm_joint_count: 6
   hand_joint_count: 16
   eigen_dim: 5                  # PCA dimensions for eigen grasp
   use_target_tracking: true     # delta-from-target + EMA (SimToolReal-style)
   ema_alpha_arm: 0.10           # EMA blend factor for arm joints (lower = smoother) — tightened for RL finetune
   ema_alpha_hand: 0.20          # EMA blend factor for hand joints — tightened for RL finetune (was 0.75)
+  arm_joint_names: ["ur5e_joint_1", "ur5e_joint_2", "ur5e_joint_3", "ur5e_joint_4", "ur5e_joint_5", "ur5e_joint_6"]
+  hand_joint_names:
+    ["index_joint_0", "index_joint_1", "index_joint_2", "index_joint_3",
+     "middle_joint_0", "middle_joint_1", "middle_joint_2", "middle_joint_3",
+     "ring_joint_0", "ring_joint_1", "ring_joint_2", "ring_joint_3",
+     "thumb_joint_0", "thumb_joint_1", "thumb_joint_2", "thumb_joint_3"]
+  tip_state_body_names: ["ur5e_link_6", "index_link_3", "middle_link_3", "ring_link_3", "thumb_link_3"]
+  tip_state_offsets:
+    ur5e_link_6: [0.0, 0.0, 0.0]
+    index_link_3: [0.0, -0.048, 0.015]
+    middle_link_3: [0.0, -0.048, 0.015]
+    ring_link_3: [0.0, -0.048, 0.015]
+    thumb_link_3: [0.0, -0.06, -0.015]
+  tip_state_rot_euler:
+    ur5e_link_6: [0.0, 0.0, 0.0]
+    index_link_3: [0.0, 0.0, 0.0]
+    middle_link_3: [0.0, 0.0, 0.0]
+    ring_link_3: [0.0, 0.0, 0.0]
+    thumb_link_3: [0.0, 0.0, 0.0]
   palm_body_name: "ur5e_link_6"  # Body used for palm pose tracking (palm_link merged into link_6)
   wrist_joint_name: "ur5e_joint_6"         # Wrist joint (separate randomization range)
   arm_joint_regex: "ur5e_joint_.*"         # Regex matching all arm joints (including wrist)
   hand_body_regex: "(ur5e_link_6|.*_link_[0-3]|.*_tip)"  # Hand bodies for table penetration check
+  calibration_path: null
   palm_frame_offset:            # Offset from palm_body_name to virtual palm_frame (null = no offset)
     pos: [-0.008, -0.0345, 0.11]
     rot_euler: [0.0, -90.0, 90.0]  # Euler XYZ degrees
@@ -25,12 +47,14 @@ robot:
   # reward computation in mdp/rewards.py. Single source of truth for this robot.
   contact_layout:
     sensor_prim_prefix: ""           # LEAP hand bodies live directly under /Robot/
+    contact_model: dexterous
     # Tier 1: per-finger contact. Thumb gates; index/middle/ring sorted+weighted.
     thumb_bodies: ["thumb_link_3"]
     finger_bodies:
       - ["index_link_3",  "index_link_2"]
       - ["middle_link_3", "middle_link_2"]
       - ["ring_link_3",   "ring_link_2"]
+    parallel_jaw_bodies: []
     # Tier 2: flat capped bonus from proximal phalanges + palm (non-fingertip strategies).
     # palm_link itself is not sensable — the fixed hand_base_joint causes URDF→USD
     # (merge_fixed_joints=True) to weld palm_link's collision boxes into ur5e_link_6.
@@ -74,4 +98,3 @@ rewards:
   finger_regularizer:
     params:
       default_joints: [0.0, 0.3, 0.3, 0.3, 0.0, 0.3, 0.3, 0.3, 0.0, 0.3, 0.3, 0.3, 1.6, 0.0, 0.2, 0.2]
-

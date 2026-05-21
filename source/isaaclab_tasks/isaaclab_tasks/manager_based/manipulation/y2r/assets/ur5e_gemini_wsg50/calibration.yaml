@@ -1,0 +1,143 @@
+editor:
+  host: 0.0.0.0
+  port: 8765
+model:
+  generated_urdf: ur5e_gemini_wsg50.urdf
+  source_urdf: ../ur5e_leap/ur5e_leap_right_gemini305.urdf
+default_pose:
+  arm_joints_deg:
+    ur5e_joint_1: 90
+    ur5e_joint_2: -70
+    ur5e_joint_3: 80
+    ur5e_joint_4: -10
+    ur5e_joint_5: 90
+    ur5e_joint_6: 0
+  wsg_opening_m: 0.11
+contact_markers:
+  pad_normals:
+    soft_finger_left_link:
+      origin_link: left_tip
+      normal: [-0.6, 0, 0]
+    soft_finger_right_link:
+      origin_link: right_tip
+      normal: [1, 0, 0]
+arm_collision_primitives:
+  ur5e_link_2:
+  - type: cylinder
+    xyz: [-0.212, 0, 0.135]
+    rpy_deg: [0, 90, 0]
+    radius: 0.055
+    length: 0.45
+  ur5e_link_3:
+  - type: cylinder
+    xyz: [-0.186, 0, 0.006]
+    rpy_deg: [0, 90, 0]
+    radius: 0.045
+    length: 0.39
+  ur5e_link_4:
+  - type: cylinder
+    xyz: [0, 0, -0.048]
+    rpy_deg: [0, 0, 0]
+    radius: 0.04
+    length: 0.08
+  ur5e_link_5:
+  - type: cylinder
+    xyz: [0, 0, -0.044]
+    rpy_deg: [0, 0, 0]
+    radius: 0.04
+    length: 0.07
+  ur5e_link_6:
+  - type: cylinder
+    xyz: [0, 0, -0.023]
+    rpy_deg: [0, 0, 0]
+    radius: 0.035
+    length: 0.04
+collision_primitives:
+  wsg_mount_link: []
+  wsg_base_link:
+  - type: box
+    xyz: [0, 0, 0.0363]
+    rpy_deg: [0, 0, 0]
+    size: [0.146, 0.05, 0.073]
+  wsg_left_slider_link: []
+  wsg_right_slider_link: []
+  soft_finger_left_link:
+  - type: box
+    xyz: [0.0165, -0.016, 0.0129]
+    rpy_deg: [0, 0, 0]
+    size: [0.033, 0.032, 0.026]
+  - type: box
+    xyz: [0.01575, -0.043, 0.0129]
+    rpy_deg: [0, 0, 0]
+    size: [0.0315, 0.032, 0.026]
+  - type: box
+    xyz: [0.012375, -0.069, 0.0129]
+    rpy_deg: [0, 0, 0]
+    size: [0.02475, 0.032, 0.026]
+  - type: box
+    xyz: [0.006, -0.093, 0.0129]
+    rpy_deg: [0, 0, 0]
+    size: [0.012, 0.032, 0.026]
+  - type: box
+    xyz: [0.0025, -0.113, 0.0129]
+    rpy_deg: [0, 0, 0]
+    size: [0.005, 0.02, 0.026]
+  soft_finger_right_link:
+  - type: box
+    xyz: [-0.0165, -0.016, 0.0129]
+    rpy_deg: [0, 0, 0]
+    size: [0.033, 0.032, 0.026]
+  - type: box
+    xyz: [-0.01575, -0.043, 0.0129]
+    rpy_deg: [0, 0, 0]
+    size: [0.0315, 0.032, 0.026]
+  - type: box
+    xyz: [-0.012375, -0.069, 0.0129]
+    rpy_deg: [0, 0, 0]
+    size: [0.02475, 0.032, 0.026]
+  - type: box
+    xyz: [-0.006, -0.093, 0.0129]
+    rpy_deg: [0, 0, 0]
+    size: [0.012, 0.032, 0.026]
+  - type: box
+    xyz: [-0.0025, -0.113, 0.0129]
+    rpy_deg: [0, 0, 0]
+    size: [0.005, 0.02, 0.026]
+  gemini_mount_link:
+  - type: box
+    xyz: [0.0058, 0.0704, 0.0055]
+    rpy_deg: [0, 0, 0]
+    size: [0.053, 0.075, 0.021]
+  gemini_305_link:
+  - type: box
+    xyz: [0, 0, 0]
+    rpy_deg: [0, 0, 0]
+    size: [0.042, 0.042, 0.025]
+transforms:
+  ee_to_wsg_mount:
+    xyz: [0.01, 0, 0]
+    rpy_deg: [-90, 180, -90]
+  wsg_mount_to_wsg_base:
+    xyz: [0, 0, 0]
+    rpy_deg: [0, 0, 0]
+  wsg_base_to_camera_mount:
+    xyz: [0, 0.0025, 0.0235]
+    rpy_deg: [180, 0, 180]
+  camera_mount_to_gemini:
+    xyz: [0, 0.085, -0.0085]
+    rpy_deg: [-165, 0, 180]
+  left_slider_to_soft_finger:
+    xyz: [0, 0.013, 0.098]
+    rpy_deg: [-90, 0, -180]
+  right_slider_to_soft_finger:
+    xyz: [0, 0.013, 0.098]
+    rpy_deg: [-90, 0, -180]
+  left_soft_finger_to_tip:
+    xyz: [0.0005, -0.1085, 0.0129]
+    rpy_deg: [180, 180, 180]
+  right_soft_finger_to_tip:
+    xyz: [-0.0005, -0.1085, 0.0129]
+    rpy_deg: [0, 0, 180]
+  wsg_base_to_palm_frame:
+    xyz: [0, 0, 0.146]
+    rpy_deg: [0, 0, 0]

@@ -106,6 +106,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Force single environment for keyboard control
     env_cfg.scene.num_envs = 1
     env_cfg.sim.device = args_cli.device if args_cli.device else "cuda:0"
+    is_parallel_jaw = env_cfg.y2r_cfg.robot.control_mode == "parallel_jaw"
 
     # Inject wrist depth camera if --depth requested
     wrist_camera_enabled = args_cli.depth
@@ -157,7 +158,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print(f"  weight  : {fr_weight}")
     print(f"  std     : {fr_std} rad")
     print(f"  phases  : {fr_phases}")
-    print(f"  default_joints (16):")
+    print(f"  default_joints ({len(fr_default_joints)}):")
     for i, val in enumerate(fr_default_joints):
         print(f"    [{i:2d}] {val:+.4f} rad ({val * 57.2958:+7.2f} deg)")
     print("=" * 80 + "\n")
@@ -182,14 +183,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     for i, name in enumerate(physx_joint_names):
         print(f"  [{i:2d}] {name}")
 
-    # Detect arm type from joint names
-    if any("ur5e" in name for name in physx_joint_names):
-        arm_joint_names = [f"ur5e_joint_{i+1}" for i in range(6)]
-        arm_type = "ur5e"
-    else:
-        arm_joint_names = [f"iiwa7_joint_{i+1}" for i in range(7)]
-        arm_type = "kuka"
-    print(f"\n[Detected arm: {arm_type}] {len(arm_joint_names)} arm joints")
+    arm_joint_names = list(unwrapped_env.cfg.y2r_cfg.robot.arm_joint_names)
+    arm_type = "ur5e" if any("ur5e" in name for name in arm_joint_names) else "kuka"
+    print(f"\n[Configured arm: {arm_type}] {len(arm_joint_names)} arm joints")
 
     arm_joint_ids, _ = robot.find_joints(arm_joint_names, preserve_order=True)
     arm_joint_ids = list(arm_joint_ids)
@@ -198,16 +194,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     for i, (name, physx_idx) in enumerate(zip(arm_joint_names, arm_joint_ids)):
         print(f"  Expected[{i}] {name:20s} -> PhysX index {physx_idx}")
     
-    # Find hand joint IDs (16 joints for Allegro)
-    hand_joint_names = ALLEGRO_HAND_JOINT_NAMES.copy()
+    hand_joint_names = list(unwrapped_env.cfg.y2r_cfg.robot.hand_joint_names)
     hand_joint_ids, _ = robot.find_joints(hand_joint_names, preserve_order=True)
     hand_joint_ids = list(hand_joint_ids)
     
-    print(f"\n[Hand Joint Mapping] (preserve_order=True)")
+    print(f"\n[Hand/Gripper Joint Mapping] (preserve_order=True)")
     print("  Expected index -> Joint name -> PhysX index -> PhysX name")
     for i, (name, physx_idx) in enumerate(zip(hand_joint_names, hand_joint_ids)):
         physx_name = physx_joint_names[physx_idx]
-        match = "✓" if name == physx_name else "✗ MISMATCH!"
+        match = "ok" if name == physx_name else "MISMATCH"
         print(f"  [{i:2d}] {name:16s} -> PhysX[{physx_idx:2d}] = {physx_name:16s} {match}")
     
     
@@ -237,13 +232,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Correct Jacobian index depends on fixed vs floating base
     jacobi_body_idx = palm_body_idx - 1 if robot.is_fixed_base else palm_body_idx
     
-    # Get first eigengrasp basis (primary open/close synergy)
-    eigen_basis = ALLEGRO_PCA_MATRIX[0].to(device)  # Shape: (16,)
+    eigen_basis = ALLEGRO_PCA_MATRIX[0].to(device) if not is_parallel_jaw else None
     
     # Eigengrasp coefficient state (positive = close, negative = open)
     eigen_coeff = torch.zeros(1, device=device)
     eigen_speed = 0.02  # Coefficient change per frame when key held
     eigen_range = [-2.0, 2.0]  # Min/max coefficient range
+    gripper_opening_target = [None]
     
     # Setup IK controller - ABSOLUTE mode (tracks fixed target)
     ik_cfg = DifferentialIKControllerCfg(
@@ -280,14 +275,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         name = physx_joint_names[i]
         print(f"  [{i:2d}] {name:16s}: {val:+.4f}")
 
-    # Print hand eigen (canonical order via get_allegro_hand_joint_ids)
-    from isaaclab_tasks.manager_based.manipulation.y2r.mdp.actions import get_allegro_hand_joint_ids
-    eigen_ids = get_allegro_hand_joint_ids(unwrapped_env, robot)
-    hand_canonical = robot.data.joint_pos[0, eigen_ids].cpu().tolist()
-    default_canonical = robot.data.default_joint_pos[0, eigen_ids].cpu().tolist()
-    print(f"\n[allegro_hand_eigen_b] hand joints in CANONICAL order (via get_allegro_hand_joint_ids):")
-    for i, (name, val, dflt) in enumerate(zip(hand_joint_names, hand_canonical, default_canonical)):
-        print(f"  [{i:2d}] {name:16s}: pos={val:+.4f}  default={dflt:+.4f}  delta={val-dflt:+.4f}")
+    if not is_parallel_jaw:
+        # Print hand eigen (canonical order via get_allegro_hand_joint_ids)
+        from isaaclab_tasks.manager_based.manipulation.y2r.mdp.actions import get_allegro_hand_joint_ids
+        eigen_ids = get_allegro_hand_joint_ids(unwrapped_env, robot)
+        hand_canonical = robot.data.joint_pos[0, eigen_ids].cpu().tolist()
+        default_canonical = robot.data.default_joint_pos[0, eigen_ids].cpu().tolist()
+        print(f"\n[allegro_hand_eigen_b] hand joints in CANONICAL order (via get_allegro_hand_joint_ids):")
+        for i, (name, val, dflt) in enumerate(zip(hand_joint_names, hand_canonical, default_canonical)):
+            print(f"  [{i:2d}] {name:16s}: pos={val:+.4f}  default={dflt:+.4f}  delta={val-dflt:+.4f}")
+    else:
+        gripper_default = robot.data.default_joint_pos[0, hand_joint_ids]
+        gripper_opening_target[0] = (gripper_default[1] - gripper_default[0]).item()
+        print(f"\n[parallel_jaw] default opening: {gripper_opening_target[0]:.4f} m")
 
     # Reset environment
     print("[INFO] Resetting environment...")
@@ -295,8 +295,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # Set unique joint positions so we can identify ordering
     # Assign value = (joint_index + 1) * 0.01 for each PhysX joint
-    unique_pos = torch.zeros(1, 22, device=device)
-    for i in range(22):
+    unique_pos = torch.zeros(1, robot.num_joints, device=device)
+    for i in range(robot.num_joints):
         unique_pos[0, i] = (i + 1) * 0.01  # 0.01, 0.02, ..., 0.22
     robot.write_joint_state_to_sim(unique_pos, torch.zeros_like(unique_pos))
     # Step physics so it takes effect
@@ -316,19 +316,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if "proprio" not in gname:
             continue
         print(f"\n[{gname} obs] shape={gdata.shape}")
-        jp = flat[:22].tolist()
-        print(f"  joint_pos (first 22 values) — match by value to PhysX index:")
+        joint_obs_dim = unwrapped_env.cfg.y2r_cfg.robot.arm_joint_count + unwrapped_env.cfg.y2r_cfg.robot.hand_joint_count
+        jp = flat[:joint_obs_dim].tolist()
+        print(f"  joint_pos (first {joint_obs_dim} values) — match by value to PhysX index:")
         for i, val in enumerate(jp):
             # val ≈ (physx_idx+1)*0.01, so physx_idx ≈ round(val/0.01) - 1
             physx_idx = round(val / 0.01) - 1
-            if 0 <= physx_idx < 22:
+            if 0 <= physx_idx < robot.num_joints:
                 name = physx_joint_names[physx_idx]
                 print(f"    obs[{i:2d}] = {val:.6f} → PhysX[{physx_idx:2d}] = {name}")
             else:
                 print(f"    obs[{i:2d}] = {val:.6f} → ???")
-        if flat.numel() >= 27:
-            eigen = flat[22:27].tolist()
-            print(f"  hand_eigen (22-26): {[f'{v:+.4f}' for v in eigen]}")
+        if not is_parallel_jaw and flat.numel() >= joint_obs_dim + 5:
+            eigen = flat[joint_obs_dim:joint_obs_dim + 5].tolist()
+            print(f"  hand_eigen: {[f'{v:+.4f}' for v in eigen]}")
 
     print("=" * 80 + "\n")
     
@@ -347,15 +348,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Add callback for 'R' key using Se3Keyboard's built-in mechanism
     se3_keyboard.add_callback("R", on_reset_key)
     
-    # Joint mode: 0 = eigengrasp, 1..16 = individual joints
-    # Mode names for display
-    joint_mode_names = ["Eigengrasp"] + hand_joint_names
+    # Joint mode: dexterous uses eigengrasp + individual joints; WSG uses one scalar opening mode.
+    joint_mode_names = ["Gripper opening"] if is_parallel_jaw else ["Eigengrasp"] + hand_joint_names
     joint_mode = [0]  # Mutable container: 0 = eigengrasp, 1-16 = individual joint index
-    num_modes = len(joint_mode_names)  # 17 total (eigen + 16 joints)
+    num_modes = len(joint_mode_names)
 
     # Per-joint position offsets (added to default pos for individual joint control)
-    joint_offsets = torch.zeros(16, device=device)
+    joint_offsets = torch.zeros(len(hand_joint_names), device=device)
     joint_speed = 0.02  # rad per frame when key held
+    opening_speed = 0.001  # meters per frame when key held
 
     # Gripper key states (J = close, K = open) - track press/release for continuous control
     gripper_delta = [0.0]  # Mutable container for closure access
@@ -522,14 +523,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             target_quat_b = default_quat_b.clone()
             eigen_coeff.zero_()  # Reset gripper to default
             joint_offsets.zero_()  # Reset individual joint offsets
+            default_hand_pos = robot.data.default_joint_pos[0, hand_joint_ids]
+            if is_parallel_jaw:
+                gripper_opening_target[0] = (default_hand_pos[1] - default_hand_pos[0]).item()
             reset_state["pressed"] = False
             print("[INFO] Reset to default pose")
 
         # Handle B: snap hand target to finger_regularizer default_joints (penalty -> 0)
         if snap_to_reg_state["pressed"]:
             fr_default_tensor = torch.tensor(fr_default_joints, device=device, dtype=torch.float32)
-            robot_default_hand_vec = robot.data.default_joint_pos[0, hand_joint_ids]  # (16,)
-            joint_offsets[:] = fr_default_tensor - robot_default_hand_vec
+            robot_default_hand_vec = robot.data.default_joint_pos[0, hand_joint_ids]
+            if is_parallel_jaw:
+                gripper_opening_target[0] = (fr_default_tensor[1] - fr_default_tensor[0]).item()
+                joint_offsets.zero_()
+            else:
+                joint_offsets[:] = fr_default_tensor - robot_default_hand_vec
             eigen_coeff.zero_()
             snap_to_reg_state["pressed"] = False
             print("[INFO] Snapped hand target to finger_regularizer default_joints (penalty target)")
@@ -577,11 +585,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # Set arm joint position targets
         robot.set_joint_position_target(arm_target, joint_ids=arm_joint_ids)
         
-        # Update hand targets based on current joint mode
+        # Update hand/gripper targets based on current joint mode
         mode = joint_mode[0]
-        default_hand_pos = robot.data.default_joint_pos[:, hand_joint_ids]  # (1, 16)
+        default_hand_pos = robot.data.default_joint_pos[:, hand_joint_ids]
 
-        if mode == 0:
+        if is_parallel_jaw:
+            limits = robot.data.soft_joint_pos_limits[:, hand_joint_ids]
+            min_opening = (limits[:, 1, 0] - limits[:, 0, 1]).item()
+            max_opening = (limits[:, 1, 1] - limits[:, 0, 0]).item()
+            if gripper_opening_target[0] is None:
+                current = robot.data.joint_pos[0, hand_joint_ids]
+                gripper_opening_target[0] = (current[1] - current[0]).item()
+            gripper_opening_target[0] -= gripper_delta[0] * opening_speed
+            gripper_opening_target[0] = min(max(gripper_opening_target[0], min_opening), max_opening)
+            half_opening = 0.5 * gripper_opening_target[0]
+            hand_target = torch.tensor([[-half_opening, half_opening]], device=device, dtype=torch.float32)
+        elif mode == 0:
             # Eigengrasp mode: J/K control eigen coefficient
             eigen_coeff += gripper_delta[0] * eigen_speed
             eigen_coeff.clamp_(eigen_range[0], eigen_range[1])
@@ -617,7 +636,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             roll, pitch, yaw = quat_to_euler_deg(palm_quat_w[0])
             mode = joint_mode[0]
             mode_name = joint_mode_names[mode]
-            if mode == 0:
+            if is_parallel_jaw:
+                cur = robot.data.joint_pos[0, hand_joint_ids]
+                mode_info = f"opening={(cur[1] - cur[0]).item():.4f} m target={gripper_opening_target[0]:.4f} m"
+            elif mode == 0:
                 mode_info = f"Eigen: {eigen_coeff.item():.2f}"
             else:
                 joint_idx = mode - 1

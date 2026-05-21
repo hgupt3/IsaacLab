@@ -284,6 +284,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
     _data_root = os.environ.get("Y2R_DATA_ROOT", _repo_root)
     config_name = agent_cfg["params"]["config"].get("name", "distillation")
+    log_suffix = os.environ.get("Y2R_LOG_SUFFIX", "")
+    if log_suffix and not config_name.endswith(log_suffix):
+        config_name = f"{config_name}{log_suffix}"
+        agent_cfg["params"]["config"]["name"] = config_name
     log_root_path = os.path.join(_data_root, "IsaacLab", "logs", "rl_games", config_name)
     
     print(f"[INFO] Logging experiment in directory: {log_root_path}")

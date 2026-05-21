@@ -135,6 +135,7 @@ def _get_finger_contact_mags(env: ManagerBasedRLEnv):
             ids = robot.find_bodies(link_name)[0]
             body_idx = ids[0] if len(ids) > 0 else None
             pad_tensor = torch.tensor(tuple(normal), device=env.device, dtype=torch.float32)
+            pad_tensor = pad_tensor / pad_tensor.norm().clamp_min(1e-8)
             cache[link_name] = (body_idx, pad_tensor)
         env._nail_gate_cache = cache
 
@@ -176,10 +177,15 @@ def _get_finger_contact_mags(env: ManagerBasedRLEnv):
             debug_data.append((link_name, link_pos.clone(), force_w.clone(), pad_w.clone()))
         env._contact_debug_data = debug_data
 
-    thumb_mag = _finger_max(layout.thumb_bodies)
-    other_mags = tuple(_finger_max(body_list) for body_list in layout.finger_bodies)
+    if layout.contact_model == "parallel_jaw":
+        mags = tuple(_finger_max(body_list) for body_list in layout.parallel_jaw_bodies)
+    elif layout.contact_model == "dexterous":
+        thumb_mag = _finger_max(layout.thumb_bodies)
+        other_mags = tuple(_finger_max(body_list) for body_list in layout.finger_bodies)
+        mags = (thumb_mag, *other_mags)
+    else:
+        raise ValueError(f"Unsupported contact_model: {layout.contact_model}")
 
-    mags = (thumb_mag, *other_mags)
     env._cached_finger_mags = (step, mags)
     return mags
 
@@ -312,6 +318,7 @@ def object_ee_distance(
     error_gate_pos_slope: float = 0.02,
     error_gate_rot_threshold: float | None = None,
     error_gate_rot_slope: float = 0.5,
+    body_names: list[str] | None = None,
     object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
@@ -337,22 +344,18 @@ def object_ee_distance(
     object: RigidObject = env.scene[object_cfg.name]
     asset_pos = asset.data.body_pos_w[:, asset_cfg.body_ids].clone()  # (N, B, 3)
 
-    # Apply tip offsets if configured (bodies 1+ are link_3, offsets are in body-local frame)
-    tip_cfg = env.cfg.y2r_cfg.robot.tip_offsets
-    if tip_cfg is not None and asset_pos.shape[1] > 1:
+    # Apply configured local offsets so merged virtual tips can still drive distance rewards.
+    if body_names is not None:
         from . import observations as _obs_mod
         from isaaclab.utils.math import quat_apply as _quat_apply
-        _obs_mod._ensure_tip_offsets_cache(env.cfg.y2r_cfg, env.device)
-        tip_offsets = _obs_mod._TIP_OFFSETS_TENSOR
-        if tip_offsets is not None:
-            asset_quat = asset.data.body_quat_w[:, asset_cfg.body_ids]  # (N, B, 4)
-            for i in range(min(4, asset_pos.shape[1] - 1)):
-                # Rotate local offset into world frame and add to position
-                offset_w = _quat_apply(
-                    asset_quat[:, 1 + i],
-                    tip_offsets[i].unsqueeze(0).expand(env.num_envs, 3),
-                )
-                asset_pos[:, 1 + i] = asset_pos[:, 1 + i] + offset_w
+        tip_offsets = _obs_mod._get_body_state_offsets_tensor(env.cfg.y2r_cfg, body_names, env.device)
+        asset_quat = asset.data.body_quat_w[:, asset_cfg.body_ids]  # (N, B, 4)
+        for i in range(asset_pos.shape[1]):
+            offset_w = _quat_apply(
+                asset_quat[:, i],
+                tip_offsets[i].unsqueeze(0).expand(env.num_envs, 3),
+            )
+            asset_pos[:, i] = asset_pos[:, i] + offset_w
 
     object_pos = object.data.root_pos_w
     body_dists = torch.norm(asset_pos - object_pos[:, None, :], dim=-1)  # (N, B)
@@ -482,7 +485,11 @@ def _get_finger_self_contact_force(env: ManagerBasedRLEnv) -> torch.Tensor:
 def contact_factor(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Cached per-step contact factor with diminishing returns for multi-finger contact.
 
-    Structure (single-tier with combined gate):
+    Parallel jaw:
+      Two contact groups are required. Each group is soft-ramped by force, and the
+      reward is min(left, right). Thumb/palm gates are not used for this model.
+
+    Dexterous:
       Per-finger score: max(link_2, link_3) for each non-thumb finger, soft-ramped → [0, 1].
       Top-K sorted descending and weighted by finger_weights → tier1.
       Combined gate input = 1.0 * thumb_sat  +  palm_weight * palm_sat
@@ -502,6 +509,22 @@ def contact_factor(env: ManagerBasedRLEnv) -> torch.Tensor:
     threshold = cf_cfg.threshold
     inv_ramp = 1.0 / cf_cfg.ramp
     min_factor = float(min(max(cf_cfg.min_factor, 0.0), 1.0))
+    layout = env.cfg.y2r_cfg.robot.contact_layout
+
+    if layout.contact_model == "parallel_jaw":
+        mags = _get_finger_contact_mags(env)
+        if len(mags) != 2:
+            raise ValueError(f"parallel_jaw contact_model requires exactly two contact groups, got {len(mags)}")
+        left_mag, right_mag = mags
+        left_f = ((left_mag - threshold) * inv_ramp).clamp(0.0, 1.0)
+        right_f = ((right_mag - threshold) * inv_ramp).clamp(0.0, 1.0)
+        raw_factor = torch.minimum(left_f, right_f)
+        result = min_factor + (1.0 - min_factor) * raw_factor
+        env._cached_contact_factor = (step, result)
+        return result
+
+    if layout.contact_model != "dexterous":
+        raise ValueError(f"Unsupported contact_model: {layout.contact_model}")
 
     # Cache weights tensor (created once)
     w = getattr(env, '_contact_finger_weights_t', None)
@@ -1599,11 +1622,22 @@ def finger_release(
     N = env.num_envs
     device = env.device
     
-    # If hand trajectory is disabled, return zeros
     if not cfg.hand_trajectory.enabled:
         return torch.zeros(N, device=device)
     
     robot: Articulation = env.scene[robot_cfg.name]
+
+    if cfg.robot.control_mode == "parallel_jaw":
+        joint_ids, _ = robot.find_joints(cfg.robot.hand_joint_names, preserve_order=True)
+        joint_ids = torch.tensor(joint_ids, device=device, dtype=torch.long)
+        gripper_pos = robot.data.joint_pos[:, joint_ids]
+        opening = gripper_pos[:, 1] - gripper_pos[:, 0]
+        limits = robot.data.soft_joint_pos_limits[:, joint_ids]
+        min_opening = limits[:, 1, 0] - limits[:, 0, 1]
+        max_opening = limits[:, 1, 1] - limits[:, 0, 0]
+        opening_norm = ((opening - min_opening) / (max_opening - min_opening).clamp_min(1e-6)).clamp(0.0, 1.0)
+        reward = torch.sigmoid((opening_norm - 0.5) * scale)
+        return _apply_phase_filter(env, reward, phases)
     
     # Use explicit joint IDs to ensure correct order (not PhysX native order)
     joint_ids = get_allegro_hand_joint_ids(env, robot)
@@ -1657,13 +1691,22 @@ def finger_regularizer(
     """
     robot: Articulation = env.scene[robot_cfg.name]
     device = env.device
-    
-    # Use explicit joint IDs to ensure correct order (not PhysX native order)
-    joint_ids = get_allegro_hand_joint_ids(env, robot)
+
+    if env.cfg.y2r_cfg.robot.control_mode == "parallel_jaw":
+        joint_ids, _ = robot.find_joints(env.cfg.y2r_cfg.robot.hand_joint_names, preserve_order=True)
+        joint_ids = torch.tensor(joint_ids, device=device, dtype=torch.long)
+    else:
+        # Use explicit joint IDs to ensure correct order (not PhysX native order)
+        joint_ids = get_allegro_hand_joint_ids(env, robot)
     finger_pos = robot.data.joint_pos[:, joint_ids]  # (N, 16) in canonical order
     
     # Default joints tensor (must be in canonical order: index, middle, ring, thumb)
     default_tensor = torch.tensor(default_joints, device=device, dtype=torch.float32)  # (16,)
+    if default_tensor.numel() != finger_pos.shape[1]:
+        raise ValueError(
+            f"finger_regularizer default_joints length {default_tensor.numel()} "
+            f"does not match controlled hand joint count {finger_pos.shape[1]}."
+        )
     
     # RMS per-joint deviation from default (std is the per-joint scale in radians)
     finger_error = (finger_pos - default_tensor).pow(2).mean(dim=-1).sqrt()  # (N,)

@@ -195,18 +195,19 @@ def build_curriculum_cfg(cfg: Y2RConfig):
                 },
             },
         )
-        hand_eigen_noise_adr = CurrTerm(
-            func=mdp.modify_term_cfg,
-            params={
-                "address": "observations.proprio.hand_eigen.noise.std",
-                "modify_fn": mdp.initial_final_interpolate_fn,
-                "modify_params": {
-                    "initial_value": cfg.curriculum.teacher_noise.hand_eigen[0],
-                    "final_value": cfg.curriculum.teacher_noise.hand_eigen[1],
-                    "difficulty_term_str": "adr",
+        if cfg.robot.control_mode == "dexterous":
+            hand_eigen_noise_adr = CurrTerm(
+                func=mdp.modify_term_cfg,
+                params={
+                    "address": "observations.proprio.hand_eigen.noise.std",
+                    "modify_fn": mdp.initial_final_interpolate_fn,
+                    "modify_params": {
+                        "initial_value": cfg.curriculum.teacher_noise.hand_eigen[0],
+                        "final_value": cfg.curriculum.teacher_noise.hand_eigen[1],
+                        "difficulty_term_str": "adr",
+                    },
                 },
-            },
-        )
+            )
         object_pc_noise_adr = CurrTerm(
             func=mdp.modify_term_cfg,
             params={
@@ -340,13 +341,17 @@ def build_curriculum_cfg(cfg: Y2RConfig):
         _student_noise_entries = [
             ("student_jp_arm",  "observations.student_proprio.joint_pos_arm",             cfg.curriculum.student_noise.joint_pos_arm),
             ("student_jp_hand", "observations.student_proprio.joint_pos_hand",            cfg.curriculum.student_noise.joint_pos_hand),
-            ("student_eigen",   "observations.student_proprio.hand_eigen",                cfg.curriculum.student_noise.hand_eigen),
             ("student_jp_tgt",  "observations.student_proprio.joint_pos_targets",         cfg.curriculum.student_noise.joint_pos_targets),
             ("student_hpose",   "observations.student_current_poses.hand_pose",           cfg.curriculum.student_noise.hand_pose),
             ("student_hpose_t", "observations.student_future_poses.hand_pose_targets",    cfg.curriculum.student_noise.hand_pose_targets),
             ("student_vpc",     "observations.student_current_pc.visible_point_cloud",    cfg.curriculum.student_noise.object_point_cloud),
             ("student_vtgt",    "observations.student_future_pc.visible_target_sequence", cfg.curriculum.student_noise.target_point_clouds),
         ]
+        if cfg.robot.control_mode == "dexterous":
+            _student_noise_entries.insert(
+                2,
+                ("student_eigen", "observations.student_proprio.hand_eigen", cfg.curriculum.student_noise.hand_eigen),
+            )
         for name, address, noise_cfg in _student_noise_entries:
             setattr(result, f"{name}_noise_adr", CurrTerm(
                 func=mdp.modify_term_cfg,

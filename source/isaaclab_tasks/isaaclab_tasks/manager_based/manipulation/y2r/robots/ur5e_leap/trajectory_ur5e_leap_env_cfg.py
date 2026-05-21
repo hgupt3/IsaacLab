@@ -22,29 +22,13 @@ from ... import mdp
 # JOINT ORDER
 # ==============================================================================
 
-UR5E_LEAP_JOINT_ORDER = [
-    # arm (6)
-    "ur5e_joint_1", "ur5e_joint_2", "ur5e_joint_3",
-    "ur5e_joint_4", "ur5e_joint_5", "ur5e_joint_6",
-    # hand (16)
-    "index_joint_0", "index_joint_1", "index_joint_2", "index_joint_3",
-    "middle_joint_0", "middle_joint_1", "middle_joint_2", "middle_joint_3",
-    "ring_joint_0",   "ring_joint_1",   "ring_joint_2",   "ring_joint_3",
-    "thumb_joint_0",  "thumb_joint_1",  "thumb_joint_2",  "thumb_joint_3",
-]
-
-
-# ==============================================================================
-# ACTION CONFIG BUILDERS
-# ==============================================================================
-
 def _build_rel_joint_action_cfg(cfg: Y2RConfig):
     """Build standard relative joint position action config (22D)."""
     @configclass
     class UR5eLeapRelJointPosActionCfg:
         action = mdp.RelativeJointPositionActionCfg(
             asset_name="robot",
-            joint_names=UR5E_LEAP_JOINT_ORDER,
+            joint_names=cfg.robot.arm_joint_names + cfg.robot.hand_joint_names,
             scale=cfg.robot.action_scale,
         )
     return UR5eLeapRelJointPosActionCfg()
@@ -56,7 +40,7 @@ def _build_eigen_grasp_action_cfg(cfg: Y2RConfig):
     class UR5eLeapEigenGraspActionCfg:
         action = mdp.EigenGraspRelativeJointPositionActionCfg(
             asset_name="robot",
-            joint_names=UR5E_LEAP_JOINT_ORDER,
+            joint_names=cfg.robot.arm_joint_names + cfg.robot.hand_joint_names,
             scale=cfg.robot.action_scale,
             arm_joint_count=cfg.robot.arm_joint_count,
             hand_joint_count=cfg.robot.hand_joint_count,
@@ -196,16 +180,18 @@ class UR5eLeapTrajectoryMixinCfg:
 
         # Hand tips state observation (link_3 bodies with computed tip offsets)
         self.observations.proprio.hand_tips_state_b = ObsTerm(
-            func=mdp.hand_tips_state_with_offsets_b,
+            func=mdp.body_state_with_offsets_b,
             noise=self.observations.proprio.hand_tips_state_b.noise,
             params={
-                "body_asset_cfg": SceneEntityCfg("robot", body_names=["ur5e_link_6", "(index|middle|ring|thumb)_link_3"]),
+                "body_asset_cfg": SceneEntityCfg("robot", body_names=cfg.robot.tip_state_body_names),
                 "base_asset_cfg": SceneEntityCfg("robot"),
+                "body_names": cfg.robot.tip_state_body_names,
             },
         )
 
         # Fingers to object reward (link_3 bodies with tip offsets applied internally)
-        self.rewards.fingers_to_object.params["asset_cfg"] = SceneEntityCfg("robot", body_names=["ur5e_link_6", "(index|middle|ring|thumb)_link_3"])
+        self.rewards.fingers_to_object.params["asset_cfg"] = SceneEntityCfg("robot", body_names=cfg.robot.tip_state_body_names)
+        self.rewards.fingers_to_object.params["body_names"] = cfg.robot.tip_state_body_names
 
         # Add wrist camera in student mode (gated on use_depth_camera so the
         # no-depth ablation skips both the rendering cost and the depth obs).

@@ -22,14 +22,15 @@ source "$(dirname "$0")/common.sh"
 TEACHER_CHECKPOINT=""
 STUDENT_CHECKPOINT=""
 TEACHER_AGENT_ALIAS="mlp"
-TEACHER_LOG_DIR="trajectory"
+TEACHER_LOG_DIR=$(resolve_agent_log "$TEACHER_AGENT_ALIAS")
 TEACHER_AGENT_ENTRY="rl_games_teacher_cfg_entry_point"
 STUDENT_AGENT="rl_games_student_cfg_entry_point"
-STUDENT_CONFIG_NAME="student_depth_distillation"
-# Which Y2R_MODE this student requires. "distill" for the depth-using students;
-# "distill_no_depth" only for the pt_no_depth variant. Validated after parsing
-# so caller can't pair an incompatible Y2R_MODE with the chosen student.
-STUDENT_REQUIRED_MODE="distill"
+STUDENT_CONFIG_BASE="student_depth_distillation"
+STUDENT_CONFIG_NAME=$(with_robot_log_suffix "$STUDENT_CONFIG_BASE")
+# Which Y2R_MODE family this student requires. "depth" allows distillation modes
+# with depth camera observations; "no_depth" allows no-depth distillation modes.
+# Validated after parsing so caller can't pair an incompatible mode with a student.
+STUDENT_REQUIRED_MODE_FAMILY="depth"
 DO_TEACHER_CONTINUE=false
 DO_STUDENT_CONTINUE=false
 FORWARD_ARGS=()
@@ -40,6 +41,11 @@ while [[ $# -gt 0 ]]; do
         --robot)
             ROBOT="$2"
             TASK=$(resolve_robot_task "$ROBOT")
+            Y2R_LOG_SUFFIX=$(resolve_robot_log_suffix "$ROBOT")
+            export Y2R_ROBOT="$ROBOT"
+            export Y2R_LOG_SUFFIX="$Y2R_LOG_SUFFIX"
+            TEACHER_LOG_DIR=$(resolve_agent_log "$TEACHER_AGENT_ALIAS")
+            STUDENT_CONFIG_NAME=$(with_robot_log_suffix "$STUDENT_CONFIG_BASE")
             shift 2
             ;;
         --multi_gpu)
@@ -66,22 +72,25 @@ while [[ $# -gt 0 ]]; do
             case "$2" in
                 pt)
                     STUDENT_AGENT="rl_games_student_pt_cfg_entry_point"
-                    STUDENT_CONFIG_NAME="student_depth_pt_distillation"
+                    STUDENT_CONFIG_BASE="student_depth_pt_distillation"
+                    STUDENT_CONFIG_NAME=$(with_robot_log_suffix "$STUDENT_CONFIG_BASE")
                     echo "========================================"
                     echo "Student: Point Transformer"
                     echo "========================================"
                     ;;
                 pt_dagger)
                     STUDENT_AGENT="rl_games_student_pt_dagger_cfg_entry_point"
-                    STUDENT_CONFIG_NAME="student_depth_pt_distillation_dagger"
+                    STUDENT_CONFIG_BASE="student_depth_pt_distillation_dagger"
+                    STUDENT_CONFIG_NAME=$(with_robot_log_suffix "$STUDENT_CONFIG_BASE")
                     echo "========================================"
                     echo "Student: Point Transformer (DAgger variant)"
                     echo "========================================"
                     ;;
                 pt_no_depth)
                     STUDENT_AGENT="rl_games_student_pt_no_depth_cfg_entry_point"
-                    STUDENT_CONFIG_NAME="student_pt_no_depth_distillation"
-                    STUDENT_REQUIRED_MODE="distill_no_depth"
+                    STUDENT_CONFIG_BASE="student_pt_no_depth_distillation"
+                    STUDENT_CONFIG_NAME=$(with_robot_log_suffix "$STUDENT_CONFIG_BASE")
+                    STUDENT_REQUIRED_MODE_FAMILY="no_depth"
                     # Auto-set Y2R_MODE if unset; explicit caller value is
                     # checked against STUDENT_REQUIRED_MODE below.
                     : "${Y2R_MODE:=distill_no_depth}"
@@ -93,22 +102,25 @@ while [[ $# -gt 0 ]]; do
                     ;;
                 pt_patch)
                     STUDENT_AGENT="rl_games_student_pt_patch_cfg_entry_point"
-                    STUDENT_CONFIG_NAME="student_depth_pt_patch_distillation"
+                    STUDENT_CONFIG_BASE="student_depth_pt_patch_distillation"
+                    STUDENT_CONFIG_NAME=$(with_robot_log_suffix "$STUDENT_CONFIG_BASE")
                     echo "========================================"
                     echo "Student: Point Transformer (ViT-style patch depth)"
                     echo "========================================"
                     ;;
                 pt_patch_dagger)
                     STUDENT_AGENT="rl_games_student_pt_patch_dagger_cfg_entry_point"
-                    STUDENT_CONFIG_NAME="student_depth_pt_patch_dagger_distillation"
+                    STUDENT_CONFIG_BASE="student_depth_pt_patch_dagger_distillation"
+                    STUDENT_CONFIG_NAME=$(with_robot_log_suffix "$STUDENT_CONFIG_BASE")
                     echo "========================================"
                     echo "Student: Point Transformer (ViT-style patch depth, DAgger BC)"
                     echo "========================================"
                     ;;
                 pt_patch_no_depth)
                     STUDENT_AGENT="rl_games_student_pt_patch_no_depth_cfg_entry_point"
-                    STUDENT_CONFIG_NAME="student_pt_patch_no_depth_distillation"
-                    STUDENT_REQUIRED_MODE="distill_no_depth"
+                    STUDENT_CONFIG_BASE="student_pt_patch_no_depth_distillation"
+                    STUDENT_CONFIG_NAME=$(with_robot_log_suffix "$STUDENT_CONFIG_BASE")
+                    STUDENT_REQUIRED_MODE_FAMILY="no_depth"
                     : "${Y2R_MODE:=distill_no_depth}"
                     export Y2R_MODE
                     echo "========================================"
@@ -118,7 +130,8 @@ while [[ $# -gt 0 ]]; do
                     ;;
                 mlp)
                     STUDENT_AGENT="rl_games_student_cfg_entry_point"
-                    STUDENT_CONFIG_NAME="student_depth_distillation"
+                    STUDENT_CONFIG_BASE="student_depth_distillation"
+                    STUDENT_CONFIG_NAME=$(with_robot_log_suffix "$STUDENT_CONFIG_BASE")
                     echo "========================================"
                     echo "Student: MLP (default)"
                     echo "========================================"
@@ -196,20 +209,31 @@ fi
 
 # Validate Y2R_MODE matches the selected student. Catches both stale invalid
 # values (e.g. Y2R_MODE=train_no_eigen leaked from a prior shell session) and
-# valid-but-incompatible pairings (pt_no_depth + distill drops student_camera
-# from obs_groups while env keeps depth → silent obs split mismatch; pt +
-# distill_no_depth keeps student_camera in obs_groups while env drops depth →
-# also broken).
+# valid-but-incompatible depth/no-depth pairings.
 EFFECTIVE_Y2R_MODE="${Y2R_MODE:-distill}"
-if [ "$EFFECTIVE_Y2R_MODE" != "$STUDENT_REQUIRED_MODE" ]; then
+if [ "$STUDENT_REQUIRED_MODE_FAMILY" = "depth" ]; then
+    COMPATIBLE_MODES=("distill" "distill_loose_hand_pose")
+else
+    COMPATIBLE_MODES=("distill_no_depth" "distill_no_depth_loose_hand_pose")
+fi
+MODE_OK=false
+for compatible_mode in "${COMPATIBLE_MODES[@]}"; do
+    if [ "$EFFECTIVE_Y2R_MODE" = "$compatible_mode" ]; then
+        MODE_OK=true
+        break
+    fi
+done
+if [ "$MODE_OK" != true ]; then
     echo "Error: Y2R_MODE='$EFFECTIVE_Y2R_MODE' is incompatible with the selected student."
-    echo "       Selected student agent requires Y2R_MODE='$STUDENT_REQUIRED_MODE'."
-    echo "       (Tip: --student pt_no_depth needs Y2R_MODE=distill_no_depth; everything"
-    echo "        else needs Y2R_MODE=distill.)"
+    echo "       Compatible modes: ${COMPATIBLE_MODES[*]}"
+    echo "       (Tip: --student pt_no_depth needs a no-depth distillation mode; everything"
+    echo "        else needs a depth distillation mode.)"
     exit 1
 fi
 
 cd "$ISAACLAB_DIR"
+
+WANDB_PROJECT="distillation${Y2R_LOG_SUFFIX}"
 
 if [ "$NUM_GPUS" -gt 0 ]; then
     # Multi-GPU: use torchrun with --distributed flag
@@ -225,7 +249,7 @@ if [ "$NUM_GPUS" -gt 0 ]; then
         --distributed \
         --enable_cameras \
         --track \
-        --wandb-project-name distillation \
+        --wandb-project-name "$WANDB_PROJECT" \
         --wandb-entity hgupt3 \
         ${STUDENT_CHECKPOINT:+--checkpoint "$STUDENT_CHECKPOINT"} \
         "${FORWARD_ARGS[@]}"
@@ -239,7 +263,7 @@ else
         --headless \
         --enable_cameras \
         --track \
-        --wandb-project-name distillation \
+        --wandb-project-name "$WANDB_PROJECT" \
         --wandb-entity hgupt3 \
         ${STUDENT_CHECKPOINT:+--checkpoint "$STUDENT_CHECKPOINT"} \
         "${FORWARD_ARGS[@]}"

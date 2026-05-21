@@ -31,6 +31,9 @@ while [[ $# -gt 0 ]]; do
         --robot)
             ROBOT="$2"
             TASK=$(resolve_robot_task "$ROBOT")
+            Y2R_LOG_SUFFIX=$(resolve_robot_log_suffix "$ROBOT")
+            export Y2R_ROBOT="$ROBOT"
+            export Y2R_LOG_SUFFIX="$Y2R_LOG_SUFFIX"
             shift 2
             ;;
         --task)
@@ -75,13 +78,13 @@ set -- "${REMAINING_ARGS[@]}"
 if [ "$STUDENT" = "1" ]; then
     # Student mode: resolve student-specific agent variant
     STUDENT_AGENT="rl_games_student_cfg_entry_point"
-    STUDENT_LOG="student_depth_distillation"
+    STUDENT_LOG=$(with_robot_log_suffix "student_depth_distillation")
     case "$AGENT_ALIAS" in
         ""|mlp)
             ;;
         pt)
             STUDENT_AGENT="rl_games_student_pt_cfg_entry_point"
-            STUDENT_LOG="student_depth_pt_distillation"
+            STUDENT_LOG=$(with_robot_log_suffix "student_depth_pt_distillation")
             echo "========================================"
             echo "Student: Point Transformer"
             echo "  Log directory: $STUDENT_LOG"
@@ -89,7 +92,7 @@ if [ "$STUDENT" = "1" ]; then
             ;;
         pt_patch)
             STUDENT_AGENT="rl_games_student_pt_patch_cfg_entry_point"
-            STUDENT_LOG="student_depth_pt_patch_distillation"
+            STUDENT_LOG=$(with_robot_log_suffix "student_depth_pt_patch_distillation")
             echo "========================================"
             echo "Student: Point Transformer (ViT-style patch depth)"
             echo "  Log directory: $STUDENT_LOG"
@@ -97,7 +100,7 @@ if [ "$STUDENT" = "1" ]; then
             ;;
         pt_patch_dagger)
             STUDENT_AGENT="rl_games_student_pt_patch_dagger_cfg_entry_point"
-            STUDENT_LOG="student_depth_pt_patch_dagger_distillation"
+            STUDENT_LOG=$(with_robot_log_suffix "student_depth_pt_patch_dagger_distillation")
             echo "========================================"
             echo "Student: Point Transformer (ViT-style patch depth, DAgger BC)"
             echo "  Log directory: $STUDENT_LOG"
@@ -105,7 +108,7 @@ if [ "$STUDENT" = "1" ]; then
             ;;
         pt_patch_no_depth)
             STUDENT_AGENT="rl_games_student_pt_patch_no_depth_cfg_entry_point"
-            STUDENT_LOG="student_pt_patch_no_depth_distillation"
+            STUDENT_LOG=$(with_robot_log_suffix "student_pt_patch_no_depth_distillation")
             echo "========================================"
             echo "Student: Point Transformer (ViT patch, no depth camera)"
             echo "  Log directory: $STUDENT_LOG"
@@ -137,7 +140,7 @@ else
         parse_checkpoint_args "$AGENT_LOG" "$@"
     else
         AGENT_ARGS=""
-        parse_checkpoint_args "trajectory" "$@"
+        parse_checkpoint_args "$(with_robot_log_suffix "trajectory")" "$@"
     fi
 fi
 shift $PARSED_ARGS

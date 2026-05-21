@@ -1,0 +1,7 @@
+# Gemini 305 camera - silver metallic
+newmtl gemini_gray
+Ka 0.25 0.25 0.25
+Kd 0.75 0.75 0.75
+Ks 0.5 0.5 0.5
+Ns 80
+d 1.0

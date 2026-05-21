@@ -22,6 +22,8 @@ shift $PARSED_ARGS
 
 cd "$ISAACLAB_DIR"
 
+WANDB_PROJECT="trajectory${Y2R_LOG_SUFFIX}"
+
 if [ "$NUM_GPUS" -gt 0 ]; then
     # Multi-GPU: use torchrun with --distributed flag
     # GPU_OFFSET shifts LOCAL_RANK so e.g. --multi_gpu 2,3 uses physical GPUs 2,3
@@ -34,7 +36,7 @@ if [ "$NUM_GPUS" -gt 0 ]; then
         --headless \
         --distributed \
         --track \
-        --wandb-project-name trajectory \
+        --wandb-project-name "$WANDB_PROJECT" \
         --wandb-entity hgupt3 \
         ${AGENT_ARGS} \
         ${CHECKPOINT:+--checkpoint "$CHECKPOINT"} \
@@ -45,7 +47,7 @@ else
         --task "$TASK" \
         --headless \
         --track \
-        --wandb-project-name trajectory \
+        --wandb-project-name "$WANDB_PROJECT" \
         --wandb-entity hgupt3 \
         ${AGENT_ARGS} \
         ${CHECKPOINT:+--checkpoint "$CHECKPOINT"} \

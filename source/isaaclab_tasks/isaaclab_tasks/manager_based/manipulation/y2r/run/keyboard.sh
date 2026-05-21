@@ -21,6 +21,9 @@ while [[ $# -gt 0 ]]; do
         --robot)
             ROBOT="$2"
             TASK=$(resolve_robot_task "$ROBOT")
+            Y2R_LOG_SUFFIX=$(resolve_robot_log_suffix "$ROBOT")
+            export Y2R_ROBOT="$ROBOT"
+            export Y2R_LOG_SUFFIX="$Y2R_LOG_SUFFIX"
             shift 2
             ;;
         --task)

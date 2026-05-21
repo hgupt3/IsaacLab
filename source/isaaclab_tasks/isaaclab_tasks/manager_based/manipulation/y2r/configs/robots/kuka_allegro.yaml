@@ -2,16 +2,38 @@
 # All robot-specific parameters: kinematics, cameras, hand defaults
 robot:
   action_scale: 0.1
+  gripper_action_scale: null
+  control_mode: dexterous
   arm_joint_count: 7
   hand_joint_count: 16
   eigen_dim: 5                  # PCA dimensions for eigen grasp
   use_target_tracking: true     # delta-from-target + EMA (SimToolReal-style)
   ema_alpha_arm: 0.1            # EMA blend factor for arm joints
   ema_alpha_hand: 0.1           # EMA blend factor for hand joints (retain prior single-α behavior for Kuka — not retuned)
+  arm_joint_names: ["iiwa7_joint_1", "iiwa7_joint_2", "iiwa7_joint_3", "iiwa7_joint_4", "iiwa7_joint_5", "iiwa7_joint_6", "iiwa7_joint_7"]
+  hand_joint_names:
+    ["index_joint_0", "index_joint_1", "index_joint_2", "index_joint_3",
+     "middle_joint_0", "middle_joint_1", "middle_joint_2", "middle_joint_3",
+     "ring_joint_0", "ring_joint_1", "ring_joint_2", "ring_joint_3",
+     "thumb_joint_0", "thumb_joint_1", "thumb_joint_2", "thumb_joint_3"]
+  tip_state_body_names: ["palm_link", "index_tip", "middle_tip", "ring_tip", "thumb_tip"]
+  tip_state_offsets:
+    palm_link: [0.0, 0.0, 0.0]
+    index_tip: [0.0, 0.0, 0.0]
+    middle_tip: [0.0, 0.0, 0.0]
+    ring_tip: [0.0, 0.0, 0.0]
+    thumb_tip: [0.0, 0.0, 0.0]
+  tip_state_rot_euler:
+    palm_link: [0.0, 0.0, 0.0]
+    index_tip: [0.0, 0.0, 0.0]
+    middle_tip: [0.0, 0.0, 0.0]
+    ring_tip: [0.0, 0.0, 0.0]
+    thumb_tip: [0.0, 0.0, 0.0]
   palm_body_name: "palm_link"   # Kuka's palm_link frame is already correct
   wrist_joint_name: "iiwa7_joint_7"
   arm_joint_regex: "iiwa7_joint_.*"
   hand_body_regex: "(palm_link|.*_link_[0-3]|.*_tip)"  # Kuka keeps palm_link as real body
+  calibration_path: null
   palm_frame_offset: null       # Kuka palm_link is already the correct frame
   tip_offsets: null              # Kuka tip bodies exist as real bodies
 
@@ -20,11 +42,13 @@ robot:
   # skipped since pad_normals is empty (contact_factor's fast path kicks in).
   contact_layout:
     sensor_prim_prefix: "ee_link/"   # Allegro bodies live under /Robot/ee_link/
+    contact_model: dexterous
     thumb_bodies: ["thumb_link_3"]
     finger_bodies:
       - ["index_link_3"]
       - ["middle_link_3"]
       - ["ring_link_3"]
+    parallel_jaw_bodies: []
     palm_proximal_bodies: []         # Disabled — no palm/link_1 sensors on allegro
     self_contact_bodies:             # Only fingertips are sensed on allegro
       ["thumb_link_3", "index_link_3", "middle_link_3", "ring_link_3"]
@@ -45,4 +69,3 @@ rewards:
   finger_regularizer:
     params:
       default_joints: [0.0315, 0.0764, 0.0196, 0.2944, -0.0010, 0.1109, 0.0309, 0.2541, -0.0067, 0.1260, 0.0697, 0.2933, 1.5165, -0.2420, 0.3112, 0.3816]
-

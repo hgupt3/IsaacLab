@@ -216,6 +216,110 @@ class EigenGraspRelativeJointPositionAction(ActionTerm):
             self._target[env_ids] = current_joint_pos
 
 
+class ParallelGripperRelativeJointPositionAction(ActionTerm):
+    """Relative UR arm + scalar parallel-jaw gripper opening action."""
+
+    cfg: "ParallelGripperRelativeJointPositionActionCfg"
+    _asset: Articulation
+
+    def __init__(self, cfg: "ParallelGripperRelativeJointPositionActionCfg", env: "ManagerBasedEnv") -> None:
+        super().__init__(cfg, env)
+
+        self._joint_ids, self._joint_names = self._asset.find_joints(self.cfg.joint_names, preserve_order=True)
+        self._arm_dim = cfg.arm_joint_count
+        self._gripper_dim = 2
+        self._input_dim = self._arm_dim + 1
+        self._output_dim = self._arm_dim + self._gripper_dim
+        if len(self._joint_ids) != self._output_dim:
+            raise ValueError(
+                f"Expected {self._output_dim} controlled joints "
+                f"(arm={self._arm_dim}, gripper=2), found {len(self._joint_ids)}."
+            )
+
+        self._raw_actions = torch.zeros(self.num_envs, self._input_dim, device=self.device)
+        self._processed_actions = torch.zeros(self.num_envs, self._output_dim, device=self.device)
+        self._command_target = torch.zeros(self.num_envs, self._output_dim, device=self.device)
+        self._opening_target = torch.zeros(self.num_envs, device=self.device)
+
+        self._arm_scale = float(cfg.arm_scale)
+        self._gripper_scale = float(cfg.gripper_scale)
+        self._min_opening = float(cfg.gripper_opening_limits[0])
+        self._max_opening = float(cfg.gripper_opening_limits[1])
+        self._use_target_tracking = cfg.use_target_tracking
+        self._ema_alpha = torch.tensor(
+            [cfg.ema_alpha_arm] * self._arm_dim + [cfg.ema_alpha_gripper] * self._gripper_dim,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        if self._use_target_tracking:
+            self._target = torch.zeros(self.num_envs, self._output_dim, device=self.device)
+            self._joint_limits_cached = False
+
+    @property
+    def action_dim(self) -> int:
+        return self._input_dim
+
+    @property
+    def raw_actions(self) -> torch.Tensor:
+        return self._raw_actions
+
+    @property
+    def processed_actions(self) -> torch.Tensor:
+        return self._processed_actions
+
+    def process_actions(self, actions: torch.Tensor):
+        self._raw_actions[:] = actions
+
+        current_joint_pos = self._asset.data.joint_pos[:, self._joint_ids]
+        arm_delta = actions[:, :self._arm_dim] * self._arm_scale
+        opening_delta = actions[:, self._arm_dim] * self._gripper_scale
+
+        if self._use_target_tracking:
+            self._cache_joint_limits()
+            arm_target = self._target[:, :self._arm_dim] + arm_delta
+            current_opening = self._opening_target
+        else:
+            arm_target = current_joint_pos[:, :self._arm_dim] + arm_delta
+            current_opening = current_joint_pos[:, self._arm_dim + 1] - current_joint_pos[:, self._arm_dim]
+
+        opening_target = (current_opening + opening_delta).clamp(self._min_opening, self._max_opening)
+        gripper_target = torch.stack((-0.5 * opening_target, 0.5 * opening_target), dim=-1)
+        raw_target = torch.cat((arm_target, gripper_target), dim=-1)
+
+        if self._use_target_tracking:
+            raw_target = torch.clamp(raw_target, self._joint_lower, self._joint_upper)
+            self._target = self._ema_alpha * raw_target + (1.0 - self._ema_alpha) * self._target
+            self._command_target[:] = self._target
+            self._opening_target[:] = self._target[:, self._arm_dim + 1] - self._target[:, self._arm_dim]
+        else:
+            self._command_target[:] = raw_target
+            self._opening_target[:] = opening_target
+
+        self._processed_actions[:, :self._arm_dim] = arm_delta
+        self._processed_actions[:, self._arm_dim:] = self._command_target[:, self._arm_dim:] - current_joint_pos[:, self._arm_dim:]
+
+    def _cache_joint_limits(self):
+        if self._joint_limits_cached:
+            return
+        limits = self._asset.data.soft_joint_pos_limits[:, self._joint_ids]
+        self._joint_lower = limits[..., 0]
+        self._joint_upper = limits[..., 1]
+        self._joint_limits_cached = True
+
+    def apply_actions(self):
+        self._asset.set_joint_position_target(self._command_target, joint_ids=self._joint_ids)
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        env_ids = slice(None) if env_ids is None else env_ids
+        self._raw_actions[env_ids] = 0.0
+        self._processed_actions[env_ids] = 0.0
+        current_joint_pos = self._asset.data.joint_pos[env_ids][:, self._joint_ids]
+        self._command_target[env_ids] = current_joint_pos
+        self._opening_target[env_ids] = current_joint_pos[:, self._arm_dim + 1] - current_joint_pos[:, self._arm_dim]
+        if self._use_target_tracking:
+            self._target[env_ids] = current_joint_pos
+
+
 @configclass
 class EigenGraspRelativeJointPositionActionCfg(ActionTermCfg):
     """Configuration for eigen grasp relative joint position action term.
@@ -259,9 +363,42 @@ class EigenGraspRelativeJointPositionActionCfg(ActionTermCfg):
     """EMA blend factor for hand joints. Higher than arm α because fingers need larger joint-space deltas to produce equivalent task-space motion."""
 
 
+@configclass
+class ParallelGripperRelativeJointPositionActionCfg(ActionTermCfg):
+    """Configuration for scalar parallel-jaw gripper relative position action."""
+
+    class_type: type[ActionTerm] = ParallelGripperRelativeJointPositionAction
+
+    joint_names: list[str] = MISSING
+    """Controlled joint names: arm joints followed by left/right gripper joints."""
+
+    arm_scale: float = 0.1
+    """Scale for arm joint deltas in radians."""
+
+    gripper_scale: float = 0.01
+    """Scale for scalar gripper opening delta in meters."""
+
+    arm_joint_count: int = 6
+    """Number of arm joints at the start of joint_names."""
+
+    gripper_opening_limits: tuple[float, float] = (0.0054, 0.11)
+    """Minimum and maximum opening in meters."""
+
+    use_target_tracking: bool = True
+    """If True, use delta-from-target + EMA smoothing."""
+
+    ema_alpha_arm: float = 0.1
+    """EMA blend factor for arm joints."""
+
+    ema_alpha_gripper: float = 0.35
+    """EMA blend factor for the two gripper joints."""
+
+
 __all__ = [
     "EigenGraspRelativeJointPositionAction",
     "EigenGraspRelativeJointPositionActionCfg",
+    "ParallelGripperRelativeJointPositionAction",
+    "ParallelGripperRelativeJointPositionActionCfg",
     "ALLEGRO_HAND_JOINT_NAMES",
     "ALLEGRO_PCA_MATRIX",
     "get_allegro_hand_joint_ids",
