@@ -18,10 +18,13 @@ CALIBRATION_PATH = ASSET_DIR / "calibration.yaml"
 TRANSFORM_KEYS = [
     "ee_to_wsg_mount",
     "wsg_mount_to_wsg_base",
+    "wsg_base_to_wsg_mount_visual",
     "wsg_base_to_camera_mount",
     "camera_mount_to_gemini",
     "left_slider_to_soft_finger",
     "right_slider_to_soft_finger",
+    "left_soft_finger_to_holder_visual",
+    "right_soft_finger_to_holder_visual",
     "left_soft_finger_to_tip",
     "right_soft_finger_to_tip",
     "wsg_base_to_palm_frame",
@@ -57,10 +60,13 @@ KEEP_JOINTS = [
 EXPECTED_LINKS = KEEP_LINKS + [
     "wsg_mount_link",
     "wsg_base_link",
+    "wsg_mount_visual_link",
     "wsg_left_slider_link",
     "wsg_right_slider_link",
     "soft_finger_left_link",
     "soft_finger_right_link",
+    "finger_holder_left_visual_link",
+    "finger_holder_right_visual_link",
     "gemini_mount_link",
     "gemini_305_link",
     "gemini_305_left_camera_frame",
@@ -83,6 +89,12 @@ CUSTOM_PHYSICAL_LINKS = [
     "gemini_305_link",
 ]
 
+CUSTOM_VISUAL_ONLY_LINKS = [
+    "wsg_mount_visual_link",
+    "finger_holder_left_visual_link",
+    "finger_holder_right_visual_link",
+]
+
 REQUIRED_COLLISION_LINKS = [
     "wsg_base_link",
     "soft_finger_left_link",
@@ -94,10 +106,13 @@ REQUIRED_COLLISION_LINKS = [
 EXPECTED_JOINTS = KEEP_JOINTS + [
     "wsg_mount_joint",
     "wsg_base_mount_joint",
+    "wsg_mount_visual_joint",
     "wsg_left_finger_joint",
     "wsg_right_finger_joint",
     "soft_finger_left_joint",
     "soft_finger_right_joint",
+    "finger_holder_left_visual_joint",
+    "finger_holder_right_visual_joint",
     "left_tip_joint",
     "right_tip_joint",
     "palm_frame_joint",
@@ -208,8 +223,8 @@ def build_robot(config: dict) -> ET.Element:
         robot.append(copy.deepcopy(material))
     add_material(robot, "wsg_gray", (0.50, 0.50, 0.50, 1.0))
     add_material(robot, "wsg_black", (0.02, 0.02, 0.02, 1.0))
-    add_material(robot, "mount_black", (0.0, 0.0, 0.0, 1.0))
-    add_material(robot, "soft_finger_blue", (0.02, 0.28, 0.90, 1.0))
+    add_material(robot, "mount_white", (1.0, 1.0, 1.0, 1.0))
+    add_material(robot, "soft_finger_black", (0.0, 0.0, 0.0, 1.0))
     add_material(robot, "gemini_305_gray", (0.45, 0.45, 0.45, 1.0))
 
     copy_named_elements(source_root, robot, "link", KEEP_LINKS)
@@ -249,6 +264,15 @@ def add_custom_links(robot: ET.Element, collision_primitives: dict) -> None:
     )
     add_mesh_link(
         robot,
+        "wsg_mount_visual_link",
+        "external_meshes/wsg50_mount.stl",
+        "mount_white",
+        mass=0.001,
+        inertia_diag=(1e-9, 1e-9, 1e-9),
+        collision_primitives=[],
+    )
+    add_mesh_link(
+        robot,
         "wsg_left_slider_link",
         "wsg50/meshes/GUIDE_WSG50_110.stl",
         "wsg_black",
@@ -273,7 +297,7 @@ def add_custom_links(robot: ET.Element, collision_primitives: dict) -> None:
         robot,
         "soft_finger_left_link",
         "external_meshes/soft_gripper_finger_left.stl",
-        "soft_finger_blue",
+        "soft_finger_black",
         mass=0.05,
         inertia_diag=(0.00004, 0.00004, 0.00004),
         collision_primitives=collision_primitives["soft_finger_left_link"],
@@ -282,16 +306,34 @@ def add_custom_links(robot: ET.Element, collision_primitives: dict) -> None:
         robot,
         "soft_finger_right_link",
         "external_meshes/soft_gripper_finger_right.stl",
-        "soft_finger_blue",
+        "soft_finger_black",
         mass=0.05,
         inertia_diag=(0.00004, 0.00004, 0.00004),
         collision_primitives=collision_primitives["soft_finger_right_link"],
     )
     add_mesh_link(
         robot,
+        "finger_holder_left_visual_link",
+        "external_meshes/finger_holder_left.obj",
+        "mount_white",
+        mass=0.001,
+        inertia_diag=(1e-9, 1e-9, 1e-9),
+        collision_primitives=[],
+    )
+    add_mesh_link(
+        robot,
+        "finger_holder_right_visual_link",
+        "external_meshes/finger_holder_right.obj",
+        "mount_white",
+        mass=0.001,
+        inertia_diag=(1e-9, 1e-9, 1e-9),
+        collision_primitives=[],
+    )
+    add_mesh_link(
+        robot,
         "gemini_mount_link",
         "external_meshes/gemini_mount.stl",
-        "mount_black",
+        "mount_white",
         mass=0.04,
         inertia_diag=(0.00001, 0.00001, 0.00001),
         collision_primitives=collision_primitives["gemini_mount_link"],
@@ -419,6 +461,13 @@ def add_inertial(link: ET.Element, mass: float, inertia_diag: tuple[float, float
 def add_custom_joints(robot: ET.Element, transforms: dict) -> None:
     add_fixed_joint(robot, "wsg_mount_joint", "ee_link", "wsg_mount_link", transforms["ee_to_wsg_mount"])
     add_fixed_joint(robot, "wsg_base_mount_joint", "wsg_mount_link", "wsg_base_link", transforms["wsg_mount_to_wsg_base"])
+    add_fixed_joint(
+        robot,
+        "wsg_mount_visual_joint",
+        "wsg_base_link",
+        "wsg_mount_visual_link",
+        transforms["wsg_base_to_wsg_mount_visual"],
+    )
     add_prismatic_joint(robot, "wsg_left_finger_joint", "wsg_base_link", "wsg_left_slider_link", (1.0, 0.0, 0.0), -0.055, -0.0027)
     add_prismatic_joint(robot, "wsg_right_finger_joint", "wsg_base_link", "wsg_right_slider_link", (1.0, 0.0, 0.0), 0.0027, 0.055)
     add_fixed_joint(
@@ -434,6 +483,20 @@ def add_custom_joints(robot: ET.Element, transforms: dict) -> None:
         "wsg_right_slider_link",
         "soft_finger_right_link",
         transforms["right_slider_to_soft_finger"],
+    )
+    add_fixed_joint(
+        robot,
+        "finger_holder_left_visual_joint",
+        "soft_finger_left_link",
+        "finger_holder_left_visual_link",
+        transforms["left_soft_finger_to_holder_visual"],
+    )
+    add_fixed_joint(
+        robot,
+        "finger_holder_right_visual_joint",
+        "soft_finger_right_link",
+        "finger_holder_right_visual_link",
+        transforms["right_soft_finger_to_holder_visual"],
     )
     add_fixed_joint(robot, "left_tip_joint", "soft_finger_left_link", "left_tip", transforms["left_soft_finger_to_tip"])
     add_fixed_joint(robot, "right_tip_joint", "soft_finger_right_link", "right_tip", transforms["right_soft_finger_to_tip"])
@@ -534,10 +597,13 @@ def validate_robot(output_path: Path) -> None:
     expected_parent_child = {
         "wsg_mount_joint": ("ee_link", "wsg_mount_link"),
         "wsg_base_mount_joint": ("wsg_mount_link", "wsg_base_link"),
+        "wsg_mount_visual_joint": ("wsg_base_link", "wsg_mount_visual_link"),
         "wsg_left_finger_joint": ("wsg_base_link", "wsg_left_slider_link"),
         "wsg_right_finger_joint": ("wsg_base_link", "wsg_right_slider_link"),
         "soft_finger_left_joint": ("wsg_left_slider_link", "soft_finger_left_link"),
         "soft_finger_right_joint": ("wsg_right_slider_link", "soft_finger_right_link"),
+        "finger_holder_left_visual_joint": ("soft_finger_left_link", "finger_holder_left_visual_link"),
+        "finger_holder_right_visual_joint": ("soft_finger_right_link", "finger_holder_right_visual_link"),
         "gemini_mount_joint": ("wsg_base_link", "gemini_mount_link"),
         "gemini_305_mount_joint": ("gemini_mount_link", "gemini_305_link"),
     }
@@ -558,6 +624,15 @@ def validate_robot(output_path: Path) -> None:
                 raise ValueError(f"{link_name} collision must use primitives, not mesh")
             if geometry.find("box") is None and geometry.find("cylinder") is None:
                 raise ValueError(f"{link_name} collision must be box or cylinder")
+
+    for link in root.findall("link"):
+        link_name = link.attrib["name"]
+        if link_name not in CUSTOM_VISUAL_ONLY_LINKS:
+            continue
+        if link.findall("collision"):
+            raise ValueError(f"{link_name} must remain visual-only and not define collision geometry")
+        if not link.findall("visual"):
+            raise ValueError(f"{link_name} must define visual geometry")
 
     for mesh in root.findall(".//mesh"):
         filename = mesh.attrib["filename"]

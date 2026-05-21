@@ -10,11 +10,11 @@
   <material name="wsg_black">
     <color rgba="0.02 0.02 0.02 1" />
   </material>
-  <material name="mount_black">
-    <color rgba="0 0 0 1" />
+  <material name="mount_white">
+    <color rgba="1 1 1 1" />
   </material>
-  <material name="soft_finger_blue">
-    <color rgba="0.02 0.28 0.9 1" />
+  <material name="soft_finger_black">
+    <color rgba="0 0 0 1" />
   </material>
   <material name="gemini_305_gray">
     <color rgba="0.45 0.45 0.45 1" />
@@ -266,6 +266,20 @@
       <inertia ixx="0.002" ixy="0" ixz="0" iyy="0.002" iyz="0" izz="0.002" />
     </inertial>
   </link>
+  <link name="wsg_mount_visual_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="external_meshes/wsg50_mount.stl" />
+      </geometry>
+      <material name="mount_white" />
+    </visual>
+    <inertial>
+      <mass value="0.001" />
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09" />
+    </inertial>
+  </link>
   <link name="wsg_left_slider_link">
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
@@ -300,7 +314,7 @@
       <geometry>
         <mesh filename="external_meshes/soft_gripper_finger_left.stl" />
       </geometry>
-      <material name="soft_finger_blue" />
+      <material name="soft_finger_black" />
     </visual>
     <collision>
       <origin xyz="0.0165 -0.016 0.0129" rpy="0 0 0" />
@@ -344,7 +358,7 @@
       <geometry>
         <mesh filename="external_meshes/soft_gripper_finger_right.stl" />
       </geometry>
-      <material name="soft_finger_blue" />
+      <material name="soft_finger_black" />
     </visual>
     <collision>
       <origin xyz="-0.0165 -0.016 0.0129" rpy="0 0 0" />
@@ -382,13 +396,41 @@
       <inertia ixx="4e-05" ixy="0" ixz="0" iyy="4e-05" iyz="0" izz="4e-05" />
     </inertial>
   </link>
+  <link name="finger_holder_left_visual_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="external_meshes/finger_holder_left.obj" />
+      </geometry>
+      <material name="mount_white" />
+    </visual>
+    <inertial>
+      <mass value="0.001" />
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09" />
+    </inertial>
+  </link>
+  <link name="finger_holder_right_visual_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="external_meshes/finger_holder_right.obj" />
+      </geometry>
+      <material name="mount_white" />
+    </visual>
+    <inertial>
+      <mass value="0.001" />
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09" />
+    </inertial>
+  </link>
   <link name="gemini_mount_link">
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
         <mesh filename="external_meshes/gemini_mount.stl" />
       </geometry>
-      <material name="mount_black" />
+      <material name="mount_white" />
     </visual>
     <collision>
       <origin xyz="0.0058 0.0704 0.0055" rpy="0 0 0" />
@@ -481,6 +523,11 @@
     <child link="wsg_base_link" />
     <origin xyz="0 0 0" rpy="0 0 0" />
   </joint>
+  <joint name="wsg_mount_visual_joint" type="fixed">
+    <parent link="wsg_base_link" />
+    <child link="wsg_mount_visual_link" />
+    <origin xyz="0 0 0" rpy="0 0 0" />
+  </joint>
   <joint name="wsg_left_finger_joint" type="prismatic">
     <parent link="wsg_base_link" />
     <child link="wsg_left_slider_link" />
@@ -506,6 +553,16 @@
     <parent link="wsg_right_slider_link" />
     <child link="soft_finger_right_link" />
     <origin xyz="0 0.013 0.098" rpy="-1.570796327 0 -3.141592654" />
+  </joint>
+  <joint name="finger_holder_left_visual_joint" type="fixed">
+    <parent link="soft_finger_left_link" />
+    <child link="finger_holder_left_visual_link" />
+    <origin xyz="-0.001 0.101 0.013" rpy="1.570796327 0 0" />
+  </joint>
+  <joint name="finger_holder_right_visual_joint" type="fixed">
+    <parent link="soft_finger_right_link" />
+    <child link="finger_holder_right_visual_link" />
+    <origin xyz="0.001 0.1 0.013" rpy="1.570796327 0 0" />
   </joint>
   <joint name="left_tip_joint" type="fixed">
     <parent link="soft_finger_left_link" />

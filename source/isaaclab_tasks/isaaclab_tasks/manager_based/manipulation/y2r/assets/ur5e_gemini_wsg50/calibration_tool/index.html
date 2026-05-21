@@ -185,10 +185,13 @@
     const TRANSFORMS = [
       ["ee_to_wsg_mount", "EE to WSG Mount", "wsg_mount_joint"],
       ["wsg_mount_to_wsg_base", "WSG Mount to WSG Base", "wsg_base_mount_joint"],
+      ["wsg_base_to_wsg_mount_visual", "WSG Base to WSG Mount Visual", "wsg_mount_visual_joint"],
       ["wsg_base_to_camera_mount", "WSG Base to Gemini Mount", "gemini_mount_joint"],
       ["camera_mount_to_gemini", "Gemini Mount to Camera", "gemini_305_mount_joint"],
       ["left_slider_to_soft_finger", "Left Slider to Soft Finger", "soft_finger_left_joint"],
       ["right_slider_to_soft_finger", "Right Slider to Soft Finger", "soft_finger_right_joint"],
+      ["left_soft_finger_to_holder_visual", "Left Soft Finger to Holder Visual", "finger_holder_left_visual_joint"],
+      ["right_soft_finger_to_holder_visual", "Right Soft Finger to Holder Visual", "finger_holder_right_visual_joint"],
       ["left_soft_finger_to_tip", "Left Soft Finger to Tip", "left_tip_joint"],
       ["right_soft_finger_to_tip", "Right Soft Finger to Tip", "right_tip_joint"],
       ["wsg_base_to_palm_frame", "WSG Base to Palm Frame", "palm_frame_joint"],
@@ -461,10 +464,14 @@
         const finish = (obj) => {
           obj.traverse((child) => {
             if (!child.isMesh) return;
-            if (path.toLowerCase().includes("soft_gripper")) {
-              child.material = new THREE.MeshPhongMaterial({ color: 0x165dce, shininess: 18 });
+            if (path.toLowerCase().includes("base_plate")) {
+              child.material = new THREE.MeshPhongMaterial({ color: 0x01010a, shininess: 12 });
+            } else if (path.toLowerCase().includes("soft_gripper")) {
+              child.material = new THREE.MeshPhongMaterial({ color: 0x030303, shininess: 18 });
             } else if (path.toLowerCase().includes("mount")) {
-              child.material = new THREE.MeshPhongMaterial({ color: 0x101820, shininess: 16 });
+              child.material = new THREE.MeshPhongMaterial({ color: 0xffffff, shininess: 16 });
+            } else if (path.toLowerCase().includes("finger_holder")) {
+              child.material = new THREE.MeshPhongMaterial({ color: 0xffffff, shininess: 16 });
             } else if (path.toLowerCase().includes("wsg")) {
               child.material = new THREE.MeshPhongMaterial({ color: 0x6b7280, shininess: 20 });
             } else if (!child.material) {
@@ -476,15 +483,16 @@
           onComplete(obj);
         };
 
+        const assetPath = cacheBust(path);
         if (path.toLowerCase().endsWith(".stl")) {
           const loader = new THREE.STLLoader(manager);
-          loader.load(path, (geometry) => finish(new THREE.Mesh(geometry, new THREE.MeshPhongMaterial())));
+          loader.load(assetPath, (geometry) => finish(new THREE.Mesh(geometry, new THREE.MeshPhongMaterial())));
           return;
         }
 
         const loadObj = () => {
           const objLoader = new THREE.OBJLoader(manager);
-          objLoader.load(path, finish, undefined, (error) => {
+          objLoader.load(assetPath, finish, undefined, (error) => {
             console.error("OBJ load failed", path, error);
           });
         };
@@ -498,13 +506,17 @@
           return;
         }
         const mtlLoader = new THREE.MTLLoader(manager);
-        mtlLoader.load(mtlPath, (materials) => {
+        mtlLoader.load(cacheBust(mtlPath), (materials) => {
           materials.preload();
           const objLoader = new THREE.OBJLoader(manager);
           objLoader.setMaterials(materials);
-          objLoader.load(path, finish, undefined, loadObj);
+          objLoader.load(assetPath, finish, undefined, loadObj);
         }, undefined, loadObj);
       };
+    }
+
+    function cacheBust(path) {
+      return `${path}${path.includes("?") ? "&" : "?"}t=${Date.now()}`;
     }
 
     async function loadRobot() {
@@ -566,7 +578,7 @@
     function addFrameAxes() {
       if (!robot || !robot.links) return;
       axesGroup.clear();
-      for (const name of ["ee_link", "wsg_base_link", "palm_frame", "gemini_305_left_camera_optical_frame", "left_tip", "right_tip"]) {
+      for (const name of ["ee_link", "wsg_base_link", "wsg_mount_visual_link", "palm_frame", "gemini_305_left_camera_optical_frame", "finger_holder_left_visual_link", "finger_holder_right_visual_link", "left_tip", "right_tip"]) {
         const link = robot.links[name];
         if (!link) continue;
         const axes = new THREE.AxesHelper(name === "wsg_base_link" ? 0.08 : 0.045);

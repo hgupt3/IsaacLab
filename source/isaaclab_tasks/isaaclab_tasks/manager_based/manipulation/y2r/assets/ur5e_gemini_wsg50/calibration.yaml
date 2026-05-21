@@ -120,6 +120,9 @@ transforms:
   wsg_mount_to_wsg_base:
     xyz: [0, 0, 0]
     rpy_deg: [0, 0, 0]
+  wsg_base_to_wsg_mount_visual:
+    xyz: [0, 0, 0]
+    rpy_deg: [0, 0, 0]
   wsg_base_to_camera_mount:
     xyz: [0, 0.0025, 0.0235]
     rpy_deg: [180, 0, 180]
@@ -132,6 +135,12 @@ transforms:
   right_slider_to_soft_finger:
     xyz: [0, 0.013, 0.098]
     rpy_deg: [-90, 0, -180]
+  left_soft_finger_to_holder_visual:
+    xyz: [-0.001, 0.101, 0.013]
+    rpy_deg: [90, 0, 0]
+  right_soft_finger_to_holder_visual:
+    xyz: [0.001, 0.1, 0.013]
+    rpy_deg: [90, 0, 0]
   left_soft_finger_to_tip:
     xyz: [0.0005, -0.1085, 0.0129]
     rpy_deg: [180, 180, 180]
