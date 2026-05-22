@@ -468,10 +468,10 @@
               child.material = new THREE.MeshPhongMaterial({ color: 0x01010a, shininess: 12 });
             } else if (path.toLowerCase().includes("soft_gripper")) {
               child.material = new THREE.MeshPhongMaterial({ color: 0x030303, shininess: 18 });
-            } else if (path.toLowerCase().includes("mount")) {
-              child.material = new THREE.MeshPhongMaterial({ color: 0xffffff, shininess: 16 });
             } else if (path.toLowerCase().includes("finger_holder")) {
               child.material = new THREE.MeshPhongMaterial({ color: 0xffffff, shininess: 16 });
+            } else if (path.toLowerCase().includes("mount")) {
+              child.material = new THREE.MeshPhongMaterial({ color: 0x000000, shininess: 16 });
             } else if (path.toLowerCase().includes("wsg")) {
               child.material = new THREE.MeshPhongMaterial({ color: 0x6b7280, shininess: 20 });
             } else if (!child.material) {

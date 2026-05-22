@@ -223,7 +223,8 @@ def build_robot(config: dict) -> ET.Element:
         robot.append(copy.deepcopy(material))
     add_material(robot, "wsg_gray", (0.50, 0.50, 0.50, 1.0))
     add_material(robot, "wsg_black", (0.02, 0.02, 0.02, 1.0))
-    add_material(robot, "mount_white", (1.0, 1.0, 1.0, 1.0))
+    add_material(robot, "mount_black", (0.0, 0.0, 0.0, 1.0))
+    add_material(robot, "fin_mount_white", (1.0, 1.0, 1.0, 1.0))
     add_material(robot, "soft_finger_black", (0.0, 0.0, 0.0, 1.0))
     add_material(robot, "gemini_305_gray", (0.45, 0.45, 0.45, 1.0))
 
@@ -266,7 +267,7 @@ def add_custom_links(robot: ET.Element, collision_primitives: dict) -> None:
         robot,
         "wsg_mount_visual_link",
         "external_meshes/wsg50_mount.stl",
-        "mount_white",
+        "mount_black",
         mass=0.001,
         inertia_diag=(1e-9, 1e-9, 1e-9),
         collision_primitives=[],
@@ -315,7 +316,7 @@ def add_custom_links(robot: ET.Element, collision_primitives: dict) -> None:
         robot,
         "finger_holder_left_visual_link",
         "external_meshes/finger_holder_left.obj",
-        "mount_white",
+        "fin_mount_white",
         mass=0.001,
         inertia_diag=(1e-9, 1e-9, 1e-9),
         collision_primitives=[],
@@ -324,7 +325,7 @@ def add_custom_links(robot: ET.Element, collision_primitives: dict) -> None:
         robot,
         "finger_holder_right_visual_link",
         "external_meshes/finger_holder_right.obj",
-        "mount_white",
+        "fin_mount_white",
         mass=0.001,
         inertia_diag=(1e-9, 1e-9, 1e-9),
         collision_primitives=[],
@@ -333,7 +334,7 @@ def add_custom_links(robot: ET.Element, collision_primitives: dict) -> None:
         robot,
         "gemini_mount_link",
         "external_meshes/gemini_mount.stl",
-        "mount_white",
+        "mount_black",
         mass=0.04,
         inertia_diag=(0.00001, 0.00001, 0.00001),
         collision_primitives=collision_primitives["gemini_mount_link"],

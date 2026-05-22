@@ -10,7 +10,10 @@
   <material name="wsg_black">
     <color rgba="0.02 0.02 0.02 1" />
   </material>
-  <material name="mount_white">
+  <material name="mount_black">
+    <color rgba="0 0 0 1" />
+  </material>
+  <material name="fin_mount_white">
     <color rgba="1 1 1 1" />
   </material>
   <material name="soft_finger_black">
@@ -272,7 +275,7 @@
       <geometry>
         <mesh filename="external_meshes/wsg50_mount.stl" />
       </geometry>
-      <material name="mount_white" />
+      <material name="mount_black" />
     </visual>
     <inertial>
       <mass value="0.001" />
@@ -402,7 +405,7 @@
       <geometry>
         <mesh filename="external_meshes/finger_holder_left.obj" />
       </geometry>
-      <material name="mount_white" />
+      <material name="fin_mount_white" />
     </visual>
     <inertial>
       <mass value="0.001" />
@@ -416,7 +419,7 @@
       <geometry>
         <mesh filename="external_meshes/finger_holder_right.obj" />
       </geometry>
-      <material name="mount_white" />
+      <material name="fin_mount_white" />
     </visual>
     <inertial>
       <mass value="0.001" />
@@ -430,7 +433,7 @@
       <geometry>
         <mesh filename="external_meshes/gemini_mount.stl" />
       </geometry>
-      <material name="mount_white" />
+      <material name="mount_black" />
     </visual>
     <collision>
       <origin xyz="0.0058 0.0704 0.0055" rpy="0 0 0" />
