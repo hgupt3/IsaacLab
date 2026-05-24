@@ -580,7 +580,7 @@
   <joint name="palm_frame_joint" type="fixed">
     <parent link="wsg_base_link" />
     <child link="palm_frame" />
-    <origin xyz="0 0 0.146" rpy="0 0 0" />
+    <origin xyz="0 0 0.146" rpy="0 0 1.570796327" />
   </joint>
   <joint name="gemini_mount_joint" type="fixed">
     <parent link="wsg_base_link" />

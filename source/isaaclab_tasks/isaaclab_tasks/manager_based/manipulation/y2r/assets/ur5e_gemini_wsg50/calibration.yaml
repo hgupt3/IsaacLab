@@ -149,4 +149,4 @@ transforms:
     rpy_deg: [0, 0, 180]
   wsg_base_to_palm_frame:
     xyz: [0, 0, 0.146]
-    rpy_deg: [0, 0, 0]
+    rpy_deg: [0, 0, 90]

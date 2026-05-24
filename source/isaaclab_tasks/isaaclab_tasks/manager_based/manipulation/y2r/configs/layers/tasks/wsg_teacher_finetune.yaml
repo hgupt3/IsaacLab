@@ -1,0 +1,11 @@
+# ==============================================================================
+# WSG Teacher Finetune Layer
+# ==============================================================================
+# Keeps the tight WSG hand-pose deviation termination while inheriting the
+# base teacher reward weights and object trajectory deviation limits.
+# ==============================================================================
+
+terminations:
+  hand_pose_deviation:
+    position_threshold: [0.066, 0.066]
+    rotation_threshold: [0.733, 0.733]
