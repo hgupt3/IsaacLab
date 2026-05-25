@@ -983,12 +983,17 @@ class TrajectoryManager:
         # Determine desired roll (either fixed or zero)
         desired_roll = torch.full((n,), cfg.fixed_hand_roll, device=self.device) if cfg.fixed_hand_roll is not None else torch.zeros(n, device=self.device)
 
-        # Compute optimal roll to satisfy all finger direction constraints simultaneously
+        # Compute optimal roll to satisfy all finger direction constraints simultaneously.
+        # Each constraint is (component_idx, threshold, sign):
+        #   sign=+1 → reject if finger_dir[component] > threshold  (upper bound)
+        #   sign=-1 → reject if finger_dir[component] < -threshold (lower bound, internally negates A/B)
         constraints = []
         if cfg.exclude_toward_robot:
-            constraints.append((0, cfg.toward_robot_threshold))  # x-component
+            constraints.append((0, cfg.toward_robot_threshold, 1))   # x upper bound (toward robot)
         if cfg.exclude_upward:
-            constraints.append((2, cfg.upward_threshold))  # z-component
+            constraints.append((2, cfg.upward_threshold, 1))         # z upper bound (upward)
+        if cfg.exclude_downward:
+            constraints.append((2, cfg.downward_threshold, -1))      # z lower bound (downward)
 
         if len(constraints) > 0:
             roll = self._compute_feasible_roll_multi_constraint(
@@ -1223,10 +1228,12 @@ class TrajectoryManager:
         # Each region is represented as a complement of an arc: feasible when |roll - phi| > half_width
         feasible_regions = []  # List of (phi, half_width, always_feasible, never_feasible)
 
-        for component_idx, threshold in constraints:
-            # Coefficients for finger[component] = A*cos(roll) + B*sin(roll)
-            A = base_X[:, component_idx]
-            B = base_Y[:, component_idx]
+        for component_idx, threshold, sign in constraints:
+            # Coefficients for sign*finger[component] = A*cos(roll) + B*sin(roll).
+            # Negating A,B when sign=-1 turns the existing "reject if A·cos+B·sin > threshold"
+            # into "reject if finger[component] < -threshold" (a lower bound).
+            A = sign * base_X[:, component_idx]
+            B = sign * base_Y[:, component_idx]
 
             # Convert to R*cos(roll - φ) form
             R = torch.sqrt(A**2 + B**2)
@@ -1288,11 +1295,11 @@ class TrajectoryManager:
         # Compute violation for each constraint at each candidate roll
         max_violations = torch.zeros(n, num_samples, device=device)
 
-        for component_idx, threshold in constraints:
-            A = base_X[:, component_idx].unsqueeze(1)  # (n, 1)
-            B = base_Y[:, component_idx].unsqueeze(1)  # (n, 1)
+        for component_idx, threshold, sign in constraints:
+            A = sign * base_X[:, component_idx].unsqueeze(1)  # (n, 1)
+            B = sign * base_Y[:, component_idx].unsqueeze(1)  # (n, 1)
 
-            # Compute finger[component] = A*cos(roll) + B*sin(roll)
+            # Compute sign*finger[component] = A*cos(roll) + B*sin(roll)
             finger_component = A * torch.cos(candidate_rolls) + B * torch.sin(candidate_rolls)
 
             # Violation = max(0, finger_component - threshold)
@@ -1517,9 +1524,11 @@ class TrajectoryManager:
             # Match grasp-sampling gating (line ~988): each constraint is opt-in via its config flag.
             constraints = []
             if grasp_cfg.exclude_toward_robot:
-                constraints.append((0, toward_robot_threshold))  # x-component (toward robot)
+                constraints.append((0, toward_robot_threshold, 1))                # x upper bound (toward robot)
             if grasp_cfg.exclude_upward:
-                constraints.append((2, grasp_cfg.upward_threshold))  # z-component (upward)
+                constraints.append((2, grasp_cfg.upward_threshold, 1))            # z upper bound (upward)
+            if grasp_cfg.exclude_downward:
+                constraints.append((2, grasp_cfg.downward_threshold, -1))         # z lower bound (downward)
 
             candidate_rolls = self._compute_feasible_roll_multi_constraint(
                 base_quat=base_quat_world.reshape(-1, 4),
@@ -1572,6 +1581,12 @@ class TrajectoryManager:
             else:
                 upward_ok = torch.ones(n, pool_size, dtype=torch.bool, device=self.device)
 
+            # ===== FILTER 4c: Exclude downward =====
+            if grasp_cfg.exclude_downward:
+                downward_ok = finger_dir_world[..., 2] > -grasp_cfg.downward_threshold
+            else:
+                downward_ok = torch.ones(n, pool_size, dtype=torch.bool, device=self.device)
+
             # ===== FILTER 5: Exclude bottom fraction (per-env: only on each env's final keypoint) =====
             # bottom_ok is enforced where this slot is the env's final keypoint;
             # elsewhere we treat it as always-true so the AND below doesn't reject.
@@ -1580,7 +1595,7 @@ class TrajectoryManager:
                 pool_normals_world[..., 2] > exclude_z,
                 torch.ones(n, pool_size, dtype=torch.bool, device=self.device),
             )
-            valid_mask = dist_ok & normal_ok & height_ok & finger_ok & upward_ok & bottom_ok
+            valid_mask = dist_ok & normal_ok & height_ok & finger_ok & upward_ok & downward_ok & bottom_ok
 
             # For scoring + fallback, compute palm_quat_world for prev values (might be invalid!)
             prev_normals_world = quat_apply(obj_quat_at_kp, prev_normals)

@@ -451,6 +451,8 @@ class GraspSamplingConfig:
     toward_robot_threshold: float
     exclude_upward: bool
     upward_threshold: float
+    exclude_downward: bool
+    downward_threshold: float
     approach_distance: float | None  # Pre-grasp distance (null = disabled)
     align_fraction: float            # Fraction of grasp phase for alignment
     fixed_origin_offset: list[float] | None  # [x,y,z] offset from object center (null = center)

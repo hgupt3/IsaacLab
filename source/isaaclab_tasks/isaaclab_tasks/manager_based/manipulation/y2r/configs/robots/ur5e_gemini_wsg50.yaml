@@ -93,6 +93,14 @@ hand_trajectory:
     max_surface_perturbation: 0.04
     roll_perturbation: 0.0
     normal_similarity_threshold: -0.05
+  # Override env.yaml grasp_sampling for the WSG parallel-jaw gripper.
+  # palm-frame +X is perpendicular to the gripper plane (vs. along-finger for LEAP),
+  # so the upward/downward filters constrain how flat-horizontal the gripper plane is.
+  # Rejects when the plane lies within 30° of horizontal (palm-X within ±30° of vertical).
+  grasp_sampling:
+    upward_threshold: 0.866       # sin 60° → reject palm-X pointing within 30° of straight up
+    exclude_downward: true        # symmetric lower bound for parallel-jaw
+    downward_threshold: 0.866     # sin 60° → reject palm-X pointing within 30° of straight down
 
 rewards:
   contact_factor:
